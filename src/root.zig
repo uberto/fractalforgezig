@@ -17,6 +17,7 @@ test {
     _ = @import("gpu/message.zig");
     _ = @import("fractal/viewport.zig");
     _ = @import("fractal/mandelbrot.zig");
+    _ = @import("fractal/color.zig");
     std.testing.refAllDecls(@This());
 }
 
