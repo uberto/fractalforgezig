@@ -16,8 +16,18 @@ pub const ImGuiContext = opaque {};
 /// `ImFontAtlas*` — unused in M0, kept opaque for igCreateContext's parameter.
 pub const ImFontAtlas = opaque {};
 
-/// `ImGuiWindowFlags` is a plain `int` typedef in ImGui.
+/// `ImGuiWindowFlags` / `ImGuiPopupFlags` are plain `int` typedefs in ImGui.
 pub const WindowFlags = c_int;
+pub const PopupFlags = c_int;
+
+/// Window flags used by the single fixed M0 app window (values from cimgui.h).
+pub const window_flags_no_title_bar: WindowFlags = 1 << 0;
+pub const window_flags_no_resize: WindowFlags = 1 << 1;
+pub const window_flags_no_move: WindowFlags = 1 << 2;
+pub const window_flags_no_collapse: WindowFlags = 1 << 5;
+pub const window_flags_no_saved_settings: WindowFlags = 1 << 8;
+pub const window_flags_menu_bar: WindowFlags = 1 << 10;
+pub const window_flags_no_bring_to_front: WindowFlags = 1 << 13;
 
 pub extern fn igCreateContext(shared_font_atlas: ?*ImFontAtlas) ?*ImGuiContext;
 pub extern fn igDestroyContext(ctx: ?*ImGuiContext) void;
@@ -27,3 +37,21 @@ pub extern fn igShowDemoWindow(p_open: ?*bool) void;
 pub extern fn igBegin(name: [*:0]const u8, p_open: ?*bool, flags: WindowFlags) bool;
 pub extern fn igEnd() void;
 pub extern fn igText(fmt: [*:0]const u8, ...) void;
+pub extern fn igTextUnformatted(text: [*:0]const u8, text_end: ?[*:0]const u8) void;
+pub extern fn igSeparator() void;
+pub extern fn igSpacing() void;
+pub extern fn igSameLine(offset_from_start_x: f32, spacing: f32) void;
+
+// Menu bar (scalar-only signatures — no struct-by-value across the ABI).
+pub extern fn igBeginMenuBar() bool;
+pub extern fn igEndMenuBar() void;
+pub extern fn igBeginMenu(label: [*:0]const u8, enabled: bool) bool;
+pub extern fn igEndMenu() void;
+pub extern fn igMenuItem_Bool(label: [*:0]const u8, shortcut: ?[*:0]const u8, selected: bool, enabled: bool) bool;
+
+// Modal popup (used by Help→About).
+pub extern fn igOpenPopup_Str(str_id: [*:0]const u8, popup_flags: PopupFlags) void;
+pub extern fn igBeginPopupModal(name: [*:0]const u8, p_open: ?*bool, flags: WindowFlags) bool;
+pub extern fn igEndPopup() void;
+pub extern fn igCloseCurrentPopup() void;
+pub extern fn igSmallButton(label: [*:0]const u8) bool;

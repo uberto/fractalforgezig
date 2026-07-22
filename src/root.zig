@@ -19,6 +19,7 @@ test {
     _ = @import("fractal/mandelbrot.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/render.zig");
+    _ = @import("ui/stats.zig");
     std.testing.refAllDecls(@This());
 }
 

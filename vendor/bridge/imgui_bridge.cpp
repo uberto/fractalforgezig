@@ -49,3 +49,34 @@ extern "C" void ffImguiShutdownBackends(void)
     ImGui_ImplSDLGPU3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
 }
+
+extern "C" void ffImguiFillMainViewport(void)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+}
+
+extern "C" void ffImguiContentAvail(float *out_w, float *out_h)
+{
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (out_w) *out_w = avail.x;
+    if (out_h) *out_h = avail.y;
+}
+
+extern "C" bool ffImguiBeginChild(const char *str_id, float w, float h, bool border)
+{
+    return ImGui::BeginChild(str_id, ImVec2(w, h), border ? ImGuiChildFlags_Borders : ImGuiChildFlags_None);
+}
+
+extern "C" void ffImguiEndChild(void)
+{
+    ImGui::EndChild();
+}
+
+extern "C" void ffImguiImage(SDL_GPUTexture *texture, float w, float h)
+{
+    // Since Dear ImGui 1.92 (2025/08/08) the SDL_GPU backend takes the raw
+    // SDL_GPUTexture* as the ImTextureID; the backend supplies the sampler.
+    ImGui::Image((ImTextureID)(intptr_t)texture, ImVec2(w, h));
+}

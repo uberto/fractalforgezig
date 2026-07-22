@@ -5,8 +5,36 @@
 ## Purpose
 
 Own Dear ImGui: context lifecycle, the SDL3 platform + SDL_GPU renderer backends,
-and per-frame new-frame/render/shutdown. C-interop edge — keep ImGui/SDL types
-here and behind `../c.zig` / `../cimgui.zig`; never leak them into the fractal core.
+per-frame new-frame/render/shutdown, and the single fixed M0 window layout.
+C-interop edge — keep ImGui/SDL types here and behind `../c.zig` / `../cimgui.zig`;
+never leak them into the fractal core.
+
+## Layout (T8) — single window, two fixed regions
+
+- `panels.zig` — `draw(texture, tex_w, tex_h, vp, max_iter, stats, quit_requested)`.
+  ImGui edge (imports `../c.zig` + `../cimgui.zig`), so it is NOT pure and NOT
+  registered in `root.zig`. One window pinned to the OS window work area
+  (`ffImguiFillMainViewport`), flags = no-title/resize/move/collapse/saved-settings
+  + menu bar. Menu bar: File→Quit (sets `quit_requested.*`), Help→About (modal via
+  `igOpenPopup_Str` + `igBeginPopupModal`). Two child regions side by side: the
+  fractal image (`ffImguiImage`, aspect-fit via `stats.containSize`) and a read-only
+  data panel (render ms, frame ms, dispatch count = 0, visible re/im bounds derived
+  from `vp`, `max_iter`). Text is pre-formatted in Zig and drawn with
+  `igTextUnformatted` (avoids ImGui's C `%`-varargs formatter).
+- `stats.zig` — PURE, unit-tested, no ImGui/GPU. `Stats{ render_ms, frame_ms,
+  dispatch_count }` (`fromRender(ns)`, `observeFrame(ns)`), `nsToMs`,
+  `containSize(img_w,img_h,region_w,region_h) Size` (letterbox fit), and
+  `renderSummary(buf,w,h,max_iter,ns)` — the `.app` startup success line
+  `"rendered {w}x{h} Mandelbrot, max_iter={n}, in {ms} ms"`. Registered in
+  `root.zig`; the fast tier proves the numbers/strings with no window.
+
+## Bridge helpers for struct-by-value ImGui calls (vendor/bridge)
+
+`ffImguiFillMainViewport`, `ffImguiContentAvail(&w,&h)`,
+`ffImguiBeginChild(id,w,h,border)`/`ffImguiEndChild`, `ffImguiImage(tex,w,h)` wrap
+ImGui calls that take `ImVec2`/`ImTextureRef` by value, exposing plain scalars so
+Zig avoids struct-ABI concerns. `ffImguiImage` passes the raw `SDL_GPUTexture*` as
+the `ImTextureID` (Dear ImGui 1.92, 2025/08/08+); the backend supplies the sampler.
 
 ## The stack (vendored, compiled from source by build.zig)
 
@@ -50,7 +78,7 @@ Up: `SDL_Init(VIDEO)` -> `SDL_CreateWindow` -> `Device.create` ->
 
 ## Testing note
 
-The window/backends are inherently visual: verified by manual smoke (`zig build
-run`) plus a runtime log check for `driver=metal` + "Dear ImGui initialized".
-Pure string builders live in `../gpu/message.zig`. T8 replaces `buildUi` in
-main.zig with the real menu bar + fractal/data panels using `cimgui.zig`.
+The window/backends + layout are inherently visual: verified by manual smoke
+(`zig build run`) plus a runtime log check for `driver=metal`, "Dear ImGui
+initialized", and the `rendered ...` summary line. Pure logic (Stats, summary,
+containSize) lives in `stats.zig` and `../gpu/message.zig` and IS unit-tested.

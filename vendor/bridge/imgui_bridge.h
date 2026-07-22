@@ -47,6 +47,28 @@ void ffImguiRenderDrawData(SDL_GPUCommandBuffer *command_buffer, SDL_GPURenderPa
 // afterwards via cimgui's igDestroyContext.
 void ffImguiShutdownBackends(void);
 
+// ── UI layout helpers ──────────────────────────────────────────────────────
+// These wrap ImGui calls that traffic in C++-only value types (ImVec2,
+// ImTextureRef), exposing plain scalars so Zig (src/ui/panels.zig) can drive the
+// layout without struct-by-value ABI concerns. Control flow (quit/about flags)
+// stays in Zig via the scalar cimgui.zig core calls.
+
+// Position + size the NEXT window to exactly cover the main viewport's work area
+// (the single fixed M0 app window). Call before igBegin.
+void ffImguiFillMainViewport(void);
+
+// Write the current content region's available size (in pixels) into *out_w/*out_h.
+void ffImguiContentAvail(float *out_w, float *out_h);
+
+// Begin a child region of the given size (0 = fill remaining). Returns visibility;
+// call ffImguiEndChild exactly once afterwards regardless of the return value.
+bool ffImguiBeginChild(const char *str_id, float w, float h, bool border);
+void ffImguiEndChild(void);
+
+// Draw `texture` as an image of `w`x`h` logical pixels at the cursor. The SDL_GPU
+// ImGui backend binds the texture via its own sampler; `texture` is the raw handle.
+void ffImguiImage(SDL_GPUTexture *texture, float w, float h);
+
 #ifdef __cplusplus
 }
 #endif
