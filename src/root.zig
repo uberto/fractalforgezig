@@ -16,6 +16,7 @@ test {
     // Only PURE modules belong here: the fast tier must not @cImport SDL/GPU.
     _ = @import("gpu/message.zig");
     _ = @import("fractal/viewport.zig");
+    _ = @import("fractal/mandelbrot.zig");
     std.testing.refAllDecls(@This());
 }
 
