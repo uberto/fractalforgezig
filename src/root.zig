@@ -13,6 +13,8 @@ pub fn startupLine(buf: []u8, zig_version: []const u8) ![]u8 {
 test {
     // Aggregation point for submodule tests as they land, e.g.:
     //   _ = @import("fractal/mandelbrot.zig");
+    // Only PURE modules belong here: the fast tier must not @cImport SDL/GPU.
+    _ = @import("gpu/message.zig");
     std.testing.refAllDecls(@This());
 }
 

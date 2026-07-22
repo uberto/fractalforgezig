@@ -9,11 +9,16 @@ native macOS window with a Dear ImGui shell. This folder holds all first-party Z
 
 ## Layout map
 
-- `main.zig` — executable entry. Logs the startup line via `std.log.scoped(.app)` and exits.
-  Keep it thin: wire modules together, push logic into pure modules.
+- `main.zig` — executable entry. Opens one window, creates the SDL_GPU device + ImGui,
+  runs the event loop (render one ImGui window per frame), tears down cleanly. Keep it thin:
+  wire modules together, push logic into pure modules.
 - `root.zig` — library/test root. `zig build test` compiles this file. Its top-level
-  `test { ... }` block aggregates submodule tests via `_ = @import("...");` as they land.
-  Also hosts small pure helpers (e.g. `startupLine`).
+  `test { ... }` block aggregates PURE submodule tests via `_ = @import("...");` (never C
+  edges). Also hosts small pure helpers (e.g. `startupLine`).
+- `c.zig` — the `@cImport` C-interop edge: SDL3 + SDL_GPU + the ImGui backend bridge,
+  translated once. Only `gpu/`, `ui/`, `main.zig` import it.
+- `cimgui.zig` — thin hand-written `extern` header for the Dear ImGui core C API (cimgui.h
+  is not `@cImport`-able due to bitfield structs). Grow as later tasks need more calls.
 - `fractal/` — pure fractal core (viewport mapping, Mandelbrot iteration, color, render).
   No SDL/GPU imports. Seeded in T3.
 - `gpu/` — SDL3 GPU device + RGBA→texture upload glue. Seeded in T2.

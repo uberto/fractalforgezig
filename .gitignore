@@ -1,2 +1,5 @@
 zig-out/
 .zig-cache/
+
+# Dear ImGui writes its window-layout cache next to the working dir at runtime.
+imgui.ini
