@@ -56,7 +56,10 @@ pub fn main() !void {
     // Render the fixed Mandelbrot on the CPU (pure core) and upload it once to a
     // GPU texture. Data flow is one-directional: render -> upload -> display.
     const vp = viewport.Viewport.fixedView(render_w, render_h);
-    const result = try fractal_render.render(std.heap.page_allocator, vp, max_iter);
+    const result = fractal_render.render(std.heap.page_allocator, vp, max_iter) catch |err| {
+        app_log.err("CPU Mandelbrot render failed ({s}); aborting startup", .{@errorName(err)});
+        return err;
+    };
     var pixels_owned = true;
     defer if (pixels_owned) std.heap.page_allocator.free(result.pixels);
 
@@ -119,13 +122,19 @@ fn runLoop(
 /// render pass. When the swapchain texture is unavailable (e.g. minimized),
 /// submit the empty command buffer and skip drawing.
 fn renderFrame(window: *c.SDL_Window, device: gpu.Device, ui: ui_mod.Ui) void {
-    const cmd = c.SDL_AcquireGPUCommandBuffer(device.handle) orelse return;
+    const cmd = c.SDL_AcquireGPUCommandBuffer(device.handle) orelse {
+        app_log.err("SDL_AcquireGPUCommandBuffer failed: {s}", .{std.mem.span(c.SDL_GetError())});
+        return;
+    };
 
     var swapchain_texture: ?*c.SDL_GPUTexture = null;
     if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmd, window, &swapchain_texture, null, null)) {
+        app_log.err("SDL_WaitAndAcquireGPUSwapchainTexture failed: {s}", .{std.mem.span(c.SDL_GetError())});
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         return;
     }
+    // A null swapchain texture is the expected not-ready/minimized case (not an
+    // error): submit the empty command buffer and skip drawing this frame.
     const texture = swapchain_texture orelse {
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         return;
@@ -141,6 +150,7 @@ fn renderFrame(window: *c.SDL_Window, device: gpu.Device, ui: ui_mod.Ui) void {
         .store_op = c.SDL_GPU_STOREOP_STORE,
     };
     const pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, null) orelse {
+        app_log.err("SDL_BeginGPURenderPass failed: {s}", .{std.mem.span(c.SDL_GetError())});
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         return;
     };

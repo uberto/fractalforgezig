@@ -22,7 +22,7 @@ native macOS window with a Dear ImGui shell. This folder holds all first-party Z
 - `fractal/` — pure fractal core (viewport mapping, Mandelbrot iteration, color, render).
   No SDL/GPU imports. Seeded in T3.
 - `gpu/` — SDL3 GPU device + RGBA→texture upload glue. Seeded in T2.
-- `ui/` — SDL3 window + cimgui/Dear ImGui shell (menu bar, image panel, debug panel).
+- `ui/` — SDL3 window + cimgui/Dear ImGui shell (menu bar, fractal image, data panel).
   Seeded in T2.
 
 ## Pure-vs-glue rule

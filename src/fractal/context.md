@@ -39,9 +39,8 @@ new module in `src/root.zig`'s `test` block (`_ = @import("fractal/<mod>.zig");`
     `RenderResult{ pixels: []u8 (caller frees), elapsed_ns: u64 }`. `std.time.Timer`
     lives ONLY here — never assert on `elapsed_ns` magnitude.
   - `bufferLen(vp) usize` — RGBA8 byte length (`width*height*4`).
-  - Golden test = key-pixel assertions on the 64x48 fixed view: interior pixel =
-    interior color, slow-escape exterior = non-black gray, plus top/bottom symmetry
-    about the real axis.
+  - Golden test = key-pixel assertions on the 64x48 fixed view: interior pixel,
+    slow-escape exterior, and top/bottom symmetry about the real axis.
 
 ## Coordinate convention (do not get this wrong)
 
@@ -57,8 +56,7 @@ symmetry test.
 
 `center_re`/`center_im` are `f64` today — a deliberate defer (see the plan). Arbitrary
 precision is only needed near ~1e-15 magnification (M7). The center type is isolated in
-`Viewport` so M7 can widen it without touching callers; do not reach around the API to
-do precision-sensitive math on the raw `f64` center.
+`Viewport` so M7 can widen it; do not do precision-sensitive math on the raw `f64` center.
 
 ## Tests
 
