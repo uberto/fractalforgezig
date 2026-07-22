@@ -66,6 +66,25 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Headless GPU texture round-trip test. A SEPARATE artifact because it links
+    // the native stack (SDL/GPU) and creates a real device — the fast pure tier
+    // above must stay C-free. At runtime it SKIPS cleanly (logged reason) when no
+    // GPU device is available, so it never fails the suite on headless CI.
+    const gpu_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu_headless_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    configureNativeStack(b, gpu_test_mod);
+    const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
+    const run_gpu_tests = b.addRunArtifact(gpu_tests);
+    const gpu_test_step = b.step("test-gpu", "Run the headless GPU texture round-trip test");
+    gpu_test_step.dependOn(&run_gpu_tests.step);
+    // Also part of the milestone's `zig build test` gate.
+    test_step.dependOn(&run_gpu_tests.step);
 }
 
 /// Wire SDL3 + the vendored ImGui/cimgui/bridge C++ into `mod`. Include paths

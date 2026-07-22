@@ -4,9 +4,9 @@
 
 ## Purpose
 
-Own the SDL_GPU device lifecycle and (later, T7) the RGBA -> texture upload path.
-On macOS the backend is Metal. This folder is a C-interop edge: SDL/GPU C types
-live here and behind `../c.zig`; never leak them into the pure fractal core.
+Own the SDL_GPU device lifecycle and the RGBA -> texture upload path. On macOS
+the backend is Metal. This folder is a C-interop edge: SDL/GPU C types live here
+and behind `../c.zig`; never leak them into the pure fractal core.
 
 ## Files
 
@@ -20,6 +20,19 @@ live here and behind `../c.zig`; never leak them into the pure fractal core.
   - `Device.swapchainTextureFormat()` -> `SDL_GetGPUSwapchainTextureFormat`; hand
     this to the ImGui renderer backend so its pipeline matches the swapchain.
   - `Device.destroy()` releases the window then destroys the device. Call once.
+- `texture.zig` (T7) — CPU RGBA8 -> `SDL_GPU` texture path; takes the raw
+  `*SDL_GPUDevice` (not the windowed `Device`) so it works device-only.
+  - `createRgbaTexture(device, w, h)` -> `Texture` (`R8G8B8A8_UNORM`, `SAMPLER`,
+    one mip). `Texture` = `{handle, width, height, device}`; `byteSize()` = w*h*4;
+    `destroy()` once. Channel order R,G,B,A matches `fractal/color.zig` `Rgba8`.
+  - `upload(device, tex, pixels)` — transfer buffer (`UPLOAD`) -> map/memcpy/unmap
+    -> copy pass `SDL_UploadToGPUTexture` -> plain submit. `pixels.len` must equal
+    `tex.byteSize()` or `error.PixelBufferSizeMismatch`.
+  - `download(device, tex, out)` — DIAGNOSTIC/TEST ONLY GPU->CPU readback; never
+    on the hot path. Copy pass `SDL_DownloadFromGPUTexture` -> submit-and-acquire-
+    fence -> `SDL_WaitForGPUFences` -> map/memcpy/unmap.
+  - All SDL failures log `std.log.err` via `message.sdlFailure` and return a Zig
+    `Error` variant — never `unreachable`.
 - `message.zig` — PURE log/summary string builders (`sdlFailure`, `deviceReady`),
   no SDL import, unit-tested in the fast tier. `device.zig` uses them for the
   strings it hands to `std.log`. Add new observability strings here so they stay
@@ -27,9 +40,9 @@ live here and behind `../c.zig`; never leak them into the pure fractal core.
 
 ## Interop rule
 
-`device.zig` imports `../c.zig` (SDL3 + SDL_GPU translated once). Keep pure logic
-in `message.zig` so `zig build test` needs no window/device. The test tier must
-never `@cImport` — only `message.zig` (pure) is imported into `root.zig`.
+`device.zig` and `texture.zig` import `../c.zig` (SDL3 + SDL_GPU). Keep pure logic
+in `message.zig` so the fast tier needs no device. Only `message.zig` (pure) is
+aggregated into `src/root.zig`; C-linking tests use `gpu_headless_test.zig`.
 
 ## Frame lifecycle (driven from main.zig)
 
@@ -48,6 +61,10 @@ Swapchain resize is automatic; re-read size each frame, do nothing special.
 
 - `SDL_CreateGPUDevice` returns an optional pointer -> use `orelse`.
 - Debug mode is enabled in `create` (2nd arg `true`) for validation while in M0.
-- T7 adds `texture.zig` here for CPU RGBA uploads + a headless round-trip test
-  (create a device WITHOUT a window). Keep that path one-directional (no readback
-  in the hot path).
+- Headless GPU test: root `src/gpu_headless_test.zig` (in `src/` so `../c.zig` /
+  `../fractal/*` resolve), the ONE C-linking artifact. `zig build test-gpu` runs
+  it; `zig build test` depends on it. SKIPS cleanly (`error.SkipZigTest`, logged
+  `warn`) when SDL_Init/`SDL_CreateGPUDevice` fail, so no-GPU CI never fails. For
+  a windowless device, `SDL_CreateGPUDevice` WITHOUT `SDL_ClaimWindowForGPUDevice`.
+- Keep the app's RGBA -> texture path one-directional; `download` is the only
+  (test/diagnostic) reverse edge — no hot-path readback.
