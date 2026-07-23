@@ -12,10 +12,10 @@ const c = @import("c.zig").c;
 const gpu = @import("gpu/device.zig");
 const ui_mod = @import("ui/imgui.zig");
 const viewport = @import("fractal/viewport.zig");
-const iterbuf = @import("fractal/iterbuf.zig");
-const color = @import("fractal/color.zig");
+const engine_mod = @import("fractal/engine.zig");
 const texture_mod = @import("gpu/texture.zig");
 const stats_mod = @import("ui/stats.zig");
+const editor_mod = @import("ui/editor.zig");
 const panels = @import("ui/panels.zig");
 
 const app_log = std.log.scoped(.app);
@@ -54,43 +54,41 @@ pub fn main() !void {
     const ui = try ui_mod.Ui.init(window, device);
     defer ui.shutdown();
 
-    // Iterate the fixed Mandelbrot on the CPU (pure core) into a persistent f32
-    // smooth-value buffer, then color it and upload once to a GPU texture. Data flow
-    // is one-directional: iterate -> color -> upload -> display.
-    //
-    // M2 SHIM (T1): iteration is now decoupled into `iterbuf`; coloring here still
-    // uses the M0 grayscale `color.smoothToRgba` at the app EDGE (the pure core no
-    // longer colors). T6 replaces this edge loop with the decoupling engine + the
-    // LUT/mapping color pass so palette edits recolor without re-iterating.
+    // Build the decoupling color engine (T5): it holds the persistent f32 smooth-value
+    // buffer + the RGBA8 output + the default gradient/mapping/interior. `iterate` runs
+    // the EXPENSIVE Mandelbrot pass ONCE at startup and colors with the default palette;
+    // from then on palette/mapping edits (T6, in the UI) rerun ONLY the cheap color pass
+    // and re-upload — the iteration buffer is never recomputed (M2's guarantee). Data
+    // flow is one-directional: iterate -> color -> upload -> display.
     const vp = viewport.Viewport.fixedView(render_w, render_h);
-    const result = iterbuf.iterate(std.heap.page_allocator, vp, max_iter) catch |err| {
+    var engine = engine_mod.Engine.init(std.heap.page_allocator, vp, max_iter) catch |err| {
+        app_log.err("color engine init failed ({s}); aborting startup", .{@errorName(err)});
+        return err;
+    };
+    defer engine.deinit();
+
+    var iterate_timer = std.time.Timer.start() catch null;
+    engine.iterate() catch |err| {
         app_log.err("CPU Mandelbrot iteration failed ({s}); aborting startup", .{@errorName(err)});
         return err;
     };
-    defer std.heap.page_allocator.free(result.values);
-
-    const pixels = try std.heap.page_allocator.alloc(u8, @as(usize, render_w) * @as(usize, render_h) * 4);
-    defer std.heap.page_allocator.free(pixels);
-    for (result.values, 0..) |smooth, i| {
-        const rgba = color.smoothToRgba(smooth, max_iter);
-        pixels[i * 4 + 0] = rgba[0];
-        pixels[i * 4 + 1] = rgba[1];
-        pixels[i * 4 + 2] = rgba[2];
-        pixels[i * 4 + 3] = rgba[3];
-    }
+    const iterate_ns = if (iterate_timer) |*t| t.read() else 0;
 
     const texture = try texture_mod.createRgbaTexture(device.handle, render_w, render_h);
     defer texture.destroy();
-    try texture_mod.upload(device.handle, texture, pixels);
+    try texture_mod.upload(device.handle, texture, engine.output());
 
     var summary_buf: [128]u8 = undefined;
-    const summary = try stats_mod.renderSummary(&summary_buf, render_w, render_h, max_iter, result.elapsed_ns);
+    const summary = try stats_mod.renderSummary(&summary_buf, render_w, render_h, max_iter, iterate_ns);
     app_log.info("{s}", .{summary});
+    var color_buf: [96]u8 = undefined;
+    if (engine.summary(&color_buf)) |line| app_log.info("{s}", .{line}) else |_| {}
 
-    var app_stats = stats_mod.Stats.fromRender(result.elapsed_ns);
+    var app_stats = stats_mod.Stats.fromRender(iterate_ns);
+    var editor = editor_mod.Editor.initDefault();
 
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, texture, vp, &app_stats);
+    runLoop(window, device, ui, texture, vp, &app_stats, &engine, &editor);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -103,6 +101,8 @@ fn runLoop(
     texture: texture_mod.Texture,
     vp: viewport.Viewport,
     app_stats: *stats_mod.Stats,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
 ) void {
     var frame_timer: ?std.time.Timer = std.time.Timer.start() catch |err| blk: {
         app_log.warn("frame timer unavailable ({s}); frame ms will read 0", .{@errorName(err)});
@@ -132,7 +132,7 @@ fn runLoop(
 
         ui.newFrame();
         var quit_requested = false;
-        panels.draw(texture.handle, texture.width, texture.height, vp, max_iter, app_stats.*, &quit_requested);
+        panels.draw(device.handle, texture, vp, max_iter, app_stats.*, engine, editor, &quit_requested);
         if (quit_requested) running = false;
         ui.endFrame();
 

@@ -4,67 +4,68 @@
 
 ## Purpose
 
-Own Dear ImGui: context lifecycle, the SDL3 platform + SDL_GPU renderer backends,
-per-frame new-frame/render/shutdown, and the single fixed M0 window layout.
-C-interop edge — keep ImGui/SDL types here and behind `../c.zig` / `../cimgui.zig`;
-never leak them into the fractal core.
+Own Dear ImGui: context lifecycle, SDL3 + SDL_GPU backends, per-frame
+new-frame/render/shutdown, and the single fixed window layout + palette editor. C-interop
+edge — keep ImGui/SDL types behind `../c.zig` / `../cimgui.zig`; never leak into the core.
 
-## Layout (T8): single window, two fixed regions
+## Layout: single window, two fixed regions
 
-- `panels.zig` — `draw(texture, tex_w, tex_h, vp, max_iter, stats, quit_requested)`.
-  ImGui edge (imports `../c.zig` + `../cimgui.zig`), so NOT pure and NOT registered in
-  `root.zig`. One window pinned to the OS work area (`ffImguiFillMainViewport`), flags
-  = no title/resize/move/collapse/bring-to-front/saved-settings + menu bar. Menu bar:
-  File→Quit (sets `quit_requested.*`), Help→About (modal via `igOpenPopup_Str` +
-  `igBeginPopupModal`). Two side-by-side child regions: the fractal image
-  (`ffImguiImage`, aspect-fit via `stats.containSize`) and a read-only data panel
-  (render/frame ms, dispatch count 0, visible re/im bounds from `vp`, `max_iter`).
-  Text is pre-formatted in Zig and drawn with `igTextUnformatted`.
-- `stats.zig` — PURE, unit-tested, no ImGui/GPU. `Stats{ render_ms, frame_ms,
-  dispatch_count }` (`fromRender(ns)`, `observeFrame(ns)`), `nsToMs`,
-  `containSize(img_w,img_h,region_w,region_h) Size`, and
-  `renderSummary(buf,w,h,max_iter,ns)` — the `.app` startup line
-  `"rendered {w}x{h} Mandelbrot, max_iter={n}, in {ms} ms"`. Registered in `root.zig`.
+- `panels.zig` — `draw(device, texture, vp, max_iter, stats, engine, editor,
+  quit_requested)`. ImGui edge (imports `../c.zig` + `../cimgui.zig`), NOT pure, NOT in
+  `root.zig`. One window pinned to the work area (`ffImguiFillMainViewport`), flags = no
+  title/resize/move/collapse/bring-to-front/saved-settings + menu bar. Menu: File→Quit
+  (sets `quit_requested.*`), Help→About (modal). Left child: fractal image (`ffImguiImage`,
+  aspect-fit via `stats.containSize`). Right child: data panel (render/frame ms, the
+  engine's `iteration passes` + `color passes` counters, live mode + stop count, re/im
+  bounds, `max_iter`) then the **Palette panel**. Text pre-formatted, `igTextUnformatted`.
+- **Palette panel + recolor flow (M2 T6).** Per stop (`igPushID_Int` keys each row):
+  `igColorEdit4` color + `igSliderFloat` pos 0..1 + `igSmallButton` "Remove"; then
+  "Add stop", the mapping `igCombo_Str_arr` (linear/log/cyclic), a period `igSliderFloat`
+  (`igBeginDisabled` unless cyclic), an interior `igColorEdit4`. Widget returns OR into an
+  `Edits{gradient,mapping,interior}`. **Flow = edit → recolor → re-upload, NEVER
+  re-iterate**: `applyEdits` calls the matching setter (`setGradient(editor.toGradient())`
+  / `setMapping(editor.params())` / `setInterior`), re-uploads `engine.output()` via
+  `texture_mod.upload`, logs `engine.summary()` (`.ui`); errors log `std.log.err(.ui)` and
+  skip. `iterate` runs ONCE at startup in `main.zig`.
+- `editor.zig` — PURE UI state, no ImGui, in `root.zig`. `Editor{ stops_buf, count,
+  mode_index, period, interior }`: `initDefault` mirrors `Engine.init`; `toGradient` copies
+  + SORTS stops ascending (a dragged pos never trips the bake's ordering precondition);
+  `params` → `mapping.Params`; `addStop`/`removeStop` keep 1..`max_stops`;
+  `modeToIndex`/`indexToMode` + `mode_items` are the combo↔enum source of truth.
+- `stats.zig` — PURE, unit-tested, no ImGui/GPU, in `root.zig`. `Stats{ render_ms,
+  frame_ms, dispatch_count }` (`fromRender`/`observeFrame`), `nsToMs`, `containSize(...)`,
+  `renderSummary(...)` → the `.app` startup line `"rendered {w}x{h} Mandelbrot, ..."`.
 
 ## Bridge helpers (vendor/bridge, struct-by-value ImGui calls)
 
-`ffImguiFillMainViewport`, `ffImguiContentAvail(&w,&h)`,
-`ffImguiBeginChild(id,w,h,border)`/`ffImguiEndChild`, `ffImguiImage(tex,w,h)` wrap
-ImGui calls taking `ImVec2`/`ImTextureRef` by value, exposing plain scalars so Zig
-avoids struct-ABI concerns. `ffImguiImage` passes the raw `SDL_GPUTexture*` as the
-`ImTextureID` (Dear ImGui 1.92, 2025/08/08+); the backend supplies the sampler.
+`ffImguiFillMainViewport`, `ffImguiContentAvail`, `ffImguiBeginChild`/`ffImguiEndChild`,
+`ffImguiImage` wrap ImGui calls taking `ImVec2`/`ImTextureRef` by value, exposing scalars so
+Zig avoids struct-ABI concerns. `ffImguiImage` passes the raw `SDL_GPUTexture*` as the
+`ImTextureID` (1.92+). The T6 widgets need no bridge (scalar/pointer sigs).
 
 ## The stack + C-interop boundary
 
-- Vendored, compiled from source by `build.zig`: cimgui + Dear ImGui **docking**
-  branch + `imgui_impl_sdl3` + `imgui_impl_sdlgpu3`. M0 is a **single, non-docking**
-  window — do NOT set the docking config flag (vendored only for M2/M3).
-- `../c.zig` (`@cImport`) — SDL3, SDL_GPU, and the backend bridge `imgui_bridge.h`.
-- `../cimgui.zig` — a thin hand-written `extern` header for the ImGui **core** C API
-  (`igCreateContext`, `igNewFrame`, `igRender`, `igBegin`, `igEnd`,
-  `igTextUnformatted`, ...). We do NOT `@cImport cimgui.h`: its docking build embeds
-  C-bitfield structs that translate-c turns into `opaque{}`. Grow it as needed.
-- `vendor/bridge/imgui_bridge.{h,cpp}` — first-party C-linkage shim wrapping the C++
-  backends (init/event/new-frame/prepare/render/shutdown) using only SDL types.
+- Vendored, compiled by `build.zig`: cimgui + Dear ImGui **docking** branch + SDL3/SDLGPU3
+  backends. Single, non-docking window — do NOT set the docking config flag.
+- `../c.zig` (`@cImport`) — SDL3, SDL_GPU, bridge `imgui_bridge.h`.
+- `../cimgui.zig` — hand-written `extern` decls for the ImGui **core** C API (context, text,
+  menus, and the T6 widgets `igColorEdit4`/`igSliderFloat`/`igCombo_Str_arr`/`igPushID_Int`/
+  `igBeginDisabled`/`igSeparatorText`). NOT `@cImport cimgui.h` (docking bitfield structs
+  become `opaque{}`). Grow as needed.
+- `vendor/bridge/imgui_bridge.{h,cpp}` — C-linkage shim over the C++ backends, SDL types only.
 
 ## `Ui` (imgui.zig)
 
-- `Ui.init(window, device)` — `igCreateContext`, then `ffImguiInitBackends(window,
-  device.handle, device.swapchainTextureFormat())`. Logs `std.log.scoped(.ui)`;
-  returns `error.ImGuiContextCreationFailed` / `error.ImGuiBackendInitFailed` — no panic.
-- Per frame: `newFrame()` → build UI → `endFrame()` (`igRender`) →
-  `prepareDrawData(cmd)` BEFORE the render pass → `renderDrawData(cmd, pass)` inside it.
-- `processEvent(&event)` feeds SDL events to the platform backend.
-- `shutdown()` tears down backends (renderer before platform), then the context.
-
-## Init / shutdown order (whole app, main.zig)
-
-Up: `SDL_Init(VIDEO)` → `SDL_CreateWindow` → `Device.create` → `Ui.init`. Down
-(reverse, via `defer`): `Ui.shutdown` → `Device.destroy` → `SDL_DestroyWindow` →
-`SDL_Quit`.
+- `Ui.init(window, device)` — `igCreateContext` + `ffImguiInitBackends(...)`. Logs `.ui`;
+  returns `error.ImGuiContextCreationFailed`/`error.ImGuiBackendInitFailed` — no panic.
+- Per frame: `newFrame()` → build UI → `endFrame()` (`igRender`) → `prepareDrawData(cmd)`
+  BEFORE the render pass → `renderDrawData(cmd, pass)` inside it. `processEvent(&event)`
+  feeds SDL events. `shutdown()` tears down backends (renderer before platform) then context.
+- App order (main.zig) up: `SDL_Init` → `CreateWindow` → `Device.create` → `Ui.init`; down
+  (defer, reverse): `Ui.shutdown` → `Device.destroy` → `DestroyWindow` → `SDL_Quit`.
 
 ## Testing
 
-Window/backends/layout are visual: manual smoke (`zig build run`) + a log check for
-`driver=metal`, "Dear ImGui initialized", and the `rendered ...` summary. Pure logic
-(`stats.zig`, `../gpu/message.zig`) IS unit-tested.
+Window/backends/layout/palette recolor are visual: manual smoke (`zig build run`) + a log
+check for `driver=metal`, "Dear ImGui initialized", the `rendered ...` and `color pass ...`
+summaries. Pure logic (`stats.zig`, `editor.zig`, `../gpu/message.zig`) IS unit-tested.

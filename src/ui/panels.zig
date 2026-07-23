@@ -11,7 +11,12 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const ig = @import("../cimgui.zig");
 const stats = @import("stats.zig");
+const editor_mod = @import("editor.zig");
 const viewport = @import("../fractal/viewport.zig");
+const engine_mod = @import("../fractal/engine.zig");
+const texture_mod = @import("../gpu/texture.zig");
+
+const ui_log = std.log.scoped(.ui);
 
 const window_name = "fractalforge";
 const about_popup = "About fractalforge";
@@ -33,15 +38,20 @@ const window_flags: ig.WindowFlags =
     ig.window_flags_menu_bar;
 
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and
-/// `Ui.endFrame`. Sets `quit_requested.*` when File→Quit is chosen; everything
-/// else is drawn read-only. `texture` is the uploaded Mandelbrot (T7).
+/// `Ui.endFrame`. Sets `quit_requested.*` when File→Quit is chosen.
+///
+/// The palette panel edits `editor`; on ANY change it drives the matching engine setter
+/// (`setGradient`/`setMapping`/`setInterior`) and RE-UPLOADS the engine's RGBA buffer to
+/// `texture` — it NEVER calls `iterate`. The data panel surfaces the engine's two pass
+/// counters so that decoupling is visible.
 pub fn draw(
-    texture: *c.SDL_GPUTexture,
-    tex_w: u32,
-    tex_h: u32,
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
     vp: viewport.Viewport,
     max_iter: u32,
     s: stats.Stats,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
     quit_requested: *bool,
 ) void {
     c.ffImguiFillMainViewport();
@@ -56,13 +66,15 @@ pub fn draw(
         if (fractal_w < 0) fractal_w = 0;
 
         _ = c.ffImguiBeginChild("fractal_region", fractal_w, 0, true);
-        drawFractal(texture, tex_w, tex_h);
+        drawFractal(texture.handle, texture.width, texture.height);
         c.ffImguiEndChild();
 
         ig.igSameLine(0, region_spacing);
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
-        drawDataPanel(vp, max_iter, s);
+        drawDataPanel(vp, max_iter, s, engine);
+        ig.igSpacing();
+        drawPalettePanel(device, texture, engine, editor);
         c.ffImguiEndChild();
 
         drawAboutModal();
@@ -102,9 +114,11 @@ fn drawFractal(texture: *c.SDL_GPUTexture, tex_w: u32, tex_h: u32) void {
     c.ffImguiImage(texture, fit.w, fit.h);
 }
 
-/// Read-only observability panel: render/frame ms, dispatch count, the visible
-/// complex-plane bounds, and max_iter. Bounds are derived from the fixed viewport.
-fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats) void {
+/// Read-only observability panel: render/frame ms, the decoupling PASS COUNTERS (iteration
+/// vs color) plus the live mode + stop count, the visible complex-plane bounds, and
+/// max_iter. The counters make the milestone guarantee visible: a palette/mapping edit
+/// bumps `color passes` while `iteration passes` stays fixed.
+fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *const engine_mod.Engine) void {
     const w: f64 = @floatFromInt(vp.width);
     const h: f64 = @floatFromInt(vp.height);
     const re_min = vp.center_re - (w / 2.0) * vp.scale;
@@ -116,7 +130,10 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats) void {
     ig.igSeparator();
     textf("CPU render: {d:.2} ms", .{s.render_ms});
     textf("Frame: {d:.2} ms", .{s.frame_ms});
-    textf("Dispatches: {d}", .{s.dispatch_count});
+    textf("iteration passes: {d}", .{engine.iteration_passes});
+    textf("color passes: {d}", .{engine.color_passes});
+    textf("mode: {s}", .{@tagName(engine.params.mode)});
+    textf("stops: {d}", .{engine.gradient.count});
 
     ig.igSpacing();
     ig.igTextUnformatted("Viewport", null);
@@ -124,6 +141,133 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats) void {
     textf("re: [{d:.4}, {d:.4}]", .{ re_min, re_max });
     textf("im: [{d:.4}, {d:.4}]", .{ im_min, im_max });
     textf("max_iter: {d}", .{max_iter});
+}
+
+/// The mapping-mode combo labels as null-terminated C pointers, derived at comptime from
+/// the pure `editor.mode_items` (the single source of truth for label + order) so the two
+/// never drift. `igCombo_Str_arr` wants `[*:0]const u8` entries, not slices.
+const mode_items_c = blk: {
+    var arr: [editor_mod.mode_items.len][*:0]const u8 = undefined;
+    for (editor_mod.mode_items, 0..) |s, i| arr[i] = s.ptr;
+    break :blk arr;
+};
+
+/// Which editable inputs a frame's widget interactions touched. Accumulated while drawing
+/// so the edge runs exactly the matching engine setter(s) once and re-uploads once.
+const Edits = struct {
+    gradient: bool = false,
+    mapping: bool = false,
+    interior: bool = false,
+
+    fn any(self: Edits) bool {
+        return self.gradient or self.mapping or self.interior;
+    }
+};
+
+/// The palette editor + mapping selector. Draws the stop list (color + position, with
+/// per-row Remove), Add-stop, the mapping combo + cyclic-period slider, and the interior
+/// color edit. On ANY change it applies the edit to `engine` and re-uploads to `texture`
+/// via `applyEdits` — never re-iterating.
+fn drawPalettePanel(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
+) void {
+    var edits = Edits{};
+
+    ig.igSeparatorText("Palette");
+    var i: usize = 0;
+    while (i < editor.count) : (i += 1) {
+        ig.igPushID_Int(@intCast(i));
+        defer ig.igPopID();
+
+        var col = colorToFloats(editor.stops_buf[i].color);
+        if (ig.igColorEdit4("color", &col, 0)) {
+            editor.stops_buf[i].color = floatsToColor(col);
+            edits.gradient = true;
+        }
+        if (ig.igSliderFloat("pos", &editor.stops_buf[i].pos, 0.0, 1.0, "%.3f", 0)) {
+            edits.gradient = true;
+        }
+        if (ig.igSmallButton("Remove")) {
+            if (editor.removeStop(i)) edits.gradient = true;
+        }
+    }
+    if (ig.igSmallButton("Add stop")) {
+        if (editor.addStop()) edits.gradient = true;
+    }
+
+    ig.igSeparatorText("Mapping");
+    if (ig.igCombo_Str_arr("mode", &editor.mode_index, &mode_items_c, mode_items_c.len, -1)) {
+        edits.mapping = true;
+    }
+    // The period only affects the cyclic mode, so disable it otherwise for clarity.
+    const cyclic = editor.mode() == .cyclic;
+    ig.igBeginDisabled(!cyclic);
+    if (ig.igSliderFloat("period", &editor.period, 1.0, 128.0, "%.1f", 0)) {
+        edits.mapping = true;
+    }
+    ig.igEndDisabled();
+
+    ig.igSeparatorText("Interior");
+    var interior = colorToFloats(editor.interior);
+    if (ig.igColorEdit4("interior", &interior, 0)) {
+        editor.interior = floatsToColor(interior);
+        edits.interior = true;
+    }
+
+    if (edits.any()) applyEdits(device, texture, engine, editor, edits);
+}
+
+/// Apply the frame's edits to the engine and re-upload the recolored buffer. Runs ONLY
+/// the color pass (never `iterate`). On an engine or upload failure logs `std.log.err`
+/// (scope `.ui`) with actionable context and skips the frame's update rather than
+/// crashing; on success logs the engine's one-line recolor summary.
+fn applyEdits(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
+    edits: Edits,
+) void {
+    if (edits.gradient) engine.setGradient(editor.toGradient()) catch |err| {
+        ui_log.err("palette edit rejected ({s}); keeping previous colors", .{@errorName(err)});
+        return;
+    };
+    if (edits.mapping) engine.setMapping(editor.params()) catch |err| {
+        ui_log.err("mapping edit rejected ({s}); keeping previous colors", .{@errorName(err)});
+        return;
+    };
+    if (edits.interior) engine.setInterior(editor.interior) catch |err| {
+        ui_log.err("interior edit rejected ({s}); keeping previous colors", .{@errorName(err)});
+        return;
+    };
+
+    texture_mod.upload(device, texture, engine.output()) catch |err| {
+        ui_log.err("re-upload of recolored buffer failed ({s})", .{@errorName(err)});
+        return;
+    };
+
+    var buf: [96]u8 = undefined;
+    const summary = engine.summary(&buf) catch return;
+    ui_log.info("{s}", .{summary});
+}
+
+/// Convert an `Rgba8` (0..255) to the `[4]f32` in `[0,1]` that `igColorEdit4` edits.
+fn colorToFloats(color: [4]u8) [4]f32 {
+    var out: [4]f32 = undefined;
+    inline for (0..4) |k| out[k] = @as(f32, @floatFromInt(color[k])) / 255.0;
+    return out;
+}
+
+/// Convert an edited `[4]f32` in `[0,1]` back to an `Rgba8`, rounding and clamping.
+fn floatsToColor(col: [4]f32) [4]u8 {
+    var out: [4]u8 = undefined;
+    inline for (0..4) |k| {
+        out[k] = @intFromFloat(@round(std.math.clamp(col[k], 0.0, 1.0) * 255.0));
+    }
+    return out;
 }
 
 /// The Help→About modal. Draw unconditionally each frame; ImGui shows it only after
