@@ -73,6 +73,24 @@ pure: no globals, no clock/random, deterministic. Register each new module in
     `0..1023`, texel `lut[idx]`. Alpha FORCED 255 both branches — always OPAQUE (matches
     M0 color.zig). `max_iter` is a param (mapToUnit needs it; spec signature omitted it).
     M0's RGBA golden lives here (interior/exterior key-pixel color, all-255 alpha, mirror).
+- `engine.zig` — shipped (M2 T5), the DECOUPLING crux. Pure (no SDL/GPU/log): owns the
+  persistent CPU pipeline state + the guarantee that palette/mapping edits recolor WITHOUT
+  re-iterating. Composes T1–T4; no new math. `Engine` holds `iter: []f32`, `rgba: []u8`,
+  `vp`, `max_iter`, `gradient` + baked `lut: [1024]Rgba8`, `params`, `interior: Rgba8`, and
+  counters `iteration_passes`/`color_passes` (public, read-only). Symbols:
+  - `init(alloc, vp, max_iter) !Engine` — allocs+zeroes both buffers, installs
+    `gradient.default()` (baked), linear mapping, opaque-black interior; counters 0; does
+    NOT iterate. `deinit()` frees. Caller owns lifetime.
+  - `iterate() EngineError!void` — refills smooth buffer (`iterbuf`) then recolors; bumps
+    BOTH counters. Only path touching `iteration_passes`.
+  - `setGradient(g)` / `setMapping(params)` / `setInterior(c) EngineError!void` — re-bake
+    LUT if needed + rerun ONLY the color pass; bump `color_passes`, leave
+    `iteration_passes` UNCHANGED. `setGradient` returns `EmptyGradient` (before mutating)
+    if `g.count == 0`.
+  - `output() []const u8` — current RGBA8 for upload. `summary(buf)`/free
+    `colorPassSummary(buf, n, mode, stops)` → `"color pass {n}: mode={s}, stops={k}"`
+    (pure, exact-string tested; the edge/T6 logs it via `std.log`).
+  - `EngineError{ EmptyGradient, BufferSizeMismatch }` — typed, never `unreachable`.
 
 ## Coordinate convention (do not get this wrong)
 

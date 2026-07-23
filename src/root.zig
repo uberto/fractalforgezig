@@ -22,6 +22,7 @@ test {
     _ = @import("fractal/mapping.zig");
     _ = @import("fractal/iterbuf.zig");
     _ = @import("fractal/colorpass.zig");
+    _ = @import("fractal/engine.zig");
     _ = @import("ui/stats.zig");
     std.testing.refAllDecls(@This());
 }
