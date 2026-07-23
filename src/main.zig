@@ -12,7 +12,8 @@ const c = @import("c.zig").c;
 const gpu = @import("gpu/device.zig");
 const ui_mod = @import("ui/imgui.zig");
 const viewport = @import("fractal/viewport.zig");
-const fractal_render = @import("fractal/render.zig");
+const iterbuf = @import("fractal/iterbuf.zig");
+const color = @import("fractal/color.zig");
 const texture_mod = @import("gpu/texture.zig");
 const stats_mod = @import("ui/stats.zig");
 const panels = @import("ui/panels.zig");
@@ -53,22 +54,34 @@ pub fn main() !void {
     const ui = try ui_mod.Ui.init(window, device);
     defer ui.shutdown();
 
-    // Render the fixed Mandelbrot on the CPU (pure core) and upload it once to a
-    // GPU texture. Data flow is one-directional: render -> upload -> display.
+    // Iterate the fixed Mandelbrot on the CPU (pure core) into a persistent f32
+    // smooth-value buffer, then color it and upload once to a GPU texture. Data flow
+    // is one-directional: iterate -> color -> upload -> display.
+    //
+    // M2 SHIM (T1): iteration is now decoupled into `iterbuf`; coloring here still
+    // uses the M0 grayscale `color.smoothToRgba` at the app EDGE (the pure core no
+    // longer colors). T6 replaces this edge loop with the decoupling engine + the
+    // LUT/mapping color pass so palette edits recolor without re-iterating.
     const vp = viewport.Viewport.fixedView(render_w, render_h);
-    const result = fractal_render.render(std.heap.page_allocator, vp, max_iter) catch |err| {
-        app_log.err("CPU Mandelbrot render failed ({s}); aborting startup", .{@errorName(err)});
+    const result = iterbuf.iterate(std.heap.page_allocator, vp, max_iter) catch |err| {
+        app_log.err("CPU Mandelbrot iteration failed ({s}); aborting startup", .{@errorName(err)});
         return err;
     };
-    var pixels_owned = true;
-    defer if (pixels_owned) std.heap.page_allocator.free(result.pixels);
+    defer std.heap.page_allocator.free(result.values);
+
+    const pixels = try std.heap.page_allocator.alloc(u8, @as(usize, render_w) * @as(usize, render_h) * 4);
+    defer std.heap.page_allocator.free(pixels);
+    for (result.values, 0..) |smooth, i| {
+        const rgba = color.smoothToRgba(smooth, max_iter);
+        pixels[i * 4 + 0] = rgba[0];
+        pixels[i * 4 + 1] = rgba[1];
+        pixels[i * 4 + 2] = rgba[2];
+        pixels[i * 4 + 3] = rgba[3];
+    }
 
     const texture = try texture_mod.createRgbaTexture(device.handle, render_w, render_h);
     defer texture.destroy();
-    try texture_mod.upload(device.handle, texture, result.pixels);
-    // Upload copied the bytes into the GPU transfer buffer; the CPU copy is done.
-    std.heap.page_allocator.free(result.pixels);
-    pixels_owned = false;
+    try texture_mod.upload(device.handle, texture, pixels);
 
     var summary_buf: [128]u8 = undefined;
     const summary = try stats_mod.renderSummary(&summary_buf, render_w, render_h, max_iter, result.elapsed_ns);
