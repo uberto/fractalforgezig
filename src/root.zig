@@ -18,6 +18,7 @@ test {
     _ = @import("fractal/viewport.zig");
     _ = @import("fractal/mandelbrot.zig");
     _ = @import("fractal/color.zig");
+    _ = @import("fractal/gradient.zig");
     _ = @import("fractal/iterbuf.zig");
     _ = @import("ui/stats.zig");
     std.testing.refAllDecls(@This());

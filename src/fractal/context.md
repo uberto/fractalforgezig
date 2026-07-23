@@ -28,6 +28,17 @@ pure: no globals, no clock/random, deterministic. Register each new module in
 - `color.zig` — M0 grayscale STOPGAP. `smoothToRgba(smooth, max_iter) Rgba8`
   (grayscale + opaque-black `interior_color`); `Rgba8 = [4]u8`. Superseded by the M2
   color pass (T4); do not extend it.
+- `gradient.zig` — shipped (M2 T2). Pure palette model + LUT bake. Reuses
+  `color.Rgba8` (does NOT redefine it). Symbols:
+  - `Stop{ pos: f32 in [0,1], color: Rgba8 }`; `Gradient` = fixed-cap (`max_stops`=32)
+    ascending-`pos` array (`count` + `stops_buf`). `Gradient.fromStops(slice)` copies
+    (debug-asserts ≥1 stop, ascending, pos in `[0,1]`); `Gradient.stops()` → slice.
+  - `lut_size` = 1024. `bakeLut(gradient, out: *[1024]Rgba8) void` — texel `i` samples
+    `t = i/1023`, per-channel LINEAR interp of bracketing stops, CLAMPED to end colors
+    outside `[first.pos, last.pos]`. Pure/deterministic, no alloc.
+  - `default() Gradient` — 5-stop deep-blue→blue→white→orange→dark palette, all opaque.
+  - ALPHA convention: interpolated per-channel like RGB, NOT forced; defaults are 255.
+    Interior color stays outside the LUT (plan A5). Consumed by the T4 color pass.
 - `iterbuf.zig` — shipped (T1). ITERATION stage only: fills a persistent `[]f32`
   smooth-value buffer (CPU analogue of the spec's `R32Float` texture). Does NO
   coloring — M2 decouples iterate-once from recolor-cheap. Reuses
