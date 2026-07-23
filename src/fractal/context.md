@@ -39,6 +39,15 @@ pure: no globals, no clock/random, deterministic. Register each new module in
   - `default() Gradient` — 5-stop deep-blue→blue→white→orange→dark palette, all opaque.
   - ALPHA convention: interpolated per-channel like RGB, NOT forced; defaults are 255.
     Interior color stays outside the LUT (plan A5). Consumed by the T4 color pass.
+- `mapping.zig` — shipped (M2 T3). Pure smooth→`[0,1]` LUT-index transforms; the T4
+  color pass calls it per pixel, the UI (T6) selects the mode. Symbols:
+  - `Mode = enum { linear, log, cyclic }`; `Params{ mode: Mode = .linear, period: f32
+    = default_period (32.0) }` (`period` used only by `cyclic`, MUST be `> 0`).
+  - `mapToUnit(smooth: f32, max_iter: u32, params) f32` — CLAMPED to `[0,1]` (cyclic to
+    `[0,1)`). linear `smooth/max_iter`; log `log(1+smooth)/log(1+max_iter)` (compresses
+    the fast-escaping exterior); cyclic `fract(smooth/period)` (repeating bands).
+    Guards: negative/non-finite `smooth` → 0; `max_iter == 0` and `period <= 0` → 0
+    (no divide-by-zero). Pure/deterministic. Formulas documented inline for GPU parity.
 - `iterbuf.zig` — shipped (T1). ITERATION stage only: fills a persistent `[]f32`
   smooth-value buffer (CPU analogue of the spec's `R32Float` texture). Does NO
   coloring — M2 decouples iterate-once from recolor-cheap. Reuses
