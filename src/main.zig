@@ -103,7 +103,18 @@ fn runLoop(
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             _ = ui.processEvent(&event);
-            if (event.type == c.SDL_EVENT_QUIT) running = false;
+            // Quit on an explicit app-quit, or when the main window's close
+            // button is pressed. SDL3 delivers the latter as
+            // SDL_EVENT_WINDOW_CLOSE_REQUESTED (not always SDL_EVENT_QUIT), so
+            // handle it directly for the window we own — otherwise closing the
+            // window leaves the process running with no visible window.
+            switch (event.type) {
+                c.SDL_EVENT_QUIT => running = false,
+                c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
+                    if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
+                },
+                else => {},
+            }
         }
 
         ui.newFrame();
