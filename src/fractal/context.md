@@ -62,6 +62,17 @@ pure: no globals, no clock/random, deterministic. Register each new module in
     lives ONLY here — never assert on `elapsed_ns` magnitude.
   - Golden test = key-pixel assertions on the 64x48 fixed view (interior sentinel,
     slow-escape exterior, top/bottom symmetry). RGBA golden moved to T4.
+- `colorpass.zig` — shipped (M2 T4). The CHEAP pass: composes `iterbuf`+`gradient` LUT
+  +`mapping` into RGBA8; reruns on palette/mapping change WITHOUT re-iterating. Reuses
+  `color.Rgba8`; no new coloring math. Symbol:
+  - `colorInto(rgba: []u8, iter: []const f32, lut: *const [1024]Rgba8, max_iter: u32,
+    params: mapping.Params, interior: Rgba8) ColorError!void` — PURE, no alloc, writes
+    into `rgba`. `rgba.len` must equal `iter.len*4` else `ColorError.BufferSizeMismatch`
+    (guard runs BEFORE any write; no logging). Per pixel: sentinel `-1.0` → `interior`;
+    else `t=mapToUnit(smooth,max_iter,params)`, `idx=@intFromFloat(t*1023)` CLAMPED to
+    `0..1023`, texel `lut[idx]`. Alpha FORCED 255 both branches — always OPAQUE (matches
+    M0 color.zig). `max_iter` is a param (mapToUnit needs it; spec signature omitted it).
+    M0's RGBA golden lives here (interior/exterior key-pixel color, all-255 alpha, mirror).
 
 ## Coordinate convention (do not get this wrong)
 
