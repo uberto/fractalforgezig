@@ -22,16 +22,278 @@ pub const Complex = struct {
     im: f64,
 };
 
-/// The fixed M0 target region on the complex plane (plan non-goal: no navigation).
-/// The constructed viewport is guaranteed to *contain* this whole region; on an
-/// image whose aspect ratio differs from `re_range : im_range` the longer axis
-/// gets extra margin rather than stretching the set.
+/// The fixed M0 target region on the complex plane (M0 non-goal: no navigation). M3 keeps
+/// it as the *home* region: `SquareView.defaultView()` is the square that contains it.
 pub const fixed_re_min: f64 = -2.5;
 pub const fixed_re_max: f64 = 1.0;
 pub const fixed_im_min: f64 = -1.25;
 pub const fixed_im_max: f64 = 1.25;
 
-/// A view onto the complex plane, parameterized so pixels are square.
+/// Rejected view geometry. Returned (never logged — this module is log-free, see
+/// `src/fractal/context.md`) so the edge that accepted the input (T7's coordinate panel,
+/// T6's gestures) logs `std.log.err` and shows the user a message; build that message
+/// with `degenerateRegionMessage` so there is exactly one wording.
+pub const ViewportError = error{
+    /// The requested region has no usable extent: a zero/negative/non-finite side or
+    /// magnification, or two identical corners.
+    DegenerateRegion,
+};
+
+/// The M3 model: the region of the complex plane the fractal is rendered from, always a
+/// SQUARE (plan A1: aspect == 1, so a letterboxed square image is never distorted).
+/// A plain value — every transform (T2) returns a NEW `SquareView`.
+///
+/// Two equivalent, lossless representations (plan A3), both editable in T7's panel:
+///   * **center + magnification** — `centerMag()` / `fromCenterMag()`, where
+///     `magnification = 1 / |diagonal| = 1 / (side · √2)` and therefore
+///     `side = 1 / (magnification · √2)`. Halving the side doubles the magnification.
+///   * **two opposite corners** — `corners()` / `fromCorners()`; a non-square input
+///     rectangle is SNAPPED to the square that contains it (side = the larger of
+///     `|Δre|`, `|Δim|`, centered on the midpoint of the two inputs), so a selection is
+///     expanded on at most one axis and never distorted.
+///
+/// Pixels come in only as a square image side `S` (px): the view carries no resolution
+/// (plan A2 — `S = min(window_w, window_h)`, chosen by T5). See `pixelToComplex`.
+///
+/// M7 seam: `center_re`/`center_im` are `f64` (see the file header). Keep precision-
+/// sensitive math inside this struct so widening the center stays a local change.
+pub const SquareView = struct {
+    center_re: f64,
+    center_im: f64,
+    /// Side length of the square region in complex-plane units. Always finite and > 0
+    /// for a view built through the constructors below.
+    side: f64,
+
+    /// The default (home) view: the smallest square CONTAINING the M0 fixed region,
+    /// i.e. center `(-0.75, 0)`, side 3.5 (the larger axis, `|Δre|`), so
+    /// `re ∈ [-2.5, 1.0]`, `im ∈ [-1.75, 1.75]`, magnification `1/(3.5·√2) ≈ 0.2020305`.
+    /// Always valid, so it needs no error union; T2's `reset()` returns exactly this.
+    pub fn defaultView() SquareView {
+        return .{
+            .center_re = (fixed_re_min + fixed_re_max) / 2.0,
+            .center_im = (fixed_im_min + fixed_im_max) / 2.0,
+            .side = @max(fixed_re_max - fixed_re_min, fixed_im_max - fixed_im_min),
+        };
+    }
+
+    /// The validating constructor every other one funnels into: rejects a non-finite
+    /// center and a side that is not finite and positive.
+    pub fn fromCenterSide(center_point: Complex, side: f64) ViewportError!SquareView {
+        if (!isFiniteComplex(center_point)) return ViewportError.DegenerateRegion;
+        if (!std.math.isFinite(side) or side <= 0.0) return ViewportError.DegenerateRegion;
+        return .{ .center_re = center_point.re, .center_im = center_point.im, .side = side };
+    }
+
+    /// The view's center on the complex plane.
+    pub fn center(self: SquareView) Complex {
+        return .{ .re = self.center_re, .im = self.center_im };
+    }
+
+    /// Unitless zoom scalar, `1 / |diagonal| = 1 / (side · √2)` (plan A3). T3's adaptive
+    /// `max_iter` heuristic and T7's panel both read this — do not recompute it.
+    pub fn magnification(self: SquareView) f64 {
+        return 1.0 / (self.side * sqrt2);
+    }
+
+    /// This view in center + magnification form.
+    pub fn centerMag(self: SquareView) CenterMag {
+        return .{ .center = self.center(), .magnification = self.magnification() };
+    }
+
+    /// Build a view from center + magnification: `side = 1 / (magnification · √2)`.
+    pub fn fromCenterMag(cm: CenterMag) ViewportError!SquareView {
+        if (!std.math.isFinite(cm.magnification) or cm.magnification <= 0.0) {
+            return ViewportError.DegenerateRegion;
+        }
+        return fromCenterSide(cm.center, 1.0 / (cm.magnification * sqrt2));
+    }
+
+    /// This view as its two opposite corners: `min` = bottom-left (min re, min im),
+    /// `max` = top-right (max re, max im).
+    pub fn corners(self: SquareView) Corners {
+        const h = self.side / 2.0;
+        return .{
+            .min = .{ .re = self.center_re - h, .im = self.center_im - h },
+            .max = .{ .re = self.center_re + h, .im = self.center_im + h },
+        };
+    }
+
+    /// Build a view from any two opposite corners, in any order, SNAPPED to a square:
+    /// `side = max(|Δre|, |Δim|)` centered on the midpoint of `a` and `b` (plan A1). The
+    /// result therefore always contains the input rectangle, expanded on the shorter axis
+    /// only. Identical corners (zero extent) are a `DegenerateRegion`.
+    pub fn fromCorners(a: Complex, b: Complex) ViewportError!SquareView {
+        if (!isFiniteComplex(a) or !isFiniteComplex(b)) return ViewportError.DegenerateRegion;
+        const side = @max(@abs(b.re - a.re), @abs(b.im - a.im));
+        const mid = Complex{ .re = (a.re + b.re) / 2.0, .im = (a.im + b.im) / 2.0 };
+        return fromCenterSide(mid, side);
+    }
+
+    /// Map an IMAGE-space pixel to the complex plane for a square image of side
+    /// `image_side` px. `(0, 0)` is the top-left corner of the image and
+    /// `(image_side, image_side)` its bottom-right corner, so pixel `(i + 0.5, j + 0.5)`
+    /// is the center of pixel `(i, j)`. `py` is negated: pixel-y grows DOWN while `im`
+    /// grows UP (see the file header). Precondition: `image_side > 0` — callers that may
+    /// see a minimized window (T5/T6) go through `cursorCoord`, which is null-safe.
+    pub fn pixelToComplex(self: SquareView, px: f64, py: f64, image_side: u32) Complex {
+        std.debug.assert(image_side > 0);
+        const s: f64 = @floatFromInt(image_side);
+        return .{
+            .re = self.center_re + (px / s - 0.5) * self.side,
+            .im = self.center_im - (py / s - 0.5) * self.side,
+        };
+    }
+
+    /// Inverse of `pixelToComplex` at the same `image_side`: the (continuous) image-space
+    /// pixel a complex point lands on. Values outside `[0, image_side]` mean the point is
+    /// outside the view. Precondition: `image_side > 0`.
+    pub fn complexToPixel(self: SquareView, c: Complex, image_side: u32) Pixel {
+        std.debug.assert(image_side > 0);
+        const s: f64 = @floatFromInt(image_side);
+        return .{
+            .x = ((c.re - self.center_re) / self.side + 0.5) * s,
+            .y = ((self.center_im - c.im) / self.side + 0.5) * s,
+        };
+    }
+
+    /// The complex value under a WINDOW-space pixel, mapped through the letterboxed
+    /// image rect, or `null` when the pixel is on a letterbox bar (or the rect is
+    /// degenerate, e.g. a minimized window). This is the hover-readout and gesture-anchor
+    /// entry point: T6 feeds it raw mouse coordinates plus T5's image rect.
+    pub fn cursorCoord(self: SquareView, window_x: f64, window_y: f64, rect: ImageRect) ?Complex {
+        const p = rect.toImagePixel(window_x, window_y) orelse return null;
+        return self.pixelToComplex(p.x, p.y, rect.side);
+    }
+
+    /// Bridge to the M0/M2 `Viewport` that `iterbuf`/`engine` iterate over: the same
+    /// region as a square `image_side × image_side` image. Exists so the pixel↔complex
+    /// math has ONE definition (pinned by a test that both mappings agree); T4 calls it
+    /// instead of deriving `scale` itself. Precondition: `image_side > 0`.
+    pub fn imageViewport(self: SquareView, image_side: u32) Viewport {
+        std.debug.assert(image_side > 0);
+        const s: f64 = @floatFromInt(image_side);
+        return .{
+            .center_re = self.center_re,
+            .center_im = self.center_im,
+            .scale = self.side / s,
+            .width = image_side,
+            .height = image_side,
+        };
+    }
+};
+
+/// `√2`, the diagonal-to-side ratio of a square — the constant in plan A3's
+/// magnification formula. Computed at comptime.
+const sqrt2: f64 = @sqrt(2.0);
+
+fn isFiniteComplex(c: Complex) bool {
+    return std.math.isFinite(c.re) and std.math.isFinite(c.im);
+}
+
+/// The center + magnification form of a `SquareView` (see `SquareView.centerMag`).
+pub const CenterMag = struct {
+    center: Complex,
+    magnification: f64,
+};
+
+/// The two-opposite-corners form of a `SquareView`: `min` is bottom-left, `max` is
+/// top-right (see `SquareView.corners`).
+pub const Corners = struct {
+    min: Complex,
+    max: Complex,
+};
+
+/// A continuous pixel coordinate (image or window space, whichever the API says).
+pub const Pixel = struct {
+    x: f64,
+    y: f64,
+};
+
+/// The letterboxed square image inside the window (plan A2): its top-left origin in
+/// window pixels plus its side `side` px. T5 computes it as
+/// `side = min(window_w, window_h)` centered in the window; this module only CONSUMES it,
+/// so the two concerns stay separately testable.
+pub const ImageRect = struct {
+    x: i32,
+    y: i32,
+    side: u32,
+
+    /// Window-space pixel → image-space pixel, or `null` when the pixel is not on the
+    /// image. The rect is HALF-OPEN (`[x, x + side)`) so every window pixel belongs to at
+    /// most one of image/bar; a zero `side` (minimized window) contains nothing.
+    pub fn toImagePixel(self: ImageRect, window_x: f64, window_y: f64) ?Pixel {
+        if (self.side == 0) return null;
+        const ox: f64 = @floatFromInt(self.x);
+        const oy: f64 = @floatFromInt(self.y);
+        const s: f64 = @floatFromInt(self.side);
+        const px = window_x - ox;
+        const py = window_y - oy;
+        if (px < 0.0 or py < 0.0 or px >= s or py >= s) return null;
+        return .{ .x = px, .y = py };
+    }
+};
+
+/// Decimals the coordinate readout shows at the shallowest zoom.
+pub const min_coord_digits: usize = 4;
+/// Decimal cap: f64 holds ~17 decimals for the |re|, |im| ≲ 3 of the Mandelbrot region,
+/// so more digits would be noise.
+pub const max_coord_digits: usize = 17;
+
+/// Buffer size that fits any `formatCoord` result for a view inside the Mandelbrot region
+/// (two signed numbers at `max_coord_digits` decimals, `" + "` and the trailing `i`). An
+/// absurd center (|re| ≥ 1e9) needs more and returns `error.NoSpaceLeft` instead.
+pub const coord_buf_len: usize = 64;
+
+/// Decimals `formatCoord` uses at a given magnification. RULE:
+/// `digits = clamp(min_coord_digits + ceil(log10(magnification)), min, max)`.
+/// Rationale: the view spans `1/magnification` across its diagonal, so each extra decade
+/// of zoom consumes one decimal digit before anything visible changes; adding
+/// `min_coord_digits` on top keeps ~4 decimals of *sub-view* detail at every depth. A
+/// non-finite or non-positive magnification is degenerate and falls back to the minimum.
+pub fn coordDigits(magnification: f64) usize {
+    if (!std.math.isFinite(magnification) or magnification <= 0.0) return min_coord_digits;
+    const decades = @ceil(@log10(magnification));
+    if (decades <= 0.0) return min_coord_digits;
+    const headroom: f64 = @floatFromInt(max_coord_digits - min_coord_digits);
+    if (decades >= headroom) return max_coord_digits;
+    return min_coord_digits + @as(usize, @intFromFloat(decades));
+}
+
+/// Render a complex value for the coordinate readout as `"a + bi"` — or `"a - bi"` when
+/// the imaginary part is negative, so the readout never shows `+ -0.5i`. Precision comes
+/// from `coordDigits(magnification)`, so the readout gains digits as the user zooms in.
+/// Pure (writes only into `buf`) so the exact string is unit-tested; `buf` should be
+/// `coord_buf_len` bytes — a short buffer returns `error.NoSpaceLeft` rather than
+/// truncating.
+pub fn formatCoord(buf: []u8, c: Complex, magnification: f64) ![]u8 {
+    const digits = coordDigits(magnification);
+    const negative = c.im < 0.0;
+    return std.fmt.bufPrint(buf, "{[re]d:.[p]} {[sign]s} {[im]d:.[p]}i", .{
+        .re = c.re,
+        .sign = @as([]const u8, if (negative) "-" else "+"),
+        .im = if (negative) -c.im else c.im,
+        .p = digits,
+    });
+}
+
+/// The human-actionable message for a `ViewportError.DegenerateRegion`: `what` names the
+/// offending input (`"magnification"`, `"side"`, `"corner extent"`) and `value` is what
+/// arrived. Pure so the wording is unit-tested once and reused by every edge that logs
+/// `std.log.err` / shows the user the rejection (T6, T7). Needs ≤ 160 bytes.
+pub fn degenerateRegionMessage(buf: []u8, what: []const u8, value: f64) ![]u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "rejected viewport: {s}={d} is not a finite positive extent; " ++
+            "enter a positive magnification or two distinct corners",
+        .{ what, value },
+    );
+}
+
+/// The IMAGE viewport `iterbuf`/`engine` iterate over: a region plus its pixel
+/// dimensions, parameterized so pixels are square. M3's authoritative *model* is
+/// `SquareView` (center + side, aspect 1, no resolution); build the matching image
+/// viewport with `SquareView.imageViewport(S)` rather than deriving `scale` by hand.
+/// `fixedView` remains the M0/M2 entry point for the non-square fixed view.
 ///
 /// `scale` is the size of ONE pixel in complex-plane units, identical for both
 /// axes — that single shared value is what keeps the mapping aspect-correct
@@ -136,4 +398,340 @@ test "pixelToComplex is deterministic for repeated identical input" {
     const b = vp.pixelToComplex(123.0, 456.0);
     try std.testing.expectEqual(a.re, b.re);
     try std.testing.expectEqual(a.im, b.im);
+}
+
+// ─── Tests: M3 SquareView model ──────────────────────────────────────────────
+//
+// Three representative views the round-trip tests share: the default square, a deep
+// zoom on a known seahorse-valley point, and a shallow off-center view. Built as
+// literals on purpose — the round-trip must hold for any valid view, not just ones
+// that came out of a constructor.
+const round_trip_views = [_]SquareView{
+    .{ .center_re = -0.75, .center_im = 0.0, .side = 3.5 },
+    .{ .center_re = -0.743643887037151, .center_im = 0.131825904205330, .side = 1.0e-6 },
+    .{ .center_re = 0.2549870375, .center_im = -0.000470125, .side = 0.125 },
+};
+
+/// The default square's magnification, spelled out from plan A3 rather than read back
+/// from the code under test.
+const default_magnification: f64 = 1.0 / (3.5 * @sqrt(2.0));
+
+/// Round-trip tolerance for a view: corner/center arithmetic quantizes at one ULP of the
+/// LARGEST magnitude involved, so a deep zoom near `re = -0.74` can only be recovered to a
+/// few ULPs of `0.74` — the documented f64 floor (M7 widens the center, not M3).
+fn roundTripTolerance(v: SquareView) f64 {
+    const magnitude = @max(@abs(v.center_re), @abs(v.center_im));
+    return 4.0 * std.math.floatEps(f64) * @max(magnitude, v.side);
+}
+
+test "defaultView snaps the M0 fixed region to its enclosing square" {
+    const v = SquareView.defaultView();
+    try std.testing.expectEqual(@as(f64, -0.75), v.center_re);
+    try std.testing.expectEqual(@as(f64, 0.0), v.center_im);
+    // Larger axis wins: |Δre| = 3.5 > |Δim| = 2.5.
+    try std.testing.expectEqual(@as(f64, 3.5), v.side);
+}
+
+test "defaultView contains the whole M0 fixed region" {
+    const c = SquareView.defaultView().corners();
+    try std.testing.expect(c.min.re <= fixed_re_min);
+    try std.testing.expect(c.max.re >= fixed_re_max);
+    try std.testing.expect(c.min.im <= fixed_im_min);
+    try std.testing.expect(c.max.im >= fixed_im_max);
+}
+
+test "defaultView equals the square snap of the M0 fixed corners" {
+    const snapped = try SquareView.fromCorners(
+        .{ .re = fixed_re_min, .im = fixed_im_min },
+        .{ .re = fixed_re_max, .im = fixed_im_max },
+    );
+    try std.testing.expectEqual(SquareView.defaultView(), snapped);
+}
+
+test "magnification is the reciprocal of the square's diagonal length" {
+    const v = try SquareView.fromCenterSide(.{ .re = 0.0, .im = 0.0 }, 2.0);
+    // side 2 ⇒ diagonal 2·√2 ⇒ magnification 1/(2·√2).
+    try std.testing.expectApproxEqRel(@as(f64, 1.0 / (2.0 * @sqrt(2.0))), v.magnification(), 1e-15);
+    try std.testing.expectApproxEqRel(default_magnification, SquareView.defaultView().magnification(), 1e-15);
+}
+
+test "halving the side exactly doubles the magnification" {
+    const wide = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 3.5);
+    const tight = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.75);
+    try std.testing.expectEqual(wide.magnification() * 2.0, tight.magnification());
+}
+
+test "fromCenterMag inverts centerMag for the default, deep-zoom and off-center views" {
+    for (round_trip_views) |v| {
+        const back = try SquareView.fromCenterMag(v.centerMag());
+        const tol = roundTripTolerance(v);
+        try std.testing.expectApproxEqRel(v.side, back.side, 1e-15);
+        try std.testing.expectApproxEqAbs(v.center_re, back.center_re, tol);
+        try std.testing.expectApproxEqAbs(v.center_im, back.center_im, tol);
+    }
+}
+
+test "fromCorners inverts corners for the default, deep-zoom and off-center views" {
+    for (round_trip_views) |v| {
+        const c = v.corners();
+        const back = try SquareView.fromCorners(c.min, c.max);
+        const tol = roundTripTolerance(v);
+        try std.testing.expectApproxEqAbs(v.side, back.side, tol);
+        try std.testing.expectApproxEqAbs(v.center_re, back.center_re, tol);
+        try std.testing.expectApproxEqAbs(v.center_im, back.center_im, tol);
+    }
+}
+
+test "corners reports the bottom-left and top-right of the square" {
+    const c = SquareView.defaultView().corners();
+    try std.testing.expectApproxEqAbs(@as(f64, -2.5), c.min.re, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, -1.75), c.min.im, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), c.max.re, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.75), c.max.im, 1e-15);
+}
+
+test "fromCorners snaps a wide rectangle to a square sized by the larger axis" {
+    // |Δre| = 4, |Δim| = 1 ⇒ side 4, centered on the midpoint (0, 0).
+    const v = try SquareView.fromCorners(.{ .re = -2.0, .im = -0.5 }, .{ .re = 2.0, .im = 0.5 });
+    try std.testing.expectApproxEqRel(@as(f64, 4.0), v.side, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), v.center_re, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), v.center_im, 1e-15);
+}
+
+test "the square snapped from a tall rectangle contains it, expanded only on the short axis" {
+    // |Δre| = 0.2, |Δim| = 3 ⇒ side 3: re grows, im is untouched.
+    const a = Complex{ .re = 0.1, .im = -1.5 };
+    const b = Complex{ .re = 0.3, .im = 1.5 };
+    const v = try SquareView.fromCorners(a, b);
+    const c = v.corners();
+    try std.testing.expectApproxEqRel(@as(f64, 3.0), v.side, 1e-15);
+    try std.testing.expect(c.min.re <= a.re and c.max.re >= b.re);
+    try std.testing.expectApproxEqAbs(a.im, c.min.im, 1e-15);
+    try std.testing.expectApproxEqAbs(b.im, c.max.im, 1e-15);
+}
+
+test "fromCorners ignores the order of the two given corners" {
+    const a = Complex{ .re = -1.25, .im = 0.5 };
+    const b = Complex{ .re = 0.75, .im = -0.25 };
+    try std.testing.expectEqual(
+        try SquareView.fromCorners(a, b),
+        try SquareView.fromCorners(b, a),
+    );
+}
+
+test "fromCorners rejects a zero-extent rectangle" {
+    const p = Complex{ .re = -0.75, .im = 0.1 };
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(p, p));
+}
+
+test "fromCorners rejects non-finite corners" {
+    const ok = Complex{ .re = 0.0, .im = 0.0 };
+    const nan = Complex{ .re = std.math.nan(f64), .im = 0.0 };
+    const inf = Complex{ .re = 0.0, .im = std.math.inf(f64) };
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(ok, nan));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(inf, ok));
+}
+
+test "fromCenterMag rejects a non-positive or non-finite magnification" {
+    const c = Complex{ .re = 0.0, .im = 0.0 };
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = 0.0 }));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = -1.0 }));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = std.math.nan(f64) }));
+}
+
+test "fromCenterSide rejects a non-positive side and a non-finite center" {
+    const c = Complex{ .re = 0.0, .im = 0.0 };
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, 0.0));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, -3.5));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, std.math.inf(f64)));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(.{ .re = std.math.nan(f64), .im = 0.0 }, 1.0));
+}
+
+test "the image corner pixels map to the view corners" {
+    const v = SquareView.defaultView();
+    const s: u32 = 512;
+    const top_left = v.pixelToComplex(0.0, 0.0, s);
+    try std.testing.expectApproxEqAbs(@as(f64, -2.5), top_left.re, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.75), top_left.im, 1e-12); // top row = max im
+    const bottom_right = v.pixelToComplex(512.0, 512.0, s);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), bottom_right.re, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, -1.75), bottom_right.im, 1e-12);
+}
+
+test "the image center pixel maps to the view center" {
+    const v = round_trip_views[1];
+    const c = v.pixelToComplex(256.0, 256.0, 512);
+    try std.testing.expectApproxEqAbs(v.center_re, c.re, v.side * 1e-12);
+    try std.testing.expectApproxEqAbs(v.center_im, c.im, v.side * 1e-12);
+}
+
+const pixel_centers = [_]Pixel{
+    .{ .x = 0.5, .y = 0.5 },
+    .{ .x = 123.5, .y = 456.5 },
+    .{ .x = 899.5, .y = 899.5 },
+};
+
+test "pixelToComplex and complexToPixel are exact inverses at pixel centers" {
+    const v = SquareView.defaultView();
+    const s: u32 = 900;
+    for (pixel_centers) |p| {
+        const back = v.complexToPixel(v.pixelToComplex(p.x, p.y, s), s);
+        try std.testing.expectApproxEqAbs(p.x, back.x, 1e-9);
+        try std.testing.expectApproxEqAbs(p.y, back.y, 1e-9);
+    }
+}
+
+test "the pixel round-trip stays far sub-pixel on a deep zoom" {
+    // side 1e-6 near re = -0.74: the complex offset is ~1e-9 ULP of the center, so the
+    // recovered pixel drifts ~1e-7 px. Still invisible; the f64 floor proper is ~1e-13
+    // (milestone non-goal — M7 widens the center).
+    const v = round_trip_views[1];
+    const s: u32 = 900;
+    for (pixel_centers) |p| {
+        const back = v.complexToPixel(v.pixelToComplex(p.x, p.y, s), s);
+        try std.testing.expectApproxEqAbs(p.x, back.x, 1e-6);
+        try std.testing.expectApproxEqAbs(p.y, back.y, 1e-6);
+    }
+}
+
+test "pixel-y grows downward while complex-im grows upward in the square model" {
+    const v = SquareView.defaultView();
+    const upper = v.pixelToComplex(100.5, 10.5, 512);
+    const lower = v.pixelToComplex(100.5, 400.5, 512);
+    try std.testing.expect(upper.im > lower.im);
+}
+
+test "toImagePixel translates a window pixel into image-local pixel coordinates" {
+    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const p = rect.toImagePixel(150.5, 70.25) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f64, 50.5), p.x);
+    try std.testing.expectEqual(@as(f64, 50.25), p.y);
+}
+
+test "toImagePixel treats the image rect as half-open: the far edge is outside" {
+    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    try std.testing.expect(rect.toImagePixel(100.0, 20.0) != null); // near edge included
+    try std.testing.expect(rect.toImagePixel(500.0, 100.0) == null); // x + side excluded
+    try std.testing.expect(rect.toImagePixel(200.0, 420.0) == null); // y + side excluded
+}
+
+test "toImagePixel rejects letterbox-bar pixels on every side" {
+    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    try std.testing.expect(rect.toImagePixel(99.9, 200.0) == null); // left bar
+    try std.testing.expect(rect.toImagePixel(640.0, 200.0) == null); // right bar
+    try std.testing.expect(rect.toImagePixel(200.0, 19.9) == null); // top bar
+    try std.testing.expect(rect.toImagePixel(200.0, 600.0) == null); // bottom bar
+}
+
+test "toImagePixel rejects every pixel of a zero-side image rect" {
+    const rect = ImageRect{ .x = 0, .y = 0, .side = 0 };
+    try std.testing.expect(rect.toImagePixel(0.0, 0.0) == null);
+}
+
+test "cursorCoord returns the complex value under a window pixel inside the image" {
+    const v = SquareView.defaultView();
+    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const got = v.cursorCoord(150.5, 70.25, rect) orelse return error.TestUnexpectedResult;
+    const want = v.pixelToComplex(50.5, 50.25, rect.side);
+    try std.testing.expectEqual(want.re, got.re);
+    try std.testing.expectEqual(want.im, got.im);
+}
+
+test "cursorCoord returns null over the letterbox bars" {
+    const v = SquareView.defaultView();
+    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    try std.testing.expect(v.cursorCoord(10.0, 200.0, rect) == null);
+    try std.testing.expect(v.cursorCoord(200.0, 900.0, rect) == null);
+}
+
+test "cursorCoord returns null for a degenerate zero-side image rect" {
+    const v = SquareView.defaultView();
+    try std.testing.expect(v.cursorCoord(0.0, 0.0, .{ .x = 0, .y = 0, .side = 0 }) == null);
+}
+
+test "coordDigits is the base precision at the default view" {
+    try std.testing.expectEqual(min_coord_digits, coordDigits(default_magnification));
+}
+
+test "coordDigits increases as magnification grows" {
+    const mags = [_]f64{ default_magnification, 1.0, 1.0e2, 1.0e6, 1.0e10 };
+    var prev = coordDigits(mags[0]);
+    for (mags[1..]) |m| {
+        const d = coordDigits(m);
+        try std.testing.expect(d >= prev);
+        prev = d;
+    }
+    try std.testing.expect(coordDigits(1.0e6) > coordDigits(default_magnification));
+}
+
+test "coordDigits follows the documented decade rule" {
+    // digits = clamp(min + ceil(log10(mag)), min, max): mag 1e6 ⇒ 4 + 6 = 10.
+    try std.testing.expectEqual(@as(usize, 10), coordDigits(1.0e6));
+    try std.testing.expectEqual(@as(usize, 5), coordDigits(1.0e1));
+}
+
+test "coordDigits clamps to the documented range" {
+    try std.testing.expectEqual(min_coord_digits, coordDigits(1.0e-30));
+    try std.testing.expectEqual(max_coord_digits, coordDigits(1.0e30));
+}
+
+test "coordDigits guards a non-finite or non-positive magnification" {
+    try std.testing.expectEqual(min_coord_digits, coordDigits(0.0));
+    try std.testing.expectEqual(min_coord_digits, coordDigits(-1.0));
+    try std.testing.expectEqual(min_coord_digits, coordDigits(std.math.nan(f64)));
+    try std.testing.expectEqual(min_coord_digits, coordDigits(std.math.inf(f64)));
+}
+
+test "formatCoord renders a positive imaginary part with a plus" {
+    var buf: [coord_buf_len]u8 = undefined;
+    const line = try formatCoord(&buf, .{ .re = -0.75, .im = 0.25 }, default_magnification);
+    try std.testing.expectEqualStrings("-0.7500 + 0.2500i", line);
+}
+
+test "formatCoord renders a negative imaginary part with a minus" {
+    var buf: [coord_buf_len]u8 = undefined;
+    const line = try formatCoord(&buf, .{ .re = 0.5, .im = -0.125 }, default_magnification);
+    try std.testing.expectEqualStrings("0.5000 - 0.1250i", line);
+}
+
+test "formatCoord shows more decimals at a deeper magnification" {
+    var buf: [coord_buf_len]u8 = undefined;
+    const line = try formatCoord(&buf, .{ .re = -0.75, .im = 0.25 }, 1.0e6);
+    try std.testing.expectEqualStrings("-0.7500000000 + 0.2500000000i", line);
+}
+
+test "formatCoord reports NoSpaceLeft instead of truncating" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, formatCoord(&buf, .{ .re = -0.75, .im = 0.25 }, default_magnification));
+}
+
+test "degenerateRegionMessage names the offending value and what to do" {
+    var buf: [160]u8 = undefined;
+    const msg = try degenerateRegionMessage(&buf, "magnification", 0.0);
+    try std.testing.expectEqualStrings(
+        "rejected viewport: magnification=0 is not a finite positive extent; " ++
+            "enter a positive magnification or two distinct corners",
+        msg,
+    );
+}
+
+test "imageViewport is a square M0 viewport of side S pixels" {
+    const v = SquareView.defaultView();
+    const vp = v.imageViewport(512);
+    try std.testing.expectEqual(@as(u32, 512), vp.width);
+    try std.testing.expectEqual(@as(u32, 512), vp.height);
+    try std.testing.expectApproxEqRel(@as(f64, 3.5 / 512.0), vp.scale, 1e-15);
+}
+
+test "imageViewport reproduces the square view's pixel mapping" {
+    const v = round_trip_views[2];
+    const s: u32 = 256;
+    const vp = v.imageViewport(s);
+    const samples = [_]Pixel{ .{ .x = 0.5, .y = 0.5 }, .{ .x = 128.5, .y = 200.5 }, .{ .x = 255.5, .y = 255.5 } };
+    for (samples) |p| {
+        const want = v.pixelToComplex(p.x, p.y, s);
+        const got = vp.pixelToComplex(p.x, p.y);
+        try std.testing.expectApproxEqAbs(want.re, got.re, v.side * 1e-12);
+        try std.testing.expectApproxEqAbs(want.im, got.im, v.side * 1e-12);
+    }
 }
