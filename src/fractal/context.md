@@ -19,7 +19,7 @@ reruns on palette/mapping edits WITHOUT re-iterating (`iterbuf` → `colorpass` 
   `-0.75+0i`, side 3.5). Lossless duals `centerMag()`/`fromCenterMag` (`magnification()` =
   `1/(side·√2)`) and `corners()`/`fromCorners` (`min`=bottom-left; SNAPS to a square by the LARGER
   axis around the midpoint); they and `fromCenterSide` validate → `ViewportError.DegenerateRegion`,
-  unlogged — the edge logs `degenerateRegionMessage(buf,what,value)`.
+  unlogged — the edge logs `degenerateRegionMessage(buf[message_buf_len],what,value)`.
   `pixelToComplex(px,py,S)`/`complexToPixel(c,S)` (assert `S>0`);
   `cursorCoord(wx,wy,ImageRect{x,y,side})` → `?Complex`, null over letterbox bars;
   `imageViewport(S)` → the M0 `Viewport` `iterbuf` iterates (`fixedView(w,h)` = M0 path). Readout:

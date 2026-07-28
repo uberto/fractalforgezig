@@ -260,14 +260,17 @@ pub fn coordDigits(magnification: f64) usize {
 }
 
 /// Render a complex value for the coordinate readout as `"a + bi"` — or `"a - bi"` when
-/// the imaginary part is negative, so the readout never shows `+ -0.5i`. Precision comes
+/// the imaginary part is negative, so the readout never shows `+ -0.5i`. The sign comes
+/// from `std.math.signbit`, so `im = -0.0` reads `- 0.0000i` exactly like any tiny
+/// negative value that rounds to zero at this precision. Precision comes
 /// from `coordDigits(magnification)`, so the readout gains digits as the user zooms in.
 /// Pure (writes only into `buf`) so the exact string is unit-tested; `buf` should be
 /// `coord_buf_len` bytes — a short buffer returns `error.NoSpaceLeft` rather than
 /// truncating.
 pub fn formatCoord(buf: []u8, c: Complex, magnification: f64) ![]u8 {
     const digits = coordDigits(magnification);
-    const negative = c.im < 0.0;
+    // signbit, NOT `< 0.0`: `-0.0 < 0.0` is false, which would print `+ -0.0000i`.
+    const negative = std.math.signbit(c.im);
     return std.fmt.bufPrint(buf, "{[re]d:.[p]} {[sign]s} {[im]d:.[p]}i", .{
         .re = c.re,
         .sign = @as([]const u8, if (negative) "-" else "+"),
@@ -276,15 +279,37 @@ pub fn formatCoord(buf: []u8, c: Complex, magnification: f64) ![]u8 {
     });
 }
 
+const degenerate_prefix = "rejected viewport: ";
+const degenerate_suffix = " is not a finite positive extent; " ++
+    "enter a positive magnification or two distinct corners";
+
+/// Longest `what` label `degenerateRegionMessage` accepts within `message_buf_len`
+/// (the shipped labels are `"magnification"`, `"side"`, `"corner extent"`, ≤ 13 bytes).
+pub const max_what_len: usize = 16;
+
+/// Widest `{e}` rendering of an f64: sign + leading digit + `.` + 16 more significant
+/// digits + `e` + exponent sign + 3 exponent digits, e.g. `-1.3508404415422605e-270`.
+/// This is what bounds the message: `{d}` would instead expand `5e-324` into 447 bytes.
+const max_float_chars: usize = 24;
+
+/// Buffer size that fits ANY `degenerateRegionMessage` result — the fixed wording, a
+/// `what` up to `max_what_len` bytes and any f64 value, including `±floatMax` and
+/// subnormals. Exactly the worst case, pinned by a test; a shorter buffer returns
+/// `error.NoSpaceLeft`.
+pub const message_buf_len: usize =
+    degenerate_prefix.len + max_what_len + 1 + max_float_chars + degenerate_suffix.len;
+
 /// The human-actionable message for a `ViewportError.DegenerateRegion`: `what` names the
 /// offending input (`"magnification"`, `"side"`, `"corner extent"`) and `value` is what
-/// arrived. Pure so the wording is unit-tested once and reused by every edge that logs
-/// `std.log.err` / shows the user the rejection (T6, T7). Needs ≤ 160 bytes.
+/// arrived, rendered in scientific notation (`{e}`) so that a hostile magnitude such as
+/// `-1e308` or `5e-324` stays a few characters instead of hundreds of digits — that keeps
+/// the message inside `message_buf_len` on the very path that reports a failure. Pure so
+/// the wording is unit-tested once and reused by every edge that logs `std.log.err` /
+/// shows the user the rejection (T6, T7); pass a `[message_buf_len]u8`.
 pub fn degenerateRegionMessage(buf: []u8, what: []const u8, value: f64) ![]u8 {
     return std.fmt.bufPrint(
         buf,
-        "rejected viewport: {s}={d} is not a finite positive extent; " ++
-            "enter a positive magnification or two distinct corners",
+        degenerate_prefix ++ "{s}={e}" ++ degenerate_suffix,
         .{ what, value },
     );
 }
@@ -705,13 +730,57 @@ test "formatCoord reports NoSpaceLeft instead of truncating" {
     try std.testing.expectError(error.NoSpaceLeft, formatCoord(&buf, .{ .re = -0.75, .im = 0.25 }, default_magnification));
 }
 
+test "formatCoord renders a negative-zero imaginary part with a minus, never `+ -`" {
+    var buf: [coord_buf_len]u8 = undefined;
+    const line = try formatCoord(&buf, .{ .re = 0.5, .im = -0.0 }, default_magnification);
+    try std.testing.expectEqualStrings("0.5000 - 0.0000i", line);
+}
+
 test "degenerateRegionMessage names the offending value and what to do" {
-    var buf: [160]u8 = undefined;
+    var buf: [message_buf_len]u8 = undefined;
     const msg = try degenerateRegionMessage(&buf, "magnification", 0.0);
     try std.testing.expectEqualStrings(
-        "rejected viewport: magnification=0 is not a finite positive extent; " ++
+        "rejected viewport: magnification=0e0 is not a finite positive extent; " ++
             "enter a positive magnification or two distinct corners",
         msg,
+    );
+}
+
+test "degenerateRegionMessage fits the documented buffer for the largest-magnitude f64" {
+    var buf: [message_buf_len]u8 = undefined;
+    const msg = try degenerateRegionMessage(&buf, "corner extent", -std.math.floatMax(f64));
+    try std.testing.expectEqualStrings(
+        "rejected viewport: corner extent=-1.7976931348623157e308 is not a finite " ++
+            "positive extent; enter a positive magnification or two distinct corners",
+        msg,
+    );
+}
+
+test "degenerateRegionMessage fits the documented buffer for the smallest subnormal f64" {
+    var buf: [message_buf_len]u8 = undefined;
+    const msg = try degenerateRegionMessage(&buf, "side", std.math.floatTrueMin(f64));
+    try std.testing.expectEqualStrings(
+        "rejected viewport: side=5e-324 is not a finite positive extent; " ++
+            "enter a positive magnification or two distinct corners",
+        msg,
+    );
+}
+
+test "message_buf_len is exactly the worst-case message length" {
+    var buf: [message_buf_len]u8 = undefined;
+    // Widest `{e}` rendering an f64 can produce: sign, 17 significant digits, 3-digit exponent.
+    const widest_value: f64 = -1.3508404415422605e-270;
+    const widest_what = "x" ** max_what_len;
+    const msg = try degenerateRegionMessage(&buf, widest_what, widest_value);
+    try std.testing.expectEqual(message_buf_len, msg.len);
+}
+
+test "degenerateRegionMessage reports NoSpaceLeft instead of truncating" {
+    var buf: [message_buf_len - 1]u8 = undefined;
+    const widest_what = "x" ** max_what_len;
+    try std.testing.expectError(
+        error.NoSpaceLeft,
+        degenerateRegionMessage(&buf, widest_what, -1.3508404415422605e-270),
     );
 }
 
