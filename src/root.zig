@@ -16,6 +16,7 @@ test {
     // Only PURE modules belong here: the fast tier must not @cImport SDL/GPU.
     _ = @import("gpu/message.zig");
     _ = @import("fractal/viewport.zig");
+    _ = @import("fractal/navigate.zig");
     _ = @import("fractal/mandelbrot.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/gradient.zig");

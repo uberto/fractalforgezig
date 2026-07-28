@@ -290,7 +290,9 @@ pub const max_what_len: usize = 16;
 /// Widest `{e}` rendering of an f64: sign + leading digit + `.` + 16 more significant
 /// digits + `e` + exponent sign + 3 exponent digits, e.g. `-1.3508404415422605e-270`.
 /// This is what bounds the message: `{d}` would instead expand `5e-324` into 447 bytes.
-const max_float_chars: usize = 24;
+/// Exported so the other pure message builders that embed an f64 (see
+/// `navigate.floor_message_buf_len`) derive their buffer from the same measured bound.
+pub const max_float_chars: usize = 24;
 
 /// Buffer size that fits ANY `degenerateRegionMessage` result — the fixed wording, a
 /// `what` up to `max_what_len` bytes and any f64 value, including `±floatMax` and
