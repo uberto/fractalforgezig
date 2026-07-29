@@ -1,67 +1,124 @@
-//! Pure DECOUPLING engine — the milestone crux. NO SDL/GPU/log imports: it operates
-//! purely on caller-owned buffers, lives in the fast test tier (`zig build test`, no
-//! window/device), and is fully unit-tested. The app (T6) owns lifetimes and the GPU
-//! upload; this engine owns only the CPU-side state + the decoupling guarantee.
+//! The DECOUPLING engine — the crux of M2's guarantee and of M3's navigation. It owns the
+//! CPU-side render state (the view, the image side `S`, the `max_iter` policy, the
+//! persistent smooth-value buffer, the palette + its LUT and the RGBA8 output) and nothing
+//! else: the app (T5/T6/T7) owns the window, the texture upload and the input.
 //!
-//! THE GUARANTEE (plan A2): editing the palette or mapping reruns ONLY the cheap color
-//! pass — it NEVER re-runs the expensive Mandelbrot iteration. We have no GPU dispatches
-//! to count, so two counters make the guarantee observable and testable:
+//! THE GUARANTEE (plan constraint, re-pinned for M3): editing the palette or mapping reruns
+//! ONLY the cheap color pass — it NEVER re-runs the expensive Mandelbrot iteration. Two
+//! counters make that observable and testable:
 //!   * `iteration_passes` — bumped ONLY by `iterate` (refills the `[]f32` smooth buffer).
-//!   * `color_passes`     — bumped by every recolor: `iterate` (which recolors too) and
-//!     each of `setGradient` / `setMapping` / `setInterior`.
-//! A palette/mapping edit therefore bumps `color_passes` while `iteration_passes` stays
-//! put — asserted directly in the tests below.
+//!     The paths that reach it are `iterate`, `setViewport`, `setPolicy` and `resize`, i.e.
+//!     exactly the inputs the iteration depends on.
+//!   * `color_passes`     — bumped by every recolor: each of the above (they recolor too)
+//!     and each of `setGradient` / `setMapping` / `setInterior`.
+//! A palette/mapping edit therefore bumps `color_passes` while `iteration_passes` stays put,
+//! even when it follows a navigation — asserted directly in the tests below.
 //!
-//! Composition (no reimplementation): `iterbuf.iterateInto` (T1) fills the smooth buffer;
-//! `gradient.bakeLut` (T2) bakes the LUT; `mapping.Params` (T3) selects the transform;
-//! `colorpass.colorInto` (T4) writes the RGBA8 output. This module adds only the
-//! persistent state, the counters, the re-bake-on-gradient-change wiring, and a pure
-//! summary-line builder.
+//! `max_iter` has ONE source of truth: T3's `autoiter.IterPolicy.effective`. The engine
+//! recomputes `max_iter` from `policy` + `view.magnification()` at the top of EVERY
+//! iteration, so the stored value can never be stale, and its log line renders the number
+//! through `autoiter.policySummary` — the same `effective` call — so the summary can never
+//! advertise a count the render did not use.
 //!
-//! Failure paths return TYPED errors, never `unreachable`: an empty gradient →
-//! `EngineError.EmptyGradient`; a mis-sized internal buffer surfaces the composed
-//! modules' `BufferSizeMismatch`. The pure core does NO logging — the edge (T6) logs the
-//! summary line / error via the repo's scoped `std.log`.
+//! Composition (no reimplementation): `viewport.SquareView.imageViewport` (T1) is the ONE
+//! bridge from the M3 view to the image `Viewport` that `iterbuf.iterateInto` (M2) iterates;
+//! `gradient.bakeLut` bakes the LUT; `mapping.Params` selects the transform;
+//! `colorpass.colorInto` writes the RGBA8 output. This module adds only the persistent
+//! state, the counters, the resize, and the pure summary/message builders.
+//!
+//! Failure paths return TYPED errors, never `unreachable` and never swallowed: a degenerate
+//! view → `viewport.ViewportError.DegenerateRegion`; a zero image side →
+//! `EngineError.DegenerateImageSide`; a magnification the auto ramp cannot use →
+//! `autoiter.AutoIterError.InvalidMagnification`; a failed buffer (re)allocation →
+//! `error.OutOfMemory` with the requested size; an empty gradient →
+//! `EngineError.EmptyGradient`; a mis-sized internal buffer surfaces the composed modules'
+//! `BufferSizeMismatch`.
+//!
+//! LOGGING — the ONE exception to `src/fractal/`'s log-free rule, required by the milestone
+//! plan's standing requirements ("the engine logs a one-line summary on re-iterate ...
+//! failure paths log `std.log.err`/`warn` with actionable context and return a Zig error").
+//! `std.log` is stdlib (no SDL/GPU/ImGui), so this module still compiles and runs in the
+//! fast `zig build test` tier. Every logged string comes from a PURE, unit-tested builder
+//! (`iteratePassSummary`, `colorPassSummary`, `degenerateViewMessage`, `imageSideMessage`,
+//! `resizeFailureMessage`, plus T1's `viewport.degenerateRegionMessage` and T3's
+//! `autoiter.maxIterRangeMessage`); the call sites stay one line. Sibling modules
+//! (`viewport`, `navigate`, `autoiter`, `iterbuf`, `colorpass`) remain log-free.
+//!
+//! One tooling caveat, spelled out at `emitErr`: the `.err` EMISSION (not the message, not
+//! the returned error) is suppressed under `builtin.is_test`, because Zig's test runner
+//! treats any logged error as a failed test and this module's failure paths are themselves
+//! acceptance criteria. The wording is pinned by the builder tests instead.
 const std = @import("std");
+const builtin = @import("builtin");
 const viewport = @import("viewport.zig");
 const iterbuf = @import("iterbuf.zig");
 const gradient = @import("gradient.zig");
 const mapping = @import("mapping.zig");
 const colorpass = @import("colorpass.zig");
 const color = @import("color.zig");
+const autoiter = @import("autoiter.zig");
 
 const Viewport = viewport.Viewport;
+const SquareView = viewport.SquareView;
+const IterPolicy = autoiter.IterPolicy;
+
+/// The fractal core's log scope (see the file header for why this module may log at all).
+const log = std.log.scoped(.fractal);
 
 /// Reused verbatim from `color.zig` (M0). Channel order R, G, B, A. Do not redefine.
 pub const Rgba8 = color.Rgba8;
 
-/// Errors returned by the engine's fallible operations.
+/// Errors this module defines itself. The composed modules' errors are re-exported through
+/// `IterateError` / `ResizeError` below, so callers match one set per operation.
 pub const EngineError = error{
     /// A supplied `Gradient` had zero stops; the LUT bake requires at least one. Returned
     /// (not asserted) so a bad edit fails loudly and testably rather than tripping a
     /// debug assert inside `gradient.bakeLut`.
     EmptyGradient,
-    /// An internal buffer's length did not match the viewport (`iter.len !=
-    /// width*height` or `rgba.len != iter.len*4`). Surfaced from `iterbuf`/`colorpass`
-    /// rather than an out-of-bounds write. `init` sizes both buffers correctly, so this
-    /// only fires if a caller corrupts the slices — but it is a returned error, never an
+    /// An internal buffer's length did not match the view (`iter.len != S*S` or
+    /// `rgba.len != iter.len*4`). Surfaced from `iterbuf`/`colorpass` rather than an
+    /// out-of-bounds write. `init`/`resize` size both buffers correctly, so this only
+    /// fires if a caller corrupts the slices — but it is a returned error, never an
     /// `unreachable`, matching the milestone's "no unreachable on failure paths" rule.
     BufferSizeMismatch,
+    /// The requested square image side was 0 px, which has no pixels to iterate and no
+    /// pixel↔complex mapping (T1's `imageViewport` requires `S > 0`). T5 hits this when the
+    /// window is minimized; report it with `imageSideMessage` and skip the pass.
+    DegenerateImageSide,
 };
 
-/// The persistent color-pipeline state + decoupling counters. The app allocates one via
-/// `init`, drives it (`iterate` once, then `setGradient`/`setMapping`/`setInterior` on
-/// every edit), reads `output()` to upload, and frees it via `deinit`.
+/// Everything an iteration path (`iterate`, `setViewport`, `setPolicy`) can return: this
+/// module's own failures, T1's degenerate-view rejection and T3's `max_iter` rejections.
+/// `iterbuf.IterError` / `colorpass.ColorError` fold in as `BufferSizeMismatch`.
+pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoIterError;
+
+/// `IterateError` plus allocation failure — what the paths that (re)allocate the buffers
+/// (`init`, `resize`) can return.
+pub const ResizeError = IterateError || std.mem.Allocator.Error;
+
+/// The persistent render state + decoupling counters. The app allocates one via `init`,
+/// drives it (`iterate` once, then `setViewport`/`setPolicy`/`resize` on navigation and
+/// `setGradient`/`setMapping`/`setInterior` on palette edits), reads `output()` to upload,
+/// and frees it via `deinit`.
 ///
-/// Fields are public so the data panel (T6) can read the counters directly; treat them
-/// as read-only outside the methods below.
+/// Fields are public so the data/coordinate panels can read them; treat them as READ-ONLY
+/// outside the methods below. In particular `max_iter` is DERIVED state — recomputed from
+/// `policy` and `view` by every iteration path — so assigning it by hand only produces a
+/// value the next pass overwrites.
 pub const Engine = struct {
     alloc: std.mem.Allocator,
-    /// The fixed view the iteration buffer was computed for (M2 has no navigation).
-    vp: Viewport,
-    /// Iteration reference passed through to `iterbuf` and `mapping`.
+    /// The M3 view (T1's `SquareView`) the iteration buffer was computed for. Change it
+    /// through `setViewport`, never in place, or the buffer and the view drift apart.
+    view: SquareView,
+    /// Side `S` of the square image in pixels (plan A2: `S = min(window_w, window_h)`,
+    /// chosen by T5). Always > 0 for an engine built through `init`.
+    image_side: u32,
+    /// How `max_iter` is chosen (T3, plan A6). Change it through `setPolicy`.
+    policy: IterPolicy,
+    /// The iteration count the CURRENT buffer was computed with: `policy.effective` of the
+    /// current view's magnification. Derived — see the struct doc.
     max_iter: u32,
-    /// Persistent smooth-value buffer (one f32 per pixel). Filled once by `iterate`.
+    /// Persistent smooth-value buffer (one f32 per pixel, `S*S` long).
     iter: []f32,
     /// Packed RGBA8 output (4 bytes per pixel). Rewritten by every recolor.
     rgba: []u8,
@@ -78,24 +135,45 @@ pub const Engine = struct {
     /// Number of color passes run. Bumped by every recolor (iterate + each edit).
     color_passes: u32,
 
-    /// Allocate the smooth-value + RGBA8 buffers for `vp`, install the default gradient
-    /// (baked) / linear mapping / opaque-black interior, and zero both counters. Does NOT
-    /// iterate or recolor: after `init` both counters are 0 and the caller drives the
-    /// first `iterate`. The smooth buffer is zeroed so a recolor before `iterate` is
-    /// well-defined rather than reading undefined memory. Caller must `deinit`.
-    pub fn init(alloc: std.mem.Allocator, vp: Viewport, max_iter: u32) !Engine {
-        const iter = try alloc.alloc(f32, iterbuf.iterationBufferLen(vp));
+    /// Allocate the smooth-value + RGBA8 buffers for a square image of side `image_side`,
+    /// derive `max_iter` from `policy` at `view`'s magnification, install the default
+    /// gradient (baked) / linear mapping / opaque-black interior, and zero both counters.
+    /// Does NOT iterate or recolor: after `init` both counters are 0 and the caller drives
+    /// the first `iterate`. Both buffers are zeroed so a recolor before the first iteration
+    /// is well-defined rather than reading undefined memory. Caller must `deinit`.
+    ///
+    /// Rejects a degenerate `view` or a zero `image_side` before allocating anything, and
+    /// reports an allocation failure with the requested size. Caller must `deinit`.
+    pub fn init(
+        alloc: std.mem.Allocator,
+        view: SquareView,
+        image_side: u32,
+        policy: IterPolicy,
+    ) ResizeError!Engine {
+        try validateGeometry(view, image_side);
+        const max_iter = try effectiveMaxIter(view, policy);
+        const sizes = try bufferSizes(view, image_side);
+
+        const iter = alloc.alloc(f32, sizes.pixels) catch |err| {
+            logResizeFailure(image_side);
+            return err;
+        };
         errdefer alloc.free(iter);
         @memset(iter, 0.0);
 
-        const rgba = try alloc.alloc(u8, iter.len * 4);
+        const rgba = alloc.alloc(u8, sizes.bytes) catch |err| {
+            logResizeFailure(image_side);
+            return err;
+        };
         errdefer alloc.free(rgba);
         @memset(rgba, 0);
 
         const g = gradient.default();
         var engine = Engine{
             .alloc = alloc,
-            .vp = vp,
+            .view = view,
+            .image_side = image_side,
+            .policy = policy,
             .max_iter = max_iter,
             .iter = iter,
             .rgba = rgba,
@@ -116,13 +194,74 @@ pub const Engine = struct {
         self.alloc.free(self.rgba);
     }
 
-    /// (Re)run the EXPENSIVE stage: refill the smooth buffer via `iterbuf` (T1), then
-    /// recolor. Bumps `iteration_passes` AND `color_passes` (a recolor happens too). This
-    /// is the only path that touches `iteration_passes`.
-    pub fn iterate(self: *Engine) EngineError!void {
-        try iterbuf.iterateInto(self.iter, self.vp, self.max_iter);
+    /// (Re)run the EXPENSIVE stage for the current view / image side / policy: refresh
+    /// `max_iter` from the policy, refill the smooth buffer via `iterbuf`, then recolor and
+    /// log the one-line pass summary. Bumps `iteration_passes` AND `color_passes` (a recolor
+    /// happens too). This is the only path that touches `iteration_passes`.
+    pub fn iterate(self: *Engine) IterateError!void {
+        try validateGeometry(self.view, self.image_side);
+        // ONE source of truth for max_iter (T3). Recomputed here, so a view/policy change
+        // can never leave the stored value describing a different render.
+        self.max_iter = try effectiveMaxIter(self.view, self.policy);
+        try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
         self.iteration_passes += 1;
         try self.recolor();
+        self.logIteratePass();
+    }
+
+    /// Navigate: install a new view and re-iterate (+ recolor) for it. Bumps
+    /// `iteration_passes` and `color_passes` by one each. A degenerate view is rejected and
+    /// leaves the engine on the previous one, so a failed navigation never strands the
+    /// buffer and the view out of sync.
+    pub fn setViewport(self: *Engine, view: SquareView) IterateError!void {
+        const previous = self.view;
+        errdefer self.view = previous;
+        self.view = view;
+        try self.iterate();
+    }
+
+    /// Install a new `max_iter` policy (T7's auto/manual control) and re-iterate: unlike the
+    /// palette setters this DOES re-iterate, because `max_iter` feeds the iteration itself.
+    /// A policy the current magnification cannot satisfy is rejected and leaves the engine on
+    /// the previous policy. Re-iterates unconditionally — callers only set a policy that
+    /// changed.
+    pub fn setPolicy(self: *Engine, policy: IterPolicy) IterateError!void {
+        const previous = self.policy;
+        errdefer self.policy = previous;
+        self.policy = policy;
+        try self.iterate();
+    }
+
+    /// Resize the render square to `image_side` px (T5, on a window resize): reallocate both
+    /// buffers when the pixel count changes, then re-iterate + recolor for the new side.
+    /// Bumps both counters by one.
+    ///
+    /// Failure-atomic: a rejected side (0 px) or a failed allocation leaves the engine on its
+    /// previous buffers and side — still renderable — and returns the error after logging the
+    /// requested size. The new buffers are zeroed like `init`'s.
+    pub fn resize(self: *Engine, image_side: u32) ResizeError!void {
+        try validateGeometry(self.view, image_side);
+        const sizes = try bufferSizes(self.view, image_side);
+
+        if (sizes.pixels != self.iter.len) {
+            const iter = self.alloc.alloc(f32, sizes.pixels) catch |err| {
+                logResizeFailure(image_side);
+                return err;
+            };
+            const rgba = self.alloc.alloc(u8, sizes.bytes) catch |err| {
+                self.alloc.free(iter);
+                logResizeFailure(image_side);
+                return err;
+            };
+            @memset(iter, 0.0);
+            @memset(rgba, 0);
+            self.alloc.free(self.iter);
+            self.alloc.free(self.rgba);
+            self.iter = iter;
+            self.rgba = rgba;
+        }
+        self.image_side = image_side;
+        try self.iterate();
     }
 
     /// Install a new palette, re-bake its LUT, and rerun ONLY the color pass. Bumps
@@ -156,23 +295,133 @@ pub const Engine = struct {
         self.color_passes += 1;
     }
 
+    /// The image `Viewport` the current view + image side iterate over — T1's single bridge,
+    /// never a hand-derived `scale`. Precondition: `image_side > 0`, which every mutating
+    /// path validates.
+    pub fn imageViewport(self: *const Engine) Viewport {
+        return self.view.imageViewport(self.image_side);
+    }
+
     /// The current packed RGBA8 image for the app to upload/display (read-only view).
     pub fn output(self: *const Engine) []const u8 {
         return self.rgba;
     }
 
     /// Write this engine's recolor summary line into `buf` (see `colorPassSummary`).
-    /// Convenience for the edge (T6) to log after a recolor; delegates to the pure
-    /// free builder so the exact string has one definition.
+    /// Convenience for the edge to log after a recolor; delegates to the pure free builder
+    /// so the exact string has one definition.
     pub fn summary(self: *const Engine, buf: []u8) ![]u8 {
         return colorPassSummary(buf, self.color_passes, self.params.mode, self.gradient.count);
     }
+
+    /// Write this engine's re-iterate summary line into `buf` (see `iteratePassSummary`).
+    /// Pass a `[iterate_summary_buf_len]u8`.
+    pub fn iterateSummary(self: *const Engine, buf: []u8) ![]u8 {
+        return iteratePassSummary(buf, self.iteration_passes, self.view, self.image_side, self.policy);
+    }
+
+    /// Log the one-line summary of the pass that just completed. Thin by design: the string
+    /// comes from the pure builder. A builder failure cannot be allowed to fail a successful
+    /// render, so it degrades to a `.warn` naming the error instead of being swallowed.
+    fn logIteratePass(self: *const Engine) void {
+        var buf: [iterate_summary_buf_len]u8 = undefined;
+        if (self.iterateSummary(&buf)) |line| {
+            log.info("{s}", .{line});
+        } else |err| {
+            log.warn(
+                "iterate pass {d} completed but its summary could not be built ({s})",
+                .{ self.iteration_passes, @errorName(err) },
+            );
+        }
+    }
 };
+
+/// Buffer lengths for a square image: `pixels` f32 smooth values and `bytes` RGBA8 bytes.
+const BufferSizes = struct { pixels: usize, bytes: usize };
+
+/// The two buffer lengths for `image_side`, with the pixel count taken from M2's
+/// `iterbuf.iterationBufferLen` (never re-derived). Requires an already-validated
+/// `image_side > 0`. A side so absurd that its byte count does not fit `usize` is reported
+/// as `OutOfMemory` with the requested size — a returned error, never an overflow panic.
+fn bufferSizes(view: SquareView, image_side: u32) std.mem.Allocator.Error!BufferSizes {
+    const pixels = iterbuf.iterationBufferLen(view.imageViewport(image_side));
+    const bytes = std.math.mul(usize, pixels, 4) catch {
+        logResizeFailure(image_side);
+        return error.OutOfMemory;
+    };
+    return .{ .pixels = pixels, .bytes = bytes };
+}
+
+/// Reject a view or image side that cannot be rendered, logging the reason. The DECISION to
+/// reject a view is entirely T1's (`SquareView.fromCenterSide`, the single validating
+/// constructor); this only reports it.
+fn validateGeometry(view: SquareView, image_side: u32) IterateError!void {
+    _ = SquareView.fromCenterSide(view.center(), view.side) catch |err| {
+        var buf: [viewport.message_buf_len]u8 = undefined;
+        logFailure(degenerateViewMessage(&buf, view));
+        return err;
+    };
+    if (image_side == 0) {
+        var buf: [image_side_message_buf_len]u8 = undefined;
+        logFailure(imageSideMessage(&buf, image_side));
+        return EngineError.DegenerateImageSide;
+    }
+}
+
+/// The `max_iter` this view deserves under `policy` — T3's `effective`, the single source of
+/// truth, with the rejection logged in T3's own wording.
+fn effectiveMaxIter(view: SquareView, policy: IterPolicy) autoiter.AutoIterError!u32 {
+    const magnification = view.magnification();
+    return policy.effective(magnification) catch |err| {
+        switch (err) {
+            error.InvalidMagnification => {
+                var buf: [viewport.message_buf_len]u8 = undefined;
+                logFailure(viewport.degenerateRegionMessage(&buf, "magnification", magnification));
+            },
+            error.MaxIterOutOfRange => {
+                var buf: [autoiter.range_message_buf_len]u8 = undefined;
+                logFailure(autoiter.maxIterRangeMessage(&buf, policy.manual_value));
+            },
+        }
+        return err;
+    };
+}
+
+/// Log a failed (re)allocation with the size that was asked for.
+fn logResizeFailure(image_side: u32) void {
+    var buf: [resize_message_buf_len]u8 = undefined;
+    logFailure(resizeFailureMessage(&buf, image_side, requestedBytes(image_side)));
+}
+
+/// Log a pure builder's message at `.err`. The builder can only fail by running out of
+/// buffer, which must not hide the failure being reported — hence the fallback line. The
+/// message is built even when the emission is suppressed (see `emitErr`), so a mis-sized
+/// call site is exercised by the tests that drive these failure paths.
+fn logFailure(built: anyerror![]u8) void {
+    if (built) |message| {
+        emitErr("{s}", .{message});
+    } else |err| {
+        emitErr("engine failure message could not be built ({s})", .{@errorName(err)});
+    }
+}
+
+/// `std.log.err` (scope `.fractal`) in the app — and deliberately a no-op in the FAST TEST
+/// TIER: Zig 0.15's test runner counts every logged error as a test failure
+/// (`lib/compiler/test_runner.zig`, `log_err_count` → `@panic("error logs detected")`), so a
+/// module whose own tests drive its failure paths — which this one must, they are acceptance
+/// criteria — can never be green while emitting `.err` from them. Nothing observable is lost:
+/// the exact wording of every failure line is pinned by the builder tests below, the typed
+/// error is asserted by the path tests, and `iterate`'s success summary (`.info`, which the
+/// runner does not count) is emitted in both builds.
+fn emitErr(comptime format: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    log.err(format, args);
+}
 
 /// Build the one-line recolor summary: `"color pass {n}: mode={s}, stops={k}"` where `n`
 /// is the color-pass count, `s` is the mapping mode tag, and `k` is the gradient's stop
-/// count. Pure (no I/O) so it is unit-tested for the exact string without a window/GPU;
-/// the edge (T6) passes it to `std.log`.
+/// count. Pure (no I/O) so it is unit-tested for the exact string; the engine and the edge
+/// pass it to `std.log`.
 pub fn colorPassSummary(buf: []u8, color_passes: u32, mode: mapping.Mode, stops: usize) ![]u8 {
     return std.fmt.bufPrint(
         buf,
@@ -181,25 +430,155 @@ pub fn colorPassSummary(buf: []u8, color_passes: u32, mode: mapping.Mode, stops:
     );
 }
 
+/// Digits in the widest `u32` (a pass counter or an image side).
+const max_u32_digits: usize = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32)}).len;
+
+/// Digits in the widest `u64` (a requested byte count).
+const max_u64_digits: usize = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u64)}).len;
+
+const iterate_prefix = "iterate pass ";
+
+/// Buffer size that fits ANY `iteratePassSummary` result. An UPPER bound rather than the
+/// exact worst case, because `viewport.coord_buf_len` (the center readout) is itself a
+/// bound; pinned by a test that the widest realistic line fits with room to spare. A
+/// shorter buffer returns `error.NoSpaceLeft`.
+pub const iterate_summary_buf_len: usize = iterate_prefix.len + max_u32_digits +
+    ": center=".len + viewport.coord_buf_len +
+    ", mag=".len + viewport.max_float_chars +
+    ", ".len + autoiter.summary_buf_len +
+    ", S=".len + max_u32_digits + "px".len;
+
+/// The success summary for one iteration pass:
+/// `"iterate pass 3: center=-0.7500 + 0.0000i, mag=2.0203050891044214e-1, max_iter=512 (auto), S=900px"`.
+/// Pure (writes only into `buf`) so the exact wording is unit-tested without a window/GPU;
+/// `Engine.iterate` passes it to `std.log.info`. Pass a `[iterate_summary_buf_len]u8`.
+///
+/// The `max_iter=... (auto|manual)` part is rendered by T3's `autoiter.policySummary` — the
+/// one definition of that phrase, always via `IterPolicy.effective`. So the line reports the
+/// CLAMPED count the pass actually iterated with (never a raw `manual_value`) and it
+/// PROPAGATES an invalid magnification instead of logging a fabricated count. `mag` uses
+/// `{e}` so a hostile magnitude stays a few characters, exactly like
+/// `viewport.degenerateRegionMessage`; the center comes from T1's `formatCoord`, so it gains
+/// decimals with zoom depth.
+pub fn iteratePassSummary(
+    buf: []u8,
+    pass: u32,
+    view: SquareView,
+    image_side: u32,
+    policy: IterPolicy,
+) ![]u8 {
+    const magnification = view.magnification();
+    var policy_buf: [autoiter.summary_buf_len]u8 = undefined;
+    const policy_part = try autoiter.policySummary(&policy_buf, policy, magnification);
+    var center_buf: [viewport.coord_buf_len]u8 = undefined;
+    const center_part = try viewport.formatCoord(&center_buf, view.center(), magnification);
+    return std.fmt.bufPrint(
+        buf,
+        iterate_prefix ++ "{d}: center={s}, mag={e}, {s}, S={d}px",
+        .{ pass, center_part, magnification, policy_part, image_side },
+    );
+}
+
+/// The human-actionable message for a view the engine cannot render. Reuses T1's
+/// `degenerateRegionMessage` so there is exactly ONE wording for a degenerate region; this
+/// only names which number offended. Pass a `[viewport.message_buf_len]u8`.
+pub fn degenerateViewMessage(buf: []u8, view: SquareView) ![]u8 {
+    const field = degenerateField(view);
+    return viewport.degenerateRegionMessage(buf, field.what, field.value);
+}
+
+/// Which number to name when T1 rejects a view. Only the MESSAGE depends on this: the
+/// accept/reject decision is always `SquareView.fromCenterSide`'s, so the two cannot
+/// disagree about whether a view is renderable.
+fn degenerateField(view: SquareView) struct { what: []const u8, value: f64 } {
+    if (!std.math.isFinite(view.center_re)) return .{ .what = "center re", .value = view.center_re };
+    if (!std.math.isFinite(view.center_im)) return .{ .what = "center im", .value = view.center_im };
+    return .{ .what = "side", .value = view.side };
+}
+
+const image_side_prefix = "rejected image side: ";
+const image_side_suffix = "px is not a renderable square; " ++
+    "the render square needs at least 1px per side (a minimized window has none)";
+
+/// Buffer size that fits ANY `imageSideMessage` result. Exactly the worst case, pinned by a
+/// test; a shorter buffer returns `error.NoSpaceLeft`.
+pub const image_side_message_buf_len: usize =
+    image_side_prefix.len + max_u32_digits + image_side_suffix.len;
+
+/// The human-actionable message for `EngineError.DegenerateImageSide`: the side that
+/// arrived and what is needed instead. Pure so the wording is unit-tested once and reused by
+/// every edge that reports it (T5's resize handler); pass a
+/// `[image_side_message_buf_len]u8`.
+pub fn imageSideMessage(buf: []u8, image_side: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, image_side_prefix ++ "{d}" ++ image_side_suffix, .{image_side});
+}
+
+const resize_prefix = "iteration buffer resize failed: ";
+const resize_infix = "px square needs ";
+const resize_suffix = " bytes; use a smaller window or free memory";
+
+/// Buffer size that fits ANY `resizeFailureMessage` result. Exactly the worst case, pinned
+/// by a test; a shorter buffer returns `error.NoSpaceLeft`.
+pub const resize_message_buf_len: usize = resize_prefix.len + max_u32_digits + 1 +
+    max_u32_digits + resize_infix.len + max_u64_digits + resize_suffix.len;
+
+/// The human-actionable message for a failed buffer (re)allocation: the requested square,
+/// what it costs, and the two ways out. Pure so the wording is unit-tested once; pass a
+/// `[resize_message_buf_len]u8`.
+pub fn resizeFailureMessage(buf: []u8, image_side: u32, bytes: u64) ![]u8 {
+    return std.fmt.bufPrint(
+        buf,
+        resize_prefix ++ "{d}x{d}" ++ resize_infix ++ "{d}" ++ resize_suffix,
+        .{ image_side, image_side, bytes },
+    );
+}
+
+/// Bytes both buffers need for a square image of side `image_side`: 4 for the f32 smooth
+/// value plus 4 for the RGBA8 texel, per pixel. `u64` and SATURATING, so reporting an
+/// absurd requested size cannot overflow on the very path that reports a failure.
+pub fn requestedBytes(image_side: u32) u64 {
+    const side: u64 = image_side;
+    return side *| side *| 8;
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 //
-// The 64x48 fixed view + its verified key-pixel coordinates are reused from iterbuf/
-// colorpass so a deep-interior pixel and a slow-escape exterior pixel are known.
+// The golden view: T1's `defaultView()` (the square containing the M0 region) rendered into
+// a 64x64 image. An auto policy gives exactly `base_max_iter` (512) there, so the M2 golden
+// numbers keep their meaning. The two key pixels below were verified against a render of
+// that view.
 const testing = std.testing;
 
-const golden_w = 64;
-const golden_h = 48;
-const golden_iter = 512;
-// Verified in iterbuf.zig against a trusted render of the fixed view.
-const interior_px = .{ .x = 46, .y = 24 };
-const exterior_px = .{ .x = 53, .y = 23 };
+const golden_side: u32 = 64;
+const golden_pixels: usize = golden_side * golden_side;
+/// What an auto policy resolves to at the golden view (T3's ramp floor).
+const golden_iter: u32 = autoiter.base_max_iter;
 
-fn testView() Viewport {
-    return Viewport.fixedView(golden_w, golden_h);
+// Verified against a render of the golden view:
+//   * (40, 32) samples c ≈ (-0.285, -0.027) — deep inside the main cardioid ⇒ the interior
+//     sentinel, so it tracks the interior color.
+//   * (52, 29) samples c ≈ (0.371, 0.137) — a slow escape (smooth value ≈ 206) ⇒ colored
+//     through the LUT.
+const interior_px = .{ .x = 40, .y = 32 };
+const exterior_px = .{ .x = 52, .y = 29 };
+
+fn testView() SquareView {
+    return SquareView.defaultView();
+}
+
+/// The golden view zoomed 8 doublings in (side / 256, so magnification is exactly 256x the
+/// default): T3's ramp gives `base_max_iter + 8 * iter_per_doubling` = 1152 there.
+fn zoomedView() viewport.ViewportError!SquareView {
+    return SquareView.fromCenterSide(testView().center(), 3.5 / 256.0);
+}
+
+/// An engine on the golden view at the golden side with the default (auto) policy.
+fn testEngine() !Engine {
+    return Engine.init(testing.allocator, testView(), golden_side, .{});
 }
 
 fn pixelAt(rgba: []const u8, x: usize, y: usize) Rgba8 {
-    const base = (y * golden_w + x) * 4;
+    const base = (y * golden_side + x) * 4;
     return .{ rgba[base + 0], rgba[base + 1], rgba[base + 2], rgba[base + 3] };
 }
 
@@ -221,29 +600,40 @@ fn diffCount(a: []const u8, b: []const u8) usize {
     return n;
 }
 
+/// Count how many smooth values differ between two equal-length iteration buffers.
+fn diffCountF32(a: []const f32, b: []const f32) usize {
+    var n: usize = 0;
+    for (a, b) |x, y| {
+        if (x != y) n += 1;
+    }
+    return n;
+}
+
+// ─── M2 regression: init, the color pass, and THE GUARANTEE ──────────────────
+
 test "init does not iterate or recolor: both counters start at zero" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try testing.expectEqual(@as(u32, 0), e.iteration_passes);
     try testing.expectEqual(@as(u32, 0), e.color_passes);
 }
 
-test "init sizes the buffers to the viewport (rgba is 4x the smooth buffer)" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+test "init sizes the buffers to the square image side (rgba is 4x the smooth buffer)" {
+    var e = try testEngine();
     defer e.deinit();
-    try testing.expectEqual(@as(usize, golden_w * golden_h), e.iter.len);
+    try testing.expectEqual(golden_pixels, e.iter.len);
     try testing.expectEqual(e.iter.len * 4, e.rgba.len);
 }
 
 test "iterate: the first pass sets iteration_passes to exactly 1" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     try testing.expectEqual(@as(u32, 1), e.iteration_passes);
 }
 
 test "iterate: the whole output image is fully opaque (alpha 255)" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     var i: usize = 3;
@@ -251,7 +641,7 @@ test "iterate: the whole output image is fully opaque (alpha 255)" {
 }
 
 test "THE GUARANTEE: setGradient bumps color_passes but leaves iteration_passes unchanged" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     const iters_before = e.iteration_passes;
@@ -262,7 +652,7 @@ test "THE GUARANTEE: setGradient bumps color_passes but leaves iteration_passes 
 }
 
 test "THE GUARANTEE: setMapping bumps color_passes but leaves iteration_passes unchanged" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     const iters_before = e.iteration_passes;
@@ -273,10 +663,10 @@ test "THE GUARANTEE: setMapping bumps color_passes but leaves iteration_passes u
 }
 
 test "setGradient changes at least one exterior pixel's bytes" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
-    var before: [golden_w * golden_h * 4]u8 = undefined;
+    var before: [golden_pixels * 4]u8 = undefined;
     @memcpy(&before, e.rgba);
     try e.setGradient(solidGradient(.{ 255, 0, 0, 255 }));
     // A gradient edit only touches exterior pixels (interior is colored outside the LUT),
@@ -285,7 +675,7 @@ test "setGradient changes at least one exterior pixel's bytes" {
 }
 
 test "setGradient leaves interior pixels tracking the (unchanged) interior color" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     try e.setGradient(solidGradient(.{ 255, 0, 0, 255 }));
@@ -295,11 +685,11 @@ test "setGradient leaves interior pixels tracking the (unchanged) interior color
 }
 
 test "setMapping (linear -> log) changes exterior bytes with no iteration recompute" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate(); // default mapping is linear
     const iters_before = e.iteration_passes;
-    var before: [golden_w * golden_h * 4]u8 = undefined;
+    var before: [golden_pixels * 4]u8 = undefined;
     @memcpy(&before, e.rgba);
     try e.setMapping(.{ .mode = .log });
     try testing.expect(diffCount(&before, e.rgba) > 0); // exterior recolored
@@ -307,7 +697,7 @@ test "setMapping (linear -> log) changes exterior bytes with no iteration recomp
 }
 
 test "setInterior recolors interior pixels without re-iterating" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     const iters_before = e.iteration_passes;
@@ -319,8 +709,16 @@ test "setInterior recolors interior pixels without re-iterating" {
     try testing.expectEqual(colors_before + 1, e.color_passes);
 }
 
+test "the known exterior pixel escapes and is colored through the LUT, not the interior color" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.setInterior(.{ 1, 2, 3, 255 });
+    try testing.expect(!std.meta.eql(e.interior, pixelAt(e.rgba, exterior_px.x, exterior_px.y)));
+}
+
 test "output() returns the current RGBA8 buffer" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     try testing.expectEqual(e.rgba.ptr, e.output().ptr);
@@ -328,7 +726,7 @@ test "output() returns the current RGBA8 buffer" {
 }
 
 test "setGradient with an empty gradient returns EmptyGradient and does not recolor" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     const colors_before = e.color_passes;
@@ -338,7 +736,7 @@ test "setGradient with an empty gradient returns EmptyGradient and does not reco
 }
 
 test "a mis-sized internal buffer surfaces BufferSizeMismatch, not unreachable" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate();
     // Shrink the output slice (same base pointer) so colorInto's size guard trips; a
@@ -350,6 +748,399 @@ test "a mis-sized internal buffer surfaces BufferSizeMismatch, not unreachable" 
     try testing.expectError(EngineError.BufferSizeMismatch, e.setMapping(.{ .mode = .log }));
 }
 
+// ─── M3: navigation re-iterates, and the guarantee survives it ───────────────
+
+test "setViewport bumps iteration_passes and color_passes by exactly one each" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const iters_before = e.iteration_passes;
+    const colors_before = e.color_passes;
+    try e.setViewport(try zoomedView());
+    try testing.expectEqual(iters_before + 1, e.iteration_passes);
+    try testing.expectEqual(colors_before + 1, e.color_passes);
+}
+
+test "setViewport installs the new view and re-iterates the buffer for it" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    var shallow: [golden_pixels]f32 = undefined;
+    @memcpy(&shallow, e.iter);
+
+    const zoomed = try zoomedView();
+    try e.setViewport(zoomed);
+    try testing.expectEqual(zoomed, e.view);
+    // The buffer really changed...
+    try testing.expect(diffCountF32(&shallow, e.iter) > 0);
+    // ...and it is exactly what an independent iteration of the NEW view produces.
+    var expected: [golden_pixels]f32 = undefined;
+    try iterbuf.iterateInto(&expected, zoomed.imageViewport(golden_side), e.max_iter);
+    try testing.expectEqualSlices(f32, &expected, e.iter);
+}
+
+test "setViewport recolors the new iteration buffer (the output tracks the new view)" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    var before: [golden_pixels * 4]u8 = undefined;
+    @memcpy(&before, e.rgba);
+    try e.setViewport(try zoomedView());
+    try testing.expect(diffCount(&before, e.rgba) > 0);
+}
+
+test "THE GUARANTEE under navigation: a gradient edit after a setViewport recolors only" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.setViewport(try zoomedView());
+    const iters_before = e.iteration_passes;
+    const colors_before = e.color_passes;
+    var iter_before: [golden_pixels]f32 = undefined;
+    @memcpy(&iter_before, e.iter);
+
+    try e.setGradient(solidGradient(.{ 0, 255, 0, 255 }));
+
+    try testing.expectEqual(iters_before, e.iteration_passes); // NEVER re-iterated
+    try testing.expectEqual(colors_before + 1, e.color_passes); // recolored once
+    // Counters aside, the expensive buffer itself is untouched.
+    try testing.expectEqualSlices(f32, &iter_before, e.iter);
+}
+
+test "THE GUARANTEE under navigation: a mapping edit after a setViewport recolors only" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.setViewport(try zoomedView());
+    const iters_before = e.iteration_passes;
+    const colors_before = e.color_passes;
+    var iter_before: [golden_pixels]f32 = undefined;
+    @memcpy(&iter_before, e.iter);
+
+    try e.setMapping(.{ .mode = .cyclic, .period = 16.0 });
+
+    try testing.expectEqual(iters_before, e.iteration_passes);
+    try testing.expectEqual(colors_before + 1, e.color_passes);
+    try testing.expectEqualSlices(f32, &iter_before, e.iter);
+}
+
+test "the interleaved navigate/edit sequence has exactly the documented counter history" {
+    var e = try testEngine();
+    defer e.deinit();
+    // Only the four iteration paths bump iteration_passes; every step bumps color_passes.
+    try e.iterate();
+    try testing.expectEqual([2]u32{ 1, 1 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setViewport(try zoomedView());
+    try testing.expectEqual([2]u32{ 2, 2 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setGradient(solidGradient(.{ 9, 9, 9, 255 }));
+    try testing.expectEqual([2]u32{ 2, 3 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setMapping(.{ .mode = .log });
+    try testing.expectEqual([2]u32{ 2, 4 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setInterior(.{ 0, 0, 0, 255 });
+    try testing.expectEqual([2]u32{ 2, 5 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setPolicy(try IterPolicy.manual(64));
+    try testing.expectEqual([2]u32{ 3, 6 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.resize(32);
+    try testing.expectEqual([2]u32{ 4, 7 }, [2]u32{ e.iteration_passes, e.color_passes });
+    try e.setGradient(solidGradient(.{ 7, 7, 7, 255 }));
+    try testing.expectEqual([2]u32{ 4, 8 }, [2]u32{ e.iteration_passes, e.color_passes });
+}
+
+test "a degenerate view is rejected: the engine keeps its view and does not re-iterate" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const iters_before = e.iteration_passes;
+    const zero_side = SquareView{ .center_re = -0.75, .center_im = 0.0, .side = 0.0 };
+    try testing.expectError(viewport.ViewportError.DegenerateRegion, e.setViewport(zero_side));
+    try testing.expectEqual(testView(), e.view);
+    try testing.expectEqual(iters_before, e.iteration_passes);
+}
+
+test "a view whose magnification overflows the auto ramp is rejected, not rendered" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    // A subnormal side is a finite positive extent (T1 accepts it) but 1/(side*sqrt2)
+    // overflows to inf, which the auto ramp cannot use.
+    const subnormal = try SquareView.fromCenterSide(testView().center(), std.math.floatTrueMin(f64));
+    try testing.expectError(autoiter.AutoIterError.InvalidMagnification, e.setViewport(subnormal));
+    try testing.expectEqual(testView(), e.view);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+// ─── M3: max_iter comes from the policy, once ────────────────────────────────
+
+test "init derives max_iter from an auto policy at the view's magnification" {
+    var e = try testEngine();
+    defer e.deinit();
+    try testing.expectEqual(golden_iter, e.max_iter);
+}
+
+test "init derives max_iter from a manual policy, ignoring the ramp" {
+    var e = try Engine.init(testing.allocator, testView(), golden_side, try IterPolicy.manual(300));
+    defer e.deinit();
+    try testing.expectEqual(@as(u32, 300), e.max_iter);
+}
+
+test "setViewport refreshes max_iter from the auto ramp for the new magnification" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.setViewport(try zoomedView());
+    // 8 doublings in: base_max_iter + 8 * iter_per_doubling = 512 + 640.
+    try testing.expectEqual(
+        autoiter.base_max_iter + 8 * @as(u32, @intFromFloat(autoiter.iter_per_doubling)),
+        e.max_iter,
+    );
+}
+
+test "setPolicy re-iterates with the new effective max_iter" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const iters_before = e.iteration_passes;
+
+    try e.setPolicy(try IterPolicy.manual(64));
+
+    try testing.expectEqual(iters_before + 1, e.iteration_passes);
+    try testing.expectEqual(@as(u32, 64), e.max_iter);
+    // The buffer is the one a 64-iteration render of the same view produces.
+    var expected: [golden_pixels]f32 = undefined;
+    try iterbuf.iterateInto(&expected, testView().imageViewport(golden_side), 64);
+    try testing.expectEqualSlices(f32, &expected, e.iter);
+}
+
+test "setPolicy clamps a hand-built out-of-range manual value instead of rendering it" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.setPolicy(.{ .auto = false, .manual_value = 1_000_000 });
+    try testing.expectEqual(autoiter.max_max_iter, e.max_iter);
+}
+
+test "a policy the current magnification cannot satisfy leaves the previous policy in place" {
+    const subnormal = try SquareView.fromCenterSide(testView().center(), std.math.floatTrueMin(f64));
+    const pinned = try IterPolicy.manual(32);
+    var e = try Engine.init(testing.allocator, subnormal, golden_side, pinned);
+    defer e.deinit();
+    try e.iterate();
+    // Switching this view to the auto ramp cannot work: its magnification is inf.
+    try testing.expectError(autoiter.AutoIterError.InvalidMagnification, e.setPolicy(.{}));
+    try testing.expectEqual(pinned, e.policy);
+    try testing.expectEqual(@as(u32, 32), e.max_iter);
+}
+
+test "init rejects an auto policy on a view whose magnification is unusable" {
+    const subnormal = try SquareView.fromCenterSide(testView().center(), std.math.floatTrueMin(f64));
+    try testing.expectError(
+        autoiter.AutoIterError.InvalidMagnification,
+        Engine.init(testing.allocator, subnormal, golden_side, .{}),
+    );
+}
+
+// ─── M3: resize ──────────────────────────────────────────────────────────────
+
+test "resize changes both buffer lengths to the new square side" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const new_side: u32 = 96;
+    try e.resize(new_side);
+    try testing.expectEqual(@as(usize, new_side) * new_side, e.iter.len);
+    try testing.expectEqual(e.iter.len * 4, e.rgba.len);
+    try testing.expectEqual(new_side, e.image_side);
+}
+
+test "resize re-iterates at the new side, matching an independent iteration" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const new_side: u32 = 32;
+    try e.resize(new_side);
+
+    const expected = try testing.allocator.alloc(f32, @as(usize, new_side) * new_side);
+    defer testing.allocator.free(expected);
+    try iterbuf.iterateInto(expected, testView().imageViewport(new_side), e.max_iter);
+    try testing.expectEqualSlices(f32, expected, e.iter);
+}
+
+test "resize bumps iteration_passes and color_passes by exactly one each" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.resize(48);
+    try testing.expectEqual(@as(u32, 2), e.iteration_passes);
+    try testing.expectEqual(@as(u32, 2), e.color_passes);
+}
+
+test "the color pass after a resize fills exactly S*S opaque RGBA texels" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const new_side: u32 = 17; // odd, so a stale stride would misalign
+    try e.resize(new_side);
+    try testing.expectEqual(@as(usize, new_side) * new_side * 4, e.rgba.len);
+    var i: usize = 3;
+    var texels: usize = 0;
+    while (i < e.rgba.len) : (i += 4) {
+        try testing.expectEqual(@as(u8, 255), e.rgba[i]);
+        texels += 1;
+    }
+    try testing.expectEqual(@as(usize, new_side) * new_side, texels);
+}
+
+test "resize to the same side keeps the buffers and still re-iterates" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const len_before = e.iter.len;
+    try e.resize(golden_side);
+    try testing.expectEqual(len_before, e.iter.len);
+    try testing.expectEqual(@as(u32, 2), e.iteration_passes);
+}
+
+test "resize(0) returns DegenerateImageSide and leaves the engine renderable" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectError(EngineError.DegenerateImageSide, e.resize(0));
+    try testing.expectEqual(golden_side, e.image_side);
+    try testing.expectEqual(golden_pixels, e.iter.len);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "init(0) rejects a zero image side before allocating anything" {
+    try testing.expectError(
+        EngineError.DegenerateImageSide,
+        Engine.init(testing.allocator, testView(), 0, .{}),
+    );
+}
+
+test "a resize whose smooth-buffer allocation fails keeps the previous buffers" {
+    // init performs exactly two allocations, so index 2 is the resize's first one.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var e = try Engine.init(failing.allocator(), testView(), golden_side, .{});
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectError(error.OutOfMemory, e.resize(128));
+    try testing.expectEqual(golden_side, e.image_side);
+    try testing.expectEqual(golden_pixels, e.iter.len);
+    try testing.expectEqual(golden_pixels * 4, e.rgba.len);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "a resize whose RGBA allocation fails frees the smooth buffer it already took" {
+    // Index 3 is the resize's SECOND allocation; the first must be released or the
+    // testing allocator reports a leak when this test ends.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 3 });
+    var e = try Engine.init(failing.allocator(), testView(), golden_side, .{});
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectError(error.OutOfMemory, e.resize(128));
+    try testing.expectEqual(golden_pixels, e.iter.len);
+}
+
+test "resize keeps the palette state, so the next color pass uses the edited gradient" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const solid: Rgba8 = .{ 200, 100, 50, 255 };
+    try e.setGradient(solidGradient(solid));
+    try e.setInterior(.{ 0, 0, 0, 255 });
+    try e.resize(32);
+    // Every texel is either the solid palette color or the interior color.
+    var i: usize = 0;
+    while (i < e.rgba.len) : (i += 4) {
+        const texel: Rgba8 = .{ e.rgba[i], e.rgba[i + 1], e.rgba[i + 2], e.rgba[i + 3] };
+        try testing.expect(std.meta.eql(texel, solid) or std.meta.eql(texel, e.interior));
+    }
+}
+
+// ─── M3: the pure summary + message builders ─────────────────────────────────
+
+test "iteratePassSummary produces the documented one-line re-iterate summary" {
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const line = try iteratePassSummary(&buf, 3, testView(), 900, .{});
+    try testing.expectEqualStrings(
+        "iterate pass 3: center=-0.7500 + 0.0000i, mag=2.0203050891044214e-1, " ++
+            "max_iter=512 (auto), S=900px",
+        line,
+    );
+}
+
+test "iteratePassSummary annotates a pinned max_iter as manual and gains center decimals" {
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const line = try iteratePassSummary(&buf, 2, try zoomedView(), golden_side, try IterPolicy.manual(300));
+    try testing.expectEqualStrings(
+        "iterate pass 2: center=-0.750000 + 0.000000i, mag=5.171981028107319e1, " ++
+            "max_iter=300 (manual), S=64px",
+        line,
+    );
+}
+
+test "iteratePassSummary reports the clamped effective max_iter, not a raw manual_value" {
+    // Guards the one-source-of-truth premise: a line formatted from `manual_value` would
+    // advertise 5000 while the render used 4096. 5000 has the same digit count as 4096, so
+    // the claim is about the value and cannot be satisfied by a buffer-length accident.
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const line = try iteratePassSummary(&buf, 1, testView(), golden_side, .{ .auto = false, .manual_value = 5000 });
+    try testing.expectEqualStrings(
+        "iterate pass 1: center=-0.7500 + 0.0000i, mag=2.0203050891044214e-1, " ++
+            "max_iter=4096 (manual), S=64px",
+        line,
+    );
+}
+
+test "iteratePassSummary propagates an invalid magnification instead of fabricating a count" {
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const subnormal = try SquareView.fromCenterSide(testView().center(), std.math.floatTrueMin(f64));
+    try testing.expectError(
+        autoiter.AutoIterError.InvalidMagnification,
+        iteratePassSummary(&buf, 1, subnormal, golden_side, .{}),
+    );
+}
+
+test "iteratePassSummary reports NoSpaceLeft instead of truncating" {
+    var buf: [iterate_prefix.len]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, iteratePassSummary(&buf, 1, testView(), 900, .{}));
+}
+
+test "iterate_summary_buf_len fits the widest line the engine can log" {
+    // Every field at its maximum: a saturated pass counter, a deep off-center view (17
+    // decimals per part), a capped max_iter and a saturated image side.
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const deep = try SquareView.fromCenterSide(.{ .re = -1.2345678901234567, .im = -0.9876543210987654 }, 1.0e-13);
+    const line = try iteratePassSummary(&buf, std.math.maxInt(u32), deep, std.math.maxInt(u32), .{});
+    try testing.expect(line.len <= iterate_summary_buf_len);
+}
+
+test "Engine.iterateSummary reflects the live pass counter, view, side and policy" {
+    var e = try Engine.init(testing.allocator, testView(), golden_side, try IterPolicy.manual(300));
+    defer e.deinit();
+    try e.iterate();
+    try e.setViewport(try zoomedView());
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "iterate pass 2: center=-0.750000 + 0.000000i, mag=5.171981028107319e1, " ++
+            "max_iter=300 (manual), S=64px",
+        try e.iterateSummary(&buf),
+    );
+}
+
+test "the logged max_iter is exactly the count the engine iterated with" {
+    // The anti-bypass check: whatever the engine rendered with must be the number in the
+    // line, including when the policy needed clamping.
+    var e = try Engine.init(testing.allocator, testView(), golden_side, .{ .auto = false, .manual_value = 5000 });
+    defer e.deinit();
+    try e.iterate();
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    const line = try e.iterateSummary(&buf);
+    var needle_buf: [autoiter.summary_buf_len]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "max_iter={d} (manual)", .{e.max_iter});
+    try testing.expect(std.mem.indexOf(u8, line, needle) != null);
+}
+
 test "colorPassSummary produces the documented one-line string" {
     var buf: [64]u8 = undefined;
     const line = try colorPassSummary(&buf, 2, .log, 5);
@@ -357,10 +1148,70 @@ test "colorPassSummary produces the documented one-line string" {
 }
 
 test "Engine.summary reflects the live counter, mapping mode, and stop count" {
-    var e = try Engine.init(testing.allocator, testView(), golden_iter);
+    var e = try testEngine();
     defer e.deinit();
     try e.iterate(); // color_passes -> 1, default 5-stop palette, linear
     var buf: [64]u8 = undefined;
     const line = try e.summary(&buf);
     try testing.expectEqualStrings("color pass 1: mode=linear, stops=5", line);
+}
+
+test "degenerateViewMessage names the offending side in T1's wording" {
+    var buf: [viewport.message_buf_len]u8 = undefined;
+    const view = SquareView{ .center_re = -0.75, .center_im = 0.0, .side = 0.0 };
+    try testing.expectEqualStrings(
+        "rejected viewport: side=0e0 is not a finite positive extent; " ++
+            "enter a positive magnification or two distinct corners",
+        try degenerateViewMessage(&buf, view),
+    );
+}
+
+test "degenerateViewMessage names a non-finite center instead of the side" {
+    var buf: [viewport.message_buf_len]u8 = undefined;
+    const view = SquareView{ .center_re = -0.75, .center_im = std.math.inf(f64), .side = 3.5 };
+    try testing.expectEqualStrings(
+        "rejected viewport: center im=inf is not a finite positive extent; " ++
+            "enter a positive magnification or two distinct corners",
+        try degenerateViewMessage(&buf, view),
+    );
+}
+
+test "imageSideMessage names the rejected pixel side and what is needed" {
+    var buf: [image_side_message_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "rejected image side: 0px is not a renderable square; the render square needs " ++
+            "at least 1px per side (a minimized window has none)",
+        try imageSideMessage(&buf, 0),
+    );
+}
+
+test "image_side_message_buf_len is exactly the worst-case message length" {
+    var buf: [image_side_message_buf_len]u8 = undefined;
+    const message = try imageSideMessage(&buf, std.math.maxInt(u32));
+    try testing.expectEqual(image_side_message_buf_len, message.len);
+}
+
+test "resizeFailureMessage names the requested square, its cost and the ways out" {
+    var buf: [resize_message_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "iteration buffer resize failed: 4096x4096px square needs 134217728 bytes; " ++
+            "use a smaller window or free memory",
+        try resizeFailureMessage(&buf, 4096, requestedBytes(4096)),
+    );
+}
+
+test "resize_message_buf_len is exactly the worst-case message length" {
+    var buf: [resize_message_buf_len]u8 = undefined;
+    const side = std.math.maxInt(u32);
+    const message = try resizeFailureMessage(&buf, side, std.math.maxInt(u64));
+    try testing.expectEqual(resize_message_buf_len, message.len);
+}
+
+test "requestedBytes counts 8 bytes per pixel (one f32 plus one RGBA8 texel)" {
+    try testing.expectEqual(@as(u64, 64 * 64 * 8), requestedBytes(64));
+    try testing.expectEqual(@as(u64, 0), requestedBytes(0));
+}
+
+test "requestedBytes saturates instead of overflowing for an absurd side" {
+    try testing.expectEqual(std.math.maxInt(u64), requestedBytes(std.math.maxInt(u32)));
 }

@@ -24,12 +24,11 @@ const window_title = "fractalforge";
 const window_w = 1280;
 const window_h = 720;
 
-// The fixed M0 render resolution. Aspect 1050:750 == 3.5:2.5 matches the fixed
-// viewport region exactly, so the whole set is shown with no letterbox in the
-// mapping. The image is then aspect-fit into its on-screen region by the UI.
-const render_w = 1050;
-const render_h = 750;
-const max_iter = 512;
+// The render resolution: a SQUARE of `render_side` px, because M3's view model is a
+// square region (plan A1) and `SquareView.imageViewport(S)` is the only pixel↔complex
+// bridge. T5 makes `render_side` follow the window (`S = min(window_w, window_h)`,
+// letterboxed); until then it is fixed and the image is aspect-fit by the UI.
+const render_side = 750;
 
 pub fn main() !void {
     var buf: [128]u8 = undefined;
@@ -60,8 +59,11 @@ pub fn main() !void {
     // from then on palette/mapping edits (T6, in the UI) rerun ONLY the cheap color pass
     // and re-upload — the iteration buffer is never recomputed (M2's guarantee). Data
     // flow is one-directional: iterate -> color -> upload -> display.
-    const vp = viewport.Viewport.fixedView(render_w, render_h);
-    var engine = engine_mod.Engine.init(std.heap.page_allocator, vp, max_iter) catch |err| {
+    // M3: the engine owns the view (T1 `SquareView`), the image side and the `max_iter`
+    // policy (T3, default auto), and re-iterates whenever any of them changes.
+    const view = viewport.SquareView.defaultView();
+    const vp = view.imageViewport(render_side);
+    var engine = engine_mod.Engine.init(std.heap.page_allocator, view, render_side, .{}) catch |err| {
         app_log.err("color engine init failed ({s}); aborting startup", .{@errorName(err)});
         return err;
     };
@@ -74,12 +76,12 @@ pub fn main() !void {
     };
     const iterate_ns = if (iterate_timer) |*t| t.read() else 0;
 
-    const texture = try texture_mod.createRgbaTexture(device.handle, render_w, render_h);
+    const texture = try texture_mod.createRgbaTexture(device.handle, render_side, render_side);
     defer texture.destroy();
     try texture_mod.upload(device.handle, texture, engine.output());
 
     var summary_buf: [128]u8 = undefined;
-    const summary = try stats_mod.renderSummary(&summary_buf, render_w, render_h, max_iter, iterate_ns);
+    const summary = try stats_mod.renderSummary(&summary_buf, render_side, render_side, engine.max_iter, iterate_ns);
     app_log.info("{s}", .{summary});
     var color_buf: [96]u8 = undefined;
     if (engine.summary(&color_buf)) |line| app_log.info("{s}", .{line}) else |_| {}
@@ -132,7 +134,9 @@ fn runLoop(
 
         ui.newFrame();
         var quit_requested = false;
-        panels.draw(device.handle, texture, vp, max_iter, app_stats.*, engine, editor, &quit_requested);
+        // `engine.max_iter` (not a local constant): the engine derives it from its
+        // `IterPolicy`, so the panel always shows the count the render actually used.
+        panels.draw(device.handle, texture, vp, engine.max_iter, app_stats.*, engine, editor, &quit_requested);
         if (quit_requested) running = false;
         ui.endFrame();
 
