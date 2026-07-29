@@ -133,8 +133,9 @@ pub const floor_message_buf_len: usize =
 /// the limit it crossed, what the user will see and what to do about it. `{e}` bounds the
 /// number the same way `viewport.degenerateRegionMessage` does (a `{d}` subnormal would run
 /// to hundreds of digits). Pure so the wording is unit-tested once and reused by every edge
-/// that logs it (`std.log.warn` in T6/T7); pass a `[floor_message_buf_len]u8`.
-pub fn precisionFloorMessage(buf: []u8, side: f64) ![]u8 {
+/// that logs it (`std.log.warn` in T6/T7); pass a `[floor_message_buf_len]u8`. The error set is
+/// spelled out rather than inferred so callers can switch on it exhaustively.
+pub fn precisionFloorMessage(buf: []u8, side: f64) error{NoSpaceLeft}![]u8 {
     return std.fmt.bufPrint(buf, floor_prefix ++ "{e}" ++ floor_suffix, .{side});
 }
 
@@ -147,6 +148,17 @@ pub fn precisionFloorMessage(buf: []u8, side: f64) ![]u8 {
 // the point of the test.
 const test_side: u32 = 512;
 const test_side_f: f64 = @floatFromInt(test_side);
+
+// A DEEP, OFF-CENTER view at an image side that is NOT `test_side` — the fixture that proves
+// the transforms read the view and `image_side` they are HANDED, rather than the default view
+// or a hard-coded 512 (every other case here starts from `defaultView()` at 512, where those
+// two mistakes are invisible). `1e-3 / 256` is exact (a power-of-two division), but neither the
+// center nor `1e-3` is dyadic, so the expected literals in the two tests below are NOT nice
+// decimals: they were computed independently in IEEE-754 double precision from T1's documented
+// formulas, in the same operation order, not read back from the code under test.
+const deep_center = Complex{ .re = -0.743, .im = 0.131 };
+const deep_side: f64 = 1.0e-3;
+const deep_image_side: u32 = 256;
 
 /// The widest `{e}` rendering an f64 can produce (24 chars) — the worst case for the
 /// warning message's buffer. Same value T1 brute-forced for `degenerateRegionMessage`.
@@ -328,6 +340,32 @@ test "panByPixels rejects a pixel delta that overflows the center" {
     try std.testing.expectError(ViewportError.DegenerateRegion, panByPixels(v, 1.0e10, 0.0, 1));
 }
 
+test "panByPixels moves the center of a deep off-center view at its own image side" {
+    const v = try SquareView.fromCenterSide(deep_center, deep_side);
+    // One pixel is 1e-3/256 = 3.90625e-6 units here, so +64 px right is +2.5e-4 in `re` and
+    // -32 px (up the screen) is +1.25e-4 in `im`.
+    const panned = try panByPixels(v, 64.0, -32.0, deep_image_side);
+    try std.testing.expectEqual(@as(f64, -0.74275), panned.center_re);
+    try std.testing.expectEqual(@as(f64, 0.131125), panned.center_im);
+}
+
+// A NON-square drag on the deep off-center view above, at `deep_image_side`: 160 px wide by
+// 120 px tall, so the square takes its side from the horizontal axis. The expected side falls
+// ~2 ULP short of the ideal 160 · 1e-3/256 = 6.25e-4 because differencing two corners so close
+// together cancels — hence the long literal.
+const deep_drag_a = Pixel{ .x = 40.0, .y = 60.0 };
+const deep_drag_b = Pixel{ .x = 200.0, .y = 180.0 };
+
+test "boxSelect maps the drag through the given view at the given image side" {
+    const v = try SquareView.fromCenterSide(deep_center, deep_side);
+    const selected = try boxSelect(v, deep_drag_a, deep_drag_b, deep_image_side);
+    // Mapping through the default view instead would give side ≈ 2.1875 (3500× too wide);
+    // mapping at 512 instead of 256 would halve every number here.
+    try std.testing.expectEqual(@as(f64, -0.74303125), selected.center_re);
+    try std.testing.expectEqual(@as(f64, 0.13103125), selected.center_im);
+    try std.testing.expectEqual(@as(f64, 0.0006249999999999867), selected.side);
+}
+
 // A deliberately NON-square drag on the default view at `test_side`: 300 px wide by
 // 100 px tall. One pixel is 3.5/512 = 0.0068359375 complex units, so the enclosing square
 // has side 300 · 0.0068359375 = 2.05078125 (the longer, horizontal axis) and is centered
@@ -358,6 +396,35 @@ test "boxSelect contains the selection, expanding only the shorter axis" {
     // Shorter (vertical) axis: grown on both sides, so the selection stays strictly inside.
     try std.testing.expect(c.min.im < bottom_right.im);
     try std.testing.expect(c.max.im > top_left.im);
+}
+
+// The MIRROR drag: 100 px wide by 300 px tall, i.e. PORTRAIT, so the enclosing square must
+// take its side from the VERTICAL axis (300 · 3.5/512 = 2.05078125) and grow the `re` bounds
+// instead. Without this case the larger-axis rule is only ever exercised on its horizontal
+// branch through `boxSelect`, and an implementation that sized the square from `|Δre|` alone —
+// cropping a tall selection, which plan A1 forbids — would pass. Midpoint pixel (250, 250)
+// ⇒ center (-0.791015625, +0.041015625).
+const tall_drag_a = Pixel{ .x = 200.0, .y = 100.0 };
+const tall_drag_b = Pixel{ .x = 300.0, .y = 400.0 };
+
+test "boxSelect sizes a taller-than-wide selection from its vertical axis" {
+    const selected = try boxSelect(SquareView.defaultView(), tall_drag_a, tall_drag_b, test_side);
+    // The 300 px height, not the 100 px width (which would give 0.68359375).
+    try std.testing.expectEqual(@as(f64, 2.05078125), selected.side);
+}
+
+test "boxSelect contains a taller-than-wide selection, expanding only the horizontal axis" {
+    const v = SquareView.defaultView();
+    const selected = try boxSelect(v, tall_drag_a, tall_drag_b, test_side);
+    const c = selected.corners();
+    const top_left = v.pixelToComplex(tall_drag_a.x, tall_drag_a.y, test_side);
+    const bottom_right = v.pixelToComplex(tall_drag_b.x, tall_drag_b.y, test_side);
+    // Longer (vertical) axis: untouched, so the selection's im bounds ARE the square's.
+    try std.testing.expectEqual(bottom_right.im, c.min.im);
+    try std.testing.expectEqual(top_left.im, c.max.im);
+    // Shorter (horizontal) axis: grown by (2.05078125 - 0.68359375)/2 on each side, equally.
+    try std.testing.expectEqual(@as(f64, 0.68359375), top_left.re - c.min.re);
+    try std.testing.expectEqual(@as(f64, 0.68359375), c.max.re - bottom_right.re);
 }
 
 test "boxSelect accepts the drag corners in either order" {
@@ -411,8 +478,11 @@ test "atPrecisionFloor flags a side below the f64 precision floor" {
     try std.testing.expect(atPrecisionFloor(v));
 }
 
-test "atPrecisionFloor does not flag a side above the floor" {
+test "atPrecisionFloor does not flag the default view" {
     try std.testing.expect(!atPrecisionFloor(SquareView.defaultView()));
+}
+
+test "atPrecisionFloor does not flag a side just above the floor" {
     const shallow = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-12);
     try std.testing.expect(!atPrecisionFloor(shallow));
 }
