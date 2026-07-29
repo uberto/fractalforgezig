@@ -17,6 +17,7 @@ test {
     _ = @import("gpu/message.zig");
     _ = @import("fractal/viewport.zig");
     _ = @import("fractal/navigate.zig");
+    _ = @import("fractal/autoiter.zig");
     _ = @import("fractal/mandelbrot.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/gradient.zig");
