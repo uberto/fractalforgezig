@@ -34,13 +34,14 @@ reruns on palette edits WITHOUT re-iterating (`iterbuf`→`colorpass`, baked `gr
   zero-area drag, `S==0`, side over/underflow. Warn-only floor: `atPrecisionFloor(v)`
   (`side<precision_floor_side`=1e-13); `precisionFloorMessage(buf[floor_message_buf_len],side)`.
 - `autoiter.zig` — T3 `max_iter` policy (A6); T4/T7 READ it, never re-derive it.
-  `autoMaxIter(mag) IterError!u32`=`clamp(base_max_iter(512)+iter_per_doubling(80)·
+  `autoMaxIter(mag) AutoIterError!u32`=`clamp(base_max_iter(512)+iter_per_doubling(80)·
   log2(mag/default_magnification),512,max_max_iter(4096))`,
   round-to-nearest, MONOTONE; non-finite/≤0 `mag`→`InvalidMagnification` (edge logs it via
   `viewport.degenerateRegionMessage`). `IterPolicy{auto=true,manual_value=512}`: `manual(v)`
   validates `[min_manual_iter(16),4096]` else `MaxIterOutOfRange`; `effective(mag)`=ramp when
   `auto` else `clampManual(v)`. `maxIterRangeMessage(buf[range_message_buf_len],v)`;
-  `policySummary(buf[summary_buf_len],policy,mag)`→`"max_iter=1152 (auto)"`.
+  `policySummary(buf[summary_buf_len],policy,mag)`→`"max_iter=1152 (auto)"`, ALWAYS via
+  `effective` (CLAMPED value; propagates its error).
 - `mandelbrot.zig` — `iterate(c_re,c_im,max_iter) f32`→smooth escape value, else
   `interior_sentinel`(-1.0).
 - `color.zig` — M0 STOPGAP; `Rgba8 = [4]u8`, `interior_color`.
@@ -52,7 +53,7 @@ reruns on palette edits WITHOUT re-iterating (`iterbuf`→`colorpass`, baked `gr
   `Params{mode=.linear, period=default_period(32.0)}` (cyclic-only, >0).
   `mapToUnit(smooth,max_iter,params) f32` CLAMPED [0,1] (cyclic [0,1)); bad inputs→0.
 - `iterbuf.zig` — ITERATION only. `iterationBufferLen(vp)`=w*h; `iterateInto(buf:[]f32, vp,
-  max_iter) IterError!void` PURE (+0.5 pixel centers; bad `buf.len`→`BufferSizeMismatch`);
+  max_iter) iterbuf.IterError!void` PURE (+0.5 pixel centers; bad `buf.len`→`BufferSizeMismatch`);
   `iterate(...)` wraps it → `IterationResult{values, elapsed_ns}` (caller frees);
   `std.time.Timer` ONLY here.
 - `colorpass.zig` — the cheap pass. `colorInto(rgba, iter, lut:*const [1024]Rgba8, max_iter,

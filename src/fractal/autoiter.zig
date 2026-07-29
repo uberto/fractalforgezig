@@ -32,7 +32,7 @@
 //!
 //! MANUAL OVERRIDE: `IterPolicy` is plain data — `{ auto, manual_value }`. `manual(value)`
 //! is the VALIDATING constructor T7's numeric field calls: an out-of-range value comes back
-//! as `IterError.MaxIterOutOfRange` (with `maxIterRangeMessage` for the wording) instead of
+//! as `AutoIterError.MaxIterOutOfRange` (with `maxIterRangeMessage` for the wording) instead of
 //! being silently accepted. `effective()` additionally CLAMPS `manual_value`, so even a
 //! hand-built struct can never hand the engine a 1-iteration or 4-billion-iteration render.
 //!
@@ -66,8 +66,11 @@ pub const iter_per_doubling: f64 = 80.0;
 /// Comptime-evaluated, so there is no second definition of the magnification formula.
 pub const default_magnification: f64 = SquareView.defaultView().magnification();
 
-/// Rejected `max_iter` inputs. Returned, never logged (see the file header).
-pub const IterError = error{
+/// Rejected `max_iter` inputs. Returned, never logged (see the file header). Named for this
+/// module (like `viewport.ViewportError` / `engine.EngineError`) because `iterbuf.zig` already
+/// exports a DIFFERENT `IterError` (buffer sizing); T4 imports both, so a bare `IterError`
+/// here would read as one type in two places.
+pub const AutoIterError = error{
     /// The magnification handed to the heuristic is not finite and positive, so
     /// `log2(mag/mag0)` has no meaning. A view from T1's constructors always has a finite
     /// positive side, but an extreme one (a subnormal side) can still overflow its
@@ -85,9 +88,9 @@ pub const IterError = error{
 /// The float result is ROUNDED to nearest (not truncated) so an exact power-of-two zoom
 /// lands on the exact documented value even if `log2` is a last-ULP off; rounding is
 /// monotone, so that costs nothing.
-pub fn autoMaxIter(magnification: f64) IterError!u32 {
+pub fn autoMaxIter(magnification: f64) AutoIterError!u32 {
     if (!std.math.isFinite(magnification) or magnification <= 0.0) {
-        return IterError.InvalidMagnification;
+        return AutoIterError.InvalidMagnification;
     }
     const doublings = std.math.log2(magnification / default_magnification);
     const raw = @as(f64, @floatFromInt(base_max_iter)) + iter_per_doubling * doublings;
@@ -116,15 +119,15 @@ pub const IterPolicy = struct {
     /// A policy that pins `value`, or `MaxIterOutOfRange` when it is outside
     /// `[min_manual_iter, max_max_iter]` (both ends inclusive). This is the entry point for
     /// user input — it is the only place that says no.
-    pub fn manual(value: u32) IterError!IterPolicy {
-        if (value < min_manual_iter or value > max_max_iter) return IterError.MaxIterOutOfRange;
+    pub fn manual(value: u32) AutoIterError!IterPolicy {
+        if (value < min_manual_iter or value > max_max_iter) return AutoIterError.MaxIterOutOfRange;
         return .{ .auto = false, .manual_value = value };
     }
 
     /// The iteration count to render this view with: the heuristic when `auto`, else the
     /// clamped pinned value. A pinned value ignores `magnification` entirely, so a garbage
     /// magnification cannot fail a manual render.
-    pub fn effective(self: IterPolicy, magnification: f64) IterError!u32 {
+    pub fn effective(self: IterPolicy, magnification: f64) AutoIterError!u32 {
         if (self.auto) return autoMaxIter(magnification);
         return clampManual(self.manual_value);
     }
@@ -147,7 +150,7 @@ const max_u32_digits: usize = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32
 /// by a test; a shorter buffer returns `error.NoSpaceLeft`.
 pub const range_message_buf_len: usize = range_prefix.len + max_u32_digits + range_suffix.len;
 
-/// The human-actionable message for `IterError.MaxIterOutOfRange`: what arrived, the range
+/// The human-actionable message for `AutoIterError.MaxIterOutOfRange`: what arrived, the range
 /// it missed, and the two ways out. Pure so the wording is unit-tested once and reused by
 /// every edge that logs `std.log.err` / shows the user the rejection (T7); pass a
 /// `[range_message_buf_len]u8`.
@@ -163,14 +166,21 @@ const manual_suffix: []const u8 = " (manual)";
 const max_effective_digits: usize = std.fmt.comptimePrint("{d}", .{max_max_iter}).len;
 
 /// Buffer size that fits ANY `policySummary` result (the longest is a 4-digit manual value).
-/// Exactly the worst case, pinned by a test.
+/// Exactly the worst case, pinned by a test. It is sized for `effective`'s RANGE — a second
+/// reason `policySummary` must print `effective`'s value and never a raw `manual_value`.
 pub const summary_buf_len: usize =
     summary_prefix.len + max_effective_digits + manual_suffix.len;
 
 /// The success summary for a chosen iteration count: `"max_iter=1152 (auto)"` or
 /// `"max_iter=750 (manual)"`, so the engine's per-pass log line (T4) and T7's panel say the
 /// same thing about the same number. Pure (writes only into `buf`) so the exact wording is
-/// unit-tested; pass a `[summary_buf_len]u8`. Fails exactly where `effective` does.
+/// unit-tested; pass a `[summary_buf_len]u8`.
+///
+/// The number it prints is ALWAYS `effective`'s, never `manual_value` read directly — so the
+/// summary cannot claim a count the render will not use (an out-of-range hand-built policy
+/// summarises as its CLAMPED value), and it PROPAGATES `effective`'s error instead of
+/// substituting a plausible number, so a magnification that overflowed to `inf` can never be
+/// logged as a confident `max_iter=512 (auto)`. Both halves are pinned by tests.
 pub fn policySummary(buf: []u8, policy: IterPolicy, magnification: f64) ![]u8 {
     const value = try policy.effective(magnification);
     return std.fmt.bufPrint(buf, summary_prefix ++ "{d}{s}", .{
@@ -240,10 +250,10 @@ test "the ramp reaches the cap on the 45th doubling and not the 44th" {
 }
 
 test "autoMaxIter rejects a non-finite or non-positive magnification" {
-    try std.testing.expectError(IterError.InvalidMagnification, autoMaxIter(0.0));
-    try std.testing.expectError(IterError.InvalidMagnification, autoMaxIter(-1.0));
-    try std.testing.expectError(IterError.InvalidMagnification, autoMaxIter(std.math.nan(f64)));
-    try std.testing.expectError(IterError.InvalidMagnification, autoMaxIter(std.math.inf(f64)));
+    try std.testing.expectError(AutoIterError.InvalidMagnification, autoMaxIter(0.0));
+    try std.testing.expectError(AutoIterError.InvalidMagnification, autoMaxIter(-1.0));
+    try std.testing.expectError(AutoIterError.InvalidMagnification, autoMaxIter(std.math.nan(f64)));
+    try std.testing.expectError(AutoIterError.InvalidMagnification, autoMaxIter(std.math.inf(f64)));
 }
 
 test "the ramp spans the whole f64-usable zoom range, capping at the precision floor" {
@@ -286,13 +296,13 @@ test "the default policy is auto at the M0 baseline" {
 }
 
 test "manual rejects a value below the supported range" {
-    try std.testing.expectError(IterError.MaxIterOutOfRange, IterPolicy.manual(0));
-    try std.testing.expectError(IterError.MaxIterOutOfRange, IterPolicy.manual(min_manual_iter - 1));
+    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(0));
+    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(min_manual_iter - 1));
 }
 
 test "manual rejects a value above the supported range" {
-    try std.testing.expectError(IterError.MaxIterOutOfRange, IterPolicy.manual(max_max_iter + 1));
-    try std.testing.expectError(IterError.MaxIterOutOfRange, IterPolicy.manual(std.math.maxInt(u32)));
+    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(max_max_iter + 1));
+    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(std.math.maxInt(u32)));
 }
 
 test "manual accepts both ends of the supported range" {
@@ -307,7 +317,7 @@ test "a manual policy ignores a non-finite magnification instead of failing" {
 
 test "an auto policy propagates an invalid magnification as a typed error" {
     const p = IterPolicy{};
-    try std.testing.expectError(IterError.InvalidMagnification, p.effective(0.0));
+    try std.testing.expectError(AutoIterError.InvalidMagnification, p.effective(0.0));
 }
 
 test "maxIterRangeMessage names the offending value, the range and what to do" {
@@ -340,6 +350,29 @@ test "policySummary reports a pinned manual value" {
     var buf: [summary_buf_len]u8 = undefined;
     const p = try IterPolicy.manual(750);
     try std.testing.expectEqualStrings("max_iter=750 (manual)", try policySummary(&buf, p, mag0));
+}
+
+test "policySummary reports the clamped effective value, not a raw out-of-range manual one" {
+    // Guards the one-source-of-truth premise: a summary formatted from `manual_value` directly
+    // would advertise 1000000 while the render used 4096.
+    var buf: [summary_buf_len]u8 = undefined;
+    // 5000 is above the cap but has the SAME digit count as the clamped 4096, so the claim is
+    // about the value and cannot be satisfied by a buffer-length accident.
+    const p = IterPolicy{ .auto = false, .manual_value = 5000 };
+    try std.testing.expectEqualStrings("max_iter=4096 (manual)", try policySummary(&buf, p, mag0));
+}
+
+test "policySummary propagates an invalid magnification instead of summarising a fabricated count" {
+    var buf: [summary_buf_len]u8 = undefined;
+    const p = IterPolicy{};
+    try std.testing.expectError(
+        AutoIterError.InvalidMagnification,
+        policySummary(&buf, p, 0.0),
+    );
+    try std.testing.expectError(
+        AutoIterError.InvalidMagnification,
+        policySummary(&buf, p, std.math.inf(f64)),
+    );
 }
 
 test "summary_buf_len is exactly the worst-case summary length" {
