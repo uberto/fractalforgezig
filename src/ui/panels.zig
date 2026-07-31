@@ -44,10 +44,15 @@ const window_flags: ig.WindowFlags =
 /// (`setGradient`/`setMapping`/`setInterior`) and RE-UPLOADS the engine's RGBA buffer to
 /// `texture` — it NEVER calls `iterate`. The data panel surfaces the engine's two pass
 /// counters so that decoupling is visible.
+///
+/// `image_rect` is the letterboxed square in window coordinates (T5), computed by
+/// `viewport.computeImageRect(window_w, window_h)`. The fractal texture is drawn at
+/// that position so that T6 can map input coordinates through the same rect.
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
     vp: viewport.Viewport,
+    image_rect: viewport.ImageRect,
     max_iter: u32,
     s: stats.Stats,
     engine: *engine_mod.Engine,
@@ -66,7 +71,7 @@ pub fn draw(
         if (fractal_w < 0) fractal_w = 0;
 
         _ = c.ffImguiBeginChild("fractal_region", fractal_w, 0, true);
-        drawFractal(texture.handle, texture.width, texture.height);
+        drawFractal(texture.handle, image_rect);
         c.ffImguiEndChild();
 
         ig.igSameLine(0, region_spacing);
@@ -100,18 +105,13 @@ fn drawMenuBar(quit_requested: *bool) bool {
     return open_about;
 }
 
-/// Draw the Mandelbrot texture, aspect-fit to the current region (letterbox).
-fn drawFractal(texture: *c.SDL_GPUTexture, tex_w: u32, tex_h: u32) void {
-    var region_w: f32 = 0;
-    var region_h: f32 = 0;
-    c.ffImguiContentAvail(&region_w, &region_h);
-    const fit = stats.containSize(
-        @floatFromInt(tex_w),
-        @floatFromInt(tex_h),
-        region_w,
-        region_h,
-    );
-    c.ffImguiImage(texture, fit.w, fit.h);
+/// Draw the Mandelbrot texture at the letterboxed `image_rect` position inside the
+/// fractal child region. The child's cursor is moved to the image_rect origin (relative
+/// to the child's own origin) then the texture is drawn at `S × S` pixels, so bars
+/// appear as the child background (SDL clear color shows through) rather than a stretch.
+fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void {
+    const s: f32 = @floatFromInt(image_rect.side);
+    c.ffImguiImage(texture, s, s);
 }
 
 /// Read-only observability panel: render/frame ms, the decoupling PASS COUNTERS (iteration

@@ -786,6 +786,23 @@ test "degenerateRegionMessage reports NoSpaceLeft instead of truncating" {
     );
 }
 
+/// Compute the letterboxed square `ImageRect` for a window of `window_w × window_h`
+/// screen pixels (plan A2: the fractal renders into a centered square of side
+/// `S = min(window_w, window_h)`).
+///
+/// Pure: no SDL/GPU/ImGui — lives in the fast test tier. Returns a zero-side rect
+/// safely for degenerate (0 × anything) input; T5 skips the render pass for those.
+/// The rect is consumed by `cursorCoord` (T6's gesture entry) and the texture upload.
+pub fn computeImageRect(window_w: u32, window_h: u32) ImageRect {
+    if (window_w == 0 or window_h == 0) return .{ .x = 0, .y = 0, .side = 0 };
+    const s = @min(window_w, window_h);
+    return .{
+        .x = @intCast((window_w - s) / 2),
+        .y = @intCast((window_h - s) / 2),
+        .side = s,
+    };
+}
+
 test "imageViewport is a square M0 viewport of side S pixels" {
     const v = SquareView.defaultView();
     const vp = v.imageViewport(512);
@@ -805,4 +822,60 @@ test "imageViewport reproduces the square view's pixel mapping" {
         try std.testing.expectApproxEqAbs(want.re, got.re, v.side * 1e-12);
         try std.testing.expectApproxEqAbs(want.im, got.im, v.side * 1e-12);
     }
+}
+
+// ─── Tests: computeImageRect ─────────────────────────────────────────────────
+
+test "computeImageRect landscape: S=height, centered horizontally" {
+    // 1280x720 landscape: S = min(1280, 720) = 720, centered horizontally.
+    // x = (1280 - 720) / 2 = 280, y = 0
+    const r = computeImageRect(1280, 720);
+    try std.testing.expectEqual(@as(u32, 720), r.side);
+    try std.testing.expectEqual(@as(i32, 280), r.x);
+    try std.testing.expectEqual(@as(i32, 0), r.y);
+}
+
+test "computeImageRect portrait: S=width, centered vertically" {
+    // 600x900 portrait: S = min(600, 900) = 600, centered vertically.
+    // x = 0, y = (900 - 600) / 2 = 150
+    const r = computeImageRect(600, 900);
+    try std.testing.expectEqual(@as(u32, 600), r.side);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(i32, 150), r.y);
+}
+
+test "computeImageRect square: S=side, no bars" {
+    // 800x800 square: S = 800, no bars.
+    const r = computeImageRect(800, 800);
+    try std.testing.expectEqual(@as(u32, 800), r.side);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(i32, 0), r.y);
+}
+
+test "computeImageRect degenerate zero-width: side=0" {
+    const r = computeImageRect(0, 800);
+    try std.testing.expectEqual(@as(u32, 0), r.side);
+}
+
+test "computeImageRect degenerate zero-height: side=0" {
+    const r = computeImageRect(800, 0);
+    try std.testing.expectEqual(@as(u32, 0), r.side);
+}
+
+test "computeImageRect degenerate zero-both: side=0, origin at zero" {
+    const r = computeImageRect(0, 0);
+    try std.testing.expectEqual(@as(u32, 0), r.side);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(i32, 0), r.y);
+}
+
+test "computeImageRect image is always centered: x+side+x == window_w and y+side+y == window_h" {
+    // For landscape 1920x1080: S=1080, x=(1920-1080)/2=420
+    const r = computeImageRect(1920, 1080);
+    try std.testing.expectEqual(@as(u32, 1080), r.side);
+    // x + side + x should equal window_w
+    try std.testing.expectEqual(
+        @as(u32, 1920),
+        @as(u32, @intCast(r.x)) + r.side + @as(u32, @intCast(r.x)),
+    );
 }

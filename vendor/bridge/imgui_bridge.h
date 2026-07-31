@@ -69,6 +69,10 @@ void ffImguiEndChild(void);
 // ImGui backend binds the texture via its own sampler; `texture` is the raw handle.
 void ffImguiImage(SDL_GPUTexture *texture, float w, float h);
 
+// Set the cursor to an absolute screen position (bypasses the child-window layout).
+// Use for letterboxed images that must sit at a computed position in window space.
+void ffImguiSetCursorScreenPos(float x, float y);
+
 #ifdef __cplusplus
 }
 #endif

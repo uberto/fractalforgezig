@@ -80,3 +80,8 @@ extern "C" void ffImguiImage(SDL_GPUTexture *texture, float w, float h)
     // SDL_GPUTexture* as the ImTextureID; the backend supplies the sampler.
     ImGui::Image((ImTextureID)(intptr_t)texture, ImVec2(w, h));
 }
+
+extern "C" void ffImguiSetCursorScreenPos(float x, float y)
+{
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+}
