@@ -142,3 +142,29 @@ pub extern fn igGetForegroundDrawList_ViewportPtr(viewport: ?*anyopaque) ?*ImDra
 // Tooltip (hover coordinate readout)
 pub extern fn igBeginTooltip() bool;
 pub extern fn igEndTooltip() void;
+
+// Coordinate panel widgets (T7): text input, checkbox, button.
+pub const InputTextFlags = c_int;
+/// `ImGuiInputTextFlags_EnterReturnsTrue` — confirm the field on Enter.
+pub const input_text_flags_enter_returns_true: InputTextFlags = 1 << 6;
+/// `ImGuiInputTextFlags_ReadOnly` — show the value but reject edits.
+pub const input_text_flags_read_only: InputTextFlags = 1 << 9;
+
+/// Text input widget. Returns true when the user commits the edit (Enter if
+/// `input_text_flags_enter_returns_true`, or focus lost). `buf` must be null-terminated
+/// and writable; `buf_size` is the TOTAL byte capacity (including the null terminator).
+/// callback and user_data must be null for the basic usage T7 needs.
+pub extern fn igInputText(
+    label: [*:0]const u8,
+    buf: [*]u8,
+    buf_size: usize,
+    flags: InputTextFlags,
+    callback: ?*anyopaque,
+    user_data: ?*anyopaque,
+) bool;
+
+/// Checkbox widget. Returns true when the value changes. `v` is read and written.
+pub extern fn igCheckbox(label: [*:0]const u8, v: *bool) bool;
+
+/// Button widget. Returns true when clicked. `size` is `{0,0}` for auto-size.
+pub extern fn igButton(label: [*:0]const u8, size: ImVec2) bool;

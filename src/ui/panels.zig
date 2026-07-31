@@ -15,6 +15,8 @@ const editor_mod = @import("editor.zig");
 const viewport = @import("../fractal/viewport.zig");
 const engine_mod = @import("../fractal/engine.zig");
 const texture_mod = @import("../gpu/texture.zig");
+const navigate = @import("../fractal/navigate.zig");
+const autoiter = @import("../fractal/autoiter.zig");
 
 const ui_log = std.log.scoped(.ui);
 
@@ -57,6 +59,7 @@ pub fn draw(
     s: stats.Stats,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
+    view_editor: *editor_mod.ViewEditor,
     quit_requested: *bool,
 ) void {
     c.ffImguiFillMainViewport();
@@ -78,6 +81,8 @@ pub fn draw(
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
         drawDataPanel(vp, max_iter, s, engine);
+        ig.igSpacing();
+        drawCoordPanel(device, texture, engine, view_editor);
         ig.igSpacing();
         drawPalettePanel(device, texture, engine, editor);
         c.ffImguiEndChild();
@@ -141,6 +146,208 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
     textf("re: [{d:.4}, {d:.4}]", .{ re_min, re_max });
     textf("im: [{d:.4}, {d:.4}]", .{ im_min, im_max });
     textf("max_iter: {d}", .{max_iter});
+}
+
+/// The coordinate editing panel: center+magnification and corners (both forms, kept in
+/// sync), Reset to home button, and the auto/manual max_iter control. On commit (Enter on
+/// an input field, Reset clicked, or Auto toggled) the panel:
+///   1. Parses and validates via the pure `ViewEditor` helpers.
+///   2. Calls the engine setter (`setViewport` or `setPolicy`).
+///   3. Re-uploads the RGBA buffer to the GPU texture.
+///   4. Syncs all text buffers from the engine's committed state.
+/// On failure, logs `std.log.err` (scope `.ui`) with actionable context and keeps the old
+/// state — never re-iterates on a parse failure.
+fn drawCoordPanel(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    ve: *editor_mod.ViewEditor,
+) void {
+    var nav_changed = false;
+    var policy_changed = false;
+
+    ig.igSeparatorText("Coord");
+
+    ig.igSeparatorText("Center / Mag");
+    // Center Re
+    if (ig.igInputText("re##cre", &ve.center_re_buf, ve.center_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (ve.parseAndApplyCenterMag()) |new_view| {
+            applyNavChange(device, texture, engine, ve, new_view);
+            nav_changed = true;
+        } else {
+            ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
+            ve.syncFromView(engine.view);
+        }
+    }
+    // Center Im
+    if (ig.igInputText("im##cim", &ve.center_im_buf, ve.center_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCenterMag()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+    // Magnification
+    if (ig.igInputText("mag##mag", &ve.mag_buf, ve.mag_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCenterMag()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+
+    ig.igSeparatorText("Corners");
+    // Corner A Re
+    if (ig.igInputText("a.re##are", &ve.corner_a_re_buf, ve.corner_a_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCorners()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+    // Corner A Im
+    if (ig.igInputText("a.im##aim", &ve.corner_a_im_buf, ve.corner_a_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCorners()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+    // Corner B Re
+    if (ig.igInputText("b.re##bre", &ve.corner_b_re_buf, ve.corner_b_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCorners()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+    // Corner B Im
+    if (ig.igInputText("b.im##bim", &ve.corner_b_im_buf, ve.corner_b_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!nav_changed) {
+            if (ve.parseAndApplyCorners()) |new_view| {
+                applyNavChange(device, texture, engine, ve, new_view);
+                nav_changed = true;
+            } else {
+                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
+                ve.syncFromView(engine.view);
+            }
+        }
+    }
+
+    // Reset to home
+    if (ig.igButton("Reset", .{ .x = 0, .y = 0 })) {
+        if (!nav_changed) {
+            const home = navigate.reset();
+            applyNavChange(device, texture, engine, ve, home);
+            nav_changed = true;
+        }
+    }
+
+    // max_iter control: Auto checkbox + manual field
+    ig.igSeparatorText("max_iter");
+    if (ig.igCheckbox("Auto", &ve.auto_iter)) {
+        // Toggle: apply the policy change immediately.
+        applyPolicyChange(device, texture, engine, ve);
+        policy_changed = true;
+    }
+    // Manual field is disabled when auto is on.
+    ig.igBeginDisabled(ve.auto_iter);
+    if (ig.igInputText("iter##iter", &ve.manual_iter_buf, ve.manual_iter_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (!policy_changed) {
+            if (ve.parseIterPolicy()) |policy| {
+                applyPolicyChangeWithPolicy(device, texture, engine, ve, policy);
+            } else {
+                ui_log.err("invalid max_iter — enter an integer between {d} and {d}", .{ autoiter.min_manual_iter, autoiter.max_max_iter });
+                // Restore the buffer to the engine's current policy value.
+                syncIterBuf(ve, engine.policy);
+            }
+        }
+    }
+    ig.igEndDisabled();
+}
+
+/// Apply a new view to the engine and re-upload. On failure logs and keeps the old view.
+/// Syncs `ve` to the committed engine view on success.
+fn applyNavChange(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    ve: *editor_mod.ViewEditor,
+    new_view: viewport.SquareView,
+) void {
+    engine.setViewport(new_view) catch |err| {
+        ui_log.err("navigation rejected ({s}); keeping previous view", .{@errorName(err)});
+        ve.syncFromView(engine.view);
+        return;
+    };
+    texture_mod.upload(device, texture, engine.output()) catch |err| {
+        ui_log.err("re-upload after coord edit failed ({s})", .{@errorName(err)});
+    };
+    ve.syncFromView(engine.view);
+}
+
+/// Build a policy from the editor's `auto_iter` toggle and `manual_iter_buf`, then apply.
+fn applyPolicyChange(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    ve: *editor_mod.ViewEditor,
+) void {
+    if (ve.auto_iter) {
+        applyPolicyChangeWithPolicy(device, texture, engine, ve, .{ .auto = true });
+    } else {
+        const policy = ve.parseIterPolicy() orelse blk: {
+            // Fall back to current manual_value when the text is blank/garbage.
+            break :blk autoiter.IterPolicy{ .auto = false, .manual_value = engine.policy.manual_value };
+        };
+        applyPolicyChangeWithPolicy(device, texture, engine, ve, policy);
+    }
+}
+
+/// Apply a given `IterPolicy` to the engine and re-upload.
+fn applyPolicyChangeWithPolicy(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    ve: *editor_mod.ViewEditor,
+    policy: autoiter.IterPolicy,
+) void {
+    engine.setPolicy(policy) catch |err| {
+        ui_log.err("policy change rejected ({s}); keeping previous policy", .{@errorName(err)});
+        syncIterBuf(ve, engine.policy);
+        return;
+    };
+    texture_mod.upload(device, texture, engine.output()) catch |err| {
+        ui_log.err("re-upload after policy change failed ({s})", .{@errorName(err)});
+    };
+    ve.auto_iter = engine.policy.auto;
+    syncIterBuf(ve, engine.policy);
+}
+
+/// Write the engine's manual_value into `ve.manual_iter_buf`.
+fn syncIterBuf(ve: *editor_mod.ViewEditor, policy: autoiter.IterPolicy) void {
+    const s = std.fmt.bufPrint(&ve.manual_iter_buf, "{d}", .{policy.manual_value}) catch return;
+    if (s.len < ve.manual_iter_buf.len) ve.manual_iter_buf[s.len] = 0;
 }
 
 /// The mapping-mode combo labels as null-terminated C pointers, derived at comptime from

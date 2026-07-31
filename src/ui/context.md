@@ -18,22 +18,14 @@ coords throughout (`SDL_GetWindowSize`/`event.window.data1,2`).
 
 ## Layout: single window, two fixed regions
 
-- `panels.zig` — `draw(device, texture, vp, image_rect, max_iter, stats, engine, editor,
-  quit_requested)`. ImGui edge, NOT pure. Window pinned to work area (`ffImguiFillMainViewport`),
-  no title/resize/move + menu bar. Menu: File→Quit, Help→About. Left child: fractal image
-  (`ffImguiImage` at `image_rect.side × image_rect.side`). Right child: data panel (ms,
-  counters, mode, stops, bounds, `max_iter`) + **Palette panel**.
-- **Palette panel + recolor flow (M2).** Per stop: `igColorEdit4` + `igSliderFloat` pos +
-  `igSmallButton` "Remove"; then "Add stop", mapping `igCombo_Str_arr`, period
-  `igSliderFloat` (`igBeginDisabled` unless cyclic), interior `igColorEdit4`. Changes OR
-  into `Edits{gradient,mapping,interior}`. **Flow = edit → recolor → re-upload, NEVER
-  re-iterate**: `applyEdits` runs the matching setter, re-uploads `engine.output()`, logs
-  `engine.summary()` (`.ui`); errors log `.err` and skip. `iterate` runs ONCE at startup.
-- `editor.zig` — PURE, in `root.zig`. `Editor{stops_buf,count,mode_index,period,interior}`:
-  `initDefault`; `toGradient` copies + SORTS ascending; `params`→`mapping.Params`;
-  `addStop`/`removeStop` keep 1..`max_stops`; `modeToIndex`/`indexToMode`+`mode_items`.
-- `stats.zig` — PURE, in `root.zig`. `Stats{render_ms,frame_ms,dispatch_count}`;
-  `fromRender`/`observeFrame`; `nsToMs`; `containSize`; `renderSummary`.
+`panels.zig` — `draw(device,texture,vp,image_rect,max_iter,stats,engine,editor,view_editor,
+quit_requested)`. ImGui edge. Left child: fractal image. Right child: data panel, coord
+panel (T7), palette panel. Menu: File→Quit, Help→About. **Palette + recolor (M2)**: per
+stop `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, `igCombo_Str_arr` mode, period
+slider, interior color. Changes OR into `Edits`. `applyEdits`→setter→re-upload→log; NEVER
+re-iterates. `editor.zig` (PURE): `Editor{stops_buf,count,mode_index,period,interior}`;
+`initDefault`; `toGradient` sorts ascending; `addStop`/`removeStop`; `modeToIndex`+
+`mode_items`. `stats.zig` (PURE): `Stats{render_ms,frame_ms}`; `renderSummary`.
 
 ## Bridge helpers (vendor/bridge)
 
@@ -57,23 +49,34 @@ backends then context. App order: `SDL_Init`→`CreateWindow`→`Device.create`�
 
 ## Navigation input + coarse→fine (T6, main.zig)
 
-All navigation glue in `main.zig`. `NavState{drag_state, drag_start_px, right_click_pt,
-full_pass_done, idle_timer}`. `real_s` = full-res S (engine may be at coarse size).
+All glue in `main.zig`. `NavState{drag_state,drag_start_px,right_click_pt,full_pass_done,
+idle_timer}`. `real_s` = full-res S. Box-select (left-drag): `handleNavInput`→
+`navigate.boxSelect`→`setViewport` on release; rubber-band via `ImDrawList_AddRect`. Pan
+(middle/Space+left): `panByPixels`→`setViewport`; reset delta after. Scroll
+(`SDL_EVENT_MOUSE_WHEEL`): `cursorCoord`→`zoomAbout`. Right-click: stash point,
+`igOpenPopup_Str`→`drawContextMenu`→`zoomCentered`. Hover: `cursorCoord`→`formatCoord`→
+tooltip. Coarse→fine: `applyViewCoarse` resizes to `max(real_s/4,1)`, `setViewport`, upload,
+`full_pass_done=false`. `runFullPass` restores `real_s`, upload, done. `refine.decidePass`
+(pure, tested) drives: `.full`→`runFullPass`.
 
-- **Box-select** (left-drag, no Space): `handleNavInput` → `navigate.boxSelect`→
-  `engine.setViewport` on release; rubber-band via `igGetWindowDrawList`/`ImDrawList_AddRect`.
-- **Pan** (middle-drag / Space+left): `igGetMouseDragDelta`→`navigate.panByPixels`→
-  `engine.setViewport`; `igResetMouseDragDelta` after each apply.
-- **Scroll-zoom** (`SDL_EVENT_MOUSE_WHEEL`): cursor→`cursorCoord`→`navigate.zoomAbout`.
-- **Right-click** (`SDL_BUTTON_RIGHT`→stash point, `igOpenPopup_Str`): `drawContextMenu`
-  renders "Zoom in/out 2×"→`navigate.zoomCentered`.
-- **Hover**: `drawHoverReadout` → `cursorCoord`→`formatCoord`→`igBeginTooltip`; null=skip.
-- **Coarse→fine**: `applyViewCoarse` resizes to `max(real_s/4,1)`, calls `setViewport`,
-  uploads, marks `full_pass_done=false`. `runFullPass` restores `real_s`, uploads, marks
-  done. `refine.decidePass(interacting,idle_ns,full_pass_done)` (pure, tested in
-  `fractal/refine.zig`) drives the per-frame decision: `.full`→`runFullPass`; else skip.
+## Coord panel + ViewEditor (T7)
+
+`ViewEditor` in `editor.zig` (PURE, unit-tested): text buffers for center re/im/mag and
+corner a/b re/im (both forms synced), `auto_iter` bool, `manual_iter_buf`.
+`initFromView`/`syncFromView` populate all 7 buffers from a `SquareView` (`{d}` format,
+null-terminated). `parseAndApplyCenterMag`→`?SquareView` (re/im/mag as f64,
+`fromCenterMag`; null on failure). `parseAndApplyCorners`→`?SquareView` (four corners,
+`fromCorners`; null on failure). `parseIterPolicy`→`?IterPolicy` (`manual_iter_buf` as u32,
+`IterPolicy.manual`; null on failure).
+
+`drawCoordPanel` in `panels.zig`: "Coord" section below data panel. `igInputText` fields
+(EnterReturnsTrue) for center/mag and corners — on commit: parse → `setViewport` → upload
+→ `syncFromView`. `igButton("Reset")` → `navigate.reset()` → same flow. `igCheckbox("Auto")`
++ manual `igInputText` (disabled when auto) → `parseIterPolicy` → `setPolicy` → upload.
+Errors log `.err`. `view_editor` created in `main.zig` after engine init; `syncFromView`
+called from `applyViewCoarse`, `runFullPass`, and after `handleResize`.
 
 ## Testing
 
-Visual (window/layout/navigation): manual smoke + log check. Pure (`stats.zig`,
+Visual (window/layout/navigation/coord panel): manual smoke + log check. Pure (`stats.zig`,
 `editor.zig`, `fractal/refine.zig`) IS unit-tested.

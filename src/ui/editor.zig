@@ -18,6 +18,8 @@ const std = @import("std");
 const gradient = @import("../fractal/gradient.zig");
 const mapping = @import("../fractal/mapping.zig");
 const color = @import("../fractal/color.zig");
+const viewport = @import("../fractal/viewport.zig");
+const autoiter = @import("../fractal/autoiter.zig");
 
 /// Reused verbatim from `color.zig` (M0). Channel order R, G, B, A. Do not redefine.
 pub const Rgba8 = color.Rgba8;
@@ -107,6 +109,108 @@ pub const Editor = struct {
 
 fn lessByPos(_: void, a: gradient.Stop, b: gradient.Stop) bool {
     return a.pos < b.pos;
+}
+
+/// Editable view state for the coordinate panel in `panels.zig`. Pure value — no ImGui/SDL
+/// imports. `panels.zig` reads/writes the text buffers via `igInputText` and calls the pure
+/// helpers here to parse and validate.
+///
+/// Two representations (always kept in sync):
+///   * **Center + magnification** (`center_re_buf`, `center_im_buf`, `mag_buf`)
+///   * **Two opposite corners** (`corner_a_re_buf` … `corner_b_im_buf`)
+/// Both are text so they can be bound directly to `igInputText`.
+pub const ViewEditor = struct {
+    center_re_buf: [32]u8 = std.mem.zeroes([32]u8),
+    center_im_buf: [32]u8 = std.mem.zeroes([32]u8),
+    mag_buf: [32]u8 = std.mem.zeroes([32]u8),
+    corner_a_re_buf: [32]u8 = std.mem.zeroes([32]u8),
+    corner_a_im_buf: [32]u8 = std.mem.zeroes([32]u8),
+    corner_b_re_buf: [32]u8 = std.mem.zeroes([32]u8),
+    corner_b_im_buf: [32]u8 = std.mem.zeroes([32]u8),
+    auto_iter: bool = true,
+    manual_iter_buf: [16]u8 = std.mem.zeroes([16]u8),
+
+    /// Build a `ViewEditor` pre-loaded from `view`. All text buffers are populated and
+    /// null-terminated. Cannot fail — `defaultView()` is always representable.
+    pub fn initFromView(view: viewport.SquareView) ViewEditor {
+        var ve = ViewEditor{};
+        ve.syncFromView(view);
+        return ve;
+    }
+
+    /// Write all text buffers from `view`, overwriting any previous content. Called after
+    /// any navigation commit so the panel stays in sync with the engine.
+    pub fn syncFromView(ve: *ViewEditor, view: viewport.SquareView) void {
+        const cm = view.centerMag();
+        const crs = view.corners();
+        writeF64(&ve.center_re_buf, cm.center.re);
+        writeF64(&ve.center_im_buf, cm.center.im);
+        writeF64(&ve.mag_buf, cm.magnification);
+        writeF64(&ve.corner_a_re_buf, crs.min.re);
+        writeF64(&ve.corner_a_im_buf, crs.min.im);
+        writeF64(&ve.corner_b_re_buf, crs.max.re);
+        writeF64(&ve.corner_b_im_buf, crs.max.im);
+    }
+
+    /// Parse center + magnification buffers and build a `SquareView`. Returns null on any
+    /// parse failure or if the view is degenerate.
+    pub fn parseAndApplyCenterMag(ve: ViewEditor) ?viewport.SquareView {
+        const re = parseF64(&ve.center_re_buf) orelse return null;
+        const im = parseF64(&ve.center_im_buf) orelse return null;
+        const mag = parseF64(&ve.mag_buf) orelse return null;
+        const cm = viewport.CenterMag{
+            .center = .{ .re = re, .im = im },
+            .magnification = mag,
+        };
+        return viewport.SquareView.fromCenterMag(cm) catch null;
+    }
+
+    /// Parse corner buffers and build a `SquareView` (snapped to the larger axis). Returns
+    /// null on any parse failure or if the view is degenerate.
+    pub fn parseAndApplyCorners(ve: ViewEditor) ?viewport.SquareView {
+        const a_re = parseF64(&ve.corner_a_re_buf) orelse return null;
+        const a_im = parseF64(&ve.corner_a_im_buf) orelse return null;
+        const b_re = parseF64(&ve.corner_b_re_buf) orelse return null;
+        const b_im = parseF64(&ve.corner_b_im_buf) orelse return null;
+        const a = viewport.Complex{ .re = a_re, .im = a_im };
+        const b = viewport.Complex{ .re = b_re, .im = b_im };
+        return viewport.SquareView.fromCorners(a, b) catch null;
+    }
+
+    /// Parse `manual_iter_buf` as a `u32` and return a manual `IterPolicy`. Returns null if
+    /// the text is not a valid number or is out of range.
+    pub fn parseIterPolicy(ve: ViewEditor) ?autoiter.IterPolicy {
+        const s = sliceUntilNull(&ve.manual_iter_buf);
+        const v = std.fmt.parseInt(u32, s, 10) catch return null;
+        return autoiter.IterPolicy.manual(v) catch null;
+    }
+};
+
+/// Write an f64 value into a null-terminated text buffer using `"{d}"` format.
+fn writeF64(buf: *[32]u8, value: f64) void {
+    const s = std.fmt.bufPrint(buf, "{d}", .{value}) catch {
+        // If the value somehow doesn't fit (shouldn't happen for f64), write "0".
+        buf[0] = '0';
+        buf[1] = 0;
+        return;
+    };
+    // Null-terminate after the written content.
+    if (s.len < buf.len) buf[s.len] = 0;
+}
+
+/// Parse an f64 from a null-terminated buffer. Returns null on failure.
+fn parseF64(buf: *const [32]u8) ?f64 {
+    const s = sliceUntilNull(buf);
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
+/// Return the slice of `buf` up to (but not including) the first null byte.
+fn sliceUntilNull(buf: anytype) []const u8 {
+    const arr: []const u8 = buf;
+    for (arr, 0..) |b, i| {
+        if (b == 0) return arr[0..i];
+    }
+    return arr;
 }
 
 /// Map a mapping `Mode` to its combo index. Inverse of `indexToMode`. The order matches
@@ -227,4 +331,72 @@ test "mode_items order matches the combo index mapping" {
     try testing.expectEqualStrings("linear", mode_items[@intCast(modeToIndex(.linear))]);
     try testing.expectEqualStrings("log", mode_items[@intCast(modeToIndex(.log))]);
     try testing.expectEqualStrings("cyclic", mode_items[@intCast(modeToIndex(.cyclic))]);
+}
+
+// ─── ViewEditor tests ─────────────────────────────────────────────────────────
+
+test "ViewEditor.initFromView round-trips through parseAndApplyCenterMag" {
+    const view = viewport.SquareView.defaultView();
+    const ve = ViewEditor.initFromView(view);
+    const parsed = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedNull;
+    try testing.expectApproxEqAbs(@as(f64, -0.75), parsed.center_re, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), parsed.center_im, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, 3.5), parsed.side, 1e-10);
+    // magnification round-trip
+    try testing.expectApproxEqRel(view.magnification(), parsed.magnification(), 1e-12);
+}
+
+test "ViewEditor.initFromView round-trips through parseAndApplyCorners" {
+    const view = viewport.SquareView.defaultView();
+    const ve = ViewEditor.initFromView(view);
+    const parsed = ve.parseAndApplyCorners() orelse return error.TestUnexpectedNull;
+    const orig_corners = view.corners();
+    const new_corners = parsed.corners();
+    try testing.expectApproxEqAbs(orig_corners.min.re, new_corners.min.re, 1e-10);
+    try testing.expectApproxEqAbs(orig_corners.min.im, new_corners.min.im, 1e-10);
+    try testing.expectApproxEqAbs(orig_corners.max.re, new_corners.max.re, 1e-10);
+    try testing.expectApproxEqAbs(orig_corners.max.im, new_corners.max.im, 1e-10);
+}
+
+test "ViewEditor.parseAndApplyCenterMag returns null on bad buffer" {
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    @memset(&ve.center_re_buf, 0);
+    @memcpy(ve.center_re_buf[0..12], "not_a_number");
+    ve.center_re_buf[12] = 0;
+    try testing.expect(ve.parseAndApplyCenterMag() == null);
+}
+
+test "ViewEditor.parseAndApplyCorners returns null on bad buffer" {
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    @memset(&ve.corner_a_re_buf, 0);
+    @memcpy(ve.corner_a_re_buf[0..12], "not_a_number");
+    ve.corner_a_re_buf[12] = 0;
+    try testing.expect(ve.parseAndApplyCorners() == null);
+}
+
+test "ViewEditor.syncFromView updates buffers to the new view" {
+    const view1 = viewport.SquareView.defaultView();
+    var ve = ViewEditor.initFromView(view1);
+    const view2 = viewport.SquareView{ .center_re = 0.25, .center_im = -0.5, .side = 0.5 };
+    ve.syncFromView(view2);
+    const parsed = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedNull;
+    try testing.expectApproxEqAbs(@as(f64, 0.25), parsed.center_re, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, -0.5), parsed.center_im, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), parsed.side, 1e-10);
+}
+
+test "ViewEditor.parseIterPolicy parses valid number" {
+    var ve = ViewEditor{};
+    @memcpy(ve.manual_iter_buf[0..3], "256");
+    ve.manual_iter_buf[3] = 0;
+    const policy = ve.parseIterPolicy() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u32, 256), policy.manual_value);
+    try testing.expectEqual(false, policy.auto);
+}
+
+test "ViewEditor.parseIterPolicy returns null on invalid text" {
+    var ve = ViewEditor{};
+    @memcpy(ve.manual_iter_buf[0..3], "abc");
+    ve.manual_iter_buf[3] = 0;
+    try testing.expect(ve.parseIterPolicy() == null);
 }

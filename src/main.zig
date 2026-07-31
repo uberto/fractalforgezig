@@ -90,9 +90,10 @@ pub fn main() !void {
 
     var app_stats = stats_mod.Stats.fromRender(iterate_ns);
     var editor = editor_mod.Editor.initDefault();
+    var view_editor = editor_mod.ViewEditor.initFromView(engine.view);
 
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, &texture, vp, &image_rect, &app_stats, &engine, &editor);
+    runLoop(window, device, ui, &texture, vp, &image_rect, &app_stats, &engine, &editor, &view_editor);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -136,6 +137,7 @@ fn applyViewCoarse(
     nav: *NavState,
     new_view: viewport.SquareView,
     real_s: u32,
+    view_editor: *editor_mod.ViewEditor,
 ) void {
     // Coarse side: S/4, minimum 1.
     const coarse_s = @max(real_s / 4, 1);
@@ -170,6 +172,7 @@ fn applyViewCoarse(
         } else |_| {}
     }
 
+    view_editor.syncFromView(engine.view);
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
 }
@@ -182,6 +185,7 @@ fn runFullPass(
     engine: *engine_mod.Engine,
     nav: *NavState,
     real_s: u32,
+    view_editor: *editor_mod.ViewEditor,
 ) void {
     // If the engine is already at real_s (e.g. coarse_s == real_s for tiny windows)
     // skip the resize; the iteration was already done.
@@ -197,6 +201,7 @@ fn runFullPass(
         app_log.err("full-res re-upload failed ({s})", .{@errorName(err)});
     };
 
+    view_editor.syncFromView(engine.view);
     nav.full_pass_done = true;
     app_log.info("full-res pass complete: S={d}", .{real_s});
 }
@@ -205,6 +210,7 @@ fn runFullPass(
 
 /// Pump events and render the single fixed window each frame until quit.
 /// T6: adds navigation input, coarse→fine dispatch, and hover readout.
+/// T7: adds coord panel with `view_editor`.
 fn runLoop(
     window: *c.SDL_Window,
     device: gpu.Device,
@@ -215,6 +221,7 @@ fn runLoop(
     app_stats: *stats_mod.Stats,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
+    view_editor: *editor_mod.ViewEditor,
 ) void {
     var frame_timer: ?std.time.Timer = std.time.Timer.start() catch |err| blk: {
         app_log.warn("frame timer unavailable ({s}); frame ms will read 0", .{@errorName(err)});
@@ -245,6 +252,7 @@ fn runLoop(
                     handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
                     real_s = engine.image_side;
                     nav.full_pass_done = true; // resize already ran a full pass
+                    view_editor.syncFromView(engine.view);
                 },
                 // Scroll-zoom: zoom toward the cursor point (plan A4).
                 c.SDL_EVENT_MOUSE_WHEEL => {
@@ -260,7 +268,7 @@ fn runLoop(
                                 navigate.zoom_step_out;
                             const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
                             if (new_view) |v|
-                                applyViewCoarse(device, texture, engine, &nav, v, real_s);
+                                applyViewCoarse(device, texture, engine, &nav, v, real_s, view_editor);
                         }
                     }
                 },
@@ -289,17 +297,17 @@ fn runLoop(
         }
 
         var quit_requested = false;
-        panels.draw(device.handle, texture.*, vp, image_rect.*, engine.max_iter, app_stats.*, engine, editor, &quit_requested);
+        panels.draw(device.handle, texture.*, vp, image_rect.*, engine.max_iter, app_stats.*, engine, editor, view_editor, &quit_requested);
         if (quit_requested) running = false;
 
         // Navigation ImGui input: box-select, pan, hover readout.
         // Must be called while the fractal child window is still current (it's the
         // last child opened in panels.draw, but panels.draw calls igEnd, so we
         // actually operate at the top-level window scope here).
-        handleNavInput(device, texture, engine, &nav, image_rect.*, real_s);
+        handleNavInput(device, texture, engine, &nav, image_rect.*, real_s, view_editor);
 
         // Right-click context menu (drawn at top-level window scope).
-        drawContextMenu(device, texture, engine, &nav, real_s);
+        drawContextMenu(device, texture, engine, &nav, real_s, view_editor);
 
         // Hover coordinate readout (tooltip).
         drawHoverReadout(engine, image_rect.*);
@@ -313,7 +321,7 @@ fn runLoop(
             (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
         const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
         switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
-            .full => runFullPass(device, texture, engine, &nav, real_s),
+            .full => runFullPass(device, texture, engine, &nav, real_s, view_editor),
             .coarse, .none => {},
         }
 
@@ -336,6 +344,7 @@ fn handleNavInput(
     nav: *NavState,
     rect: viewport.ImageRect,
     real_s: u32,
+    view_editor: *editor_mod.ViewEditor,
 ) void {
     const space_held = ig.igIsKeyDown_Nil(ig.key_space);
 
@@ -357,7 +366,7 @@ fn handleNavInput(
                 break :blk null;
             };
             if (new_view) |v| {
-                applyViewCoarse(device, texture, engine, nav, v, real_s);
+                applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
                 ig.igResetMouseDragDelta(btn);
             }
         }
@@ -416,7 +425,7 @@ fn handleNavInput(
                     app_log.warn("box-select rejected ({s})", .{@errorName(err)});
                     break :blk null;
                 };
-                if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+                if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
             }
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
@@ -441,16 +450,17 @@ fn drawContextMenu(
     engine: *engine_mod.Engine,
     nav: *NavState,
     real_s: u32,
+    view_editor: *editor_mod.ViewEditor,
 ) void {
     if (ig.igBeginPopup("##nav_ctx", 0)) {
         const pt = nav.right_click_pt;
         if (ig.igMenuItem_Bool("Zoom in 2\xc3\x97", null, false, true)) {
             const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_in) catch null;
-            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
         }
         if (ig.igMenuItem_Bool("Zoom out 2\xc3\x97", null, false, true)) {
             const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_out) catch null;
-            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
         }
         ig.igEndPopup();
     }
