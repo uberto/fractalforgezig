@@ -1,22 +1,24 @@
-//! Executable entry point. The M0 payoff (T8): open one macOS window, bring up an
-//! SDL_GPU (Metal) device + swapchain, render the fixed CPU Mandelbrot once at
-//! startup, upload it to a GPU texture, and display it via `ImGui::Image` inside a
-//! single fixed window (menu bar + fractal region + read-only data panel).
+//! Executable entry point. Thin init/render/shutdown glue.
+//! Pure math lives in `fractal/`, GPU edge in `gpu/`, ImGui layout in `ui/`.
 //!
-//! Keep this file thin: it is the init/render/shutdown glue. Pure math lives in
-//! `fractal/`, the GPU edge in `gpu/`, and the ImGui layout in `ui/`.
+//! T6 additions: mouse/keyboard navigation (box-select, pan, scroll-zoom,
+//! right-click zoom menu), hover coordinate readout, and coarse→fine recompute
+//! driven by the pure `refine.PassDecision` helper.
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const c = @import("c.zig").c;
+const ig = @import("cimgui.zig");
 const gpu = @import("gpu/device.zig");
 const ui_mod = @import("ui/imgui.zig");
 const viewport = @import("fractal/viewport.zig");
+const navigate = @import("fractal/navigate.zig");
 const engine_mod = @import("fractal/engine.zig");
 const texture_mod = @import("gpu/texture.zig");
 const stats_mod = @import("ui/stats.zig");
 const editor_mod = @import("ui/editor.zig");
 const panels = @import("ui/panels.zig");
+const refine = @import("fractal/refine.zig");
 
 const app_log = std.log.scoped(.app);
 
@@ -49,8 +51,6 @@ pub fn main() !void {
     defer ui.shutdown();
 
     // T5: read initial window size and compute the letterboxed image rect.
-    // SDL_GetWindowSize returns screen coordinates (consistent throughout the app;
-    // see results/T5.md for the HiDPI note).
     var win_w: c_int = 0;
     var win_h: c_int = 0;
     _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
@@ -58,20 +58,11 @@ pub fn main() !void {
     const initial_S = image_rect.side;
 
     if (initial_S == 0) {
-        // Degenerate startup window — cannot render; abort cleanly.
         app_log.err("startup window has zero side (S=0); cannot initialise the engine", .{});
         return error.DegenerateWindowSize;
     }
 
-    // Build the decoupling color engine: it holds the persistent f32 smooth-value
-    // buffer + the RGBA8 output + the default gradient/mapping/interior. `iterate` runs
-    // the EXPENSIVE Mandelbrot pass ONCE at startup and colors with the default palette;
-    // from then on palette/mapping edits (T6, in the UI) rerun ONLY the cheap color pass
-    // and re-upload — the iteration buffer is never recomputed (M2's guarantee). Data
-    // flow is one-directional: iterate -> color -> upload -> display.
-    // M3: the engine owns the view (T1 `SquareView`), the image side (T5: S = min(w,h))
-    // and the `max_iter` policy (T3, default auto), and re-iterates whenever any of them
-    // changes. T5 calls `engine.resize(S)` on each window resize event.
+    // Engine: holds the view, S, policy, iteration buffer, RGBA output.
     const view = viewport.SquareView.defaultView();
     const vp = view.imageViewport(initial_S);
     var engine = engine_mod.Engine.init(std.heap.page_allocator, view, initial_S, .{}) catch |err| {
@@ -87,7 +78,6 @@ pub fn main() !void {
     };
     const iterate_ns = if (iterate_timer) |*t| t.read() else 0;
 
-    // Create the texture at the initial S×S size (not a hardcoded constant).
     var texture = try texture_mod.createRgbaTexture(device.handle, initial_S, initial_S);
     defer texture.destroy();
     try texture_mod.upload(device.handle, texture, engine.output());
@@ -106,11 +96,115 @@ pub fn main() !void {
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
+// ─── Navigation state ─────────────────────────────────────────────────────────
+
+/// Box-select drag state.
+const DragState = enum { none, active };
+
+/// All navigation state for one run of the event loop. No globals.
+const NavState = struct {
+    /// Whether a left-drag box-select is in progress.
+    drag_state: DragState = .none,
+    /// Image-space pixel where the left button went down (box-select start).
+    drag_start_px: viewport.Pixel = .{ .x = 0.0, .y = 0.0 },
+    /// Window-space position where the left button went down (rubber-band drawing).
+    drag_start_win_x: f32 = 0.0,
+    drag_start_win_y: f32 = 0.0,
+
+    /// Stashed complex point for the right-click context menu.
+    right_click_pt: viewport.Complex = .{ .re = -0.75, .im = 0.0 },
+    /// Whether to open the right-click popup this frame.
+    open_ctx_menu: bool = false,
+
+    /// Whether the full-res pass has been run for the current view.
+    /// `true` at startup (the initial iterate counts as a full pass).
+    full_pass_done: bool = true,
+
+    /// Timer measuring idle time since the last navigation action.
+    idle_timer: ?std.time.Timer = null,
+};
+
+// ─── View-change helpers ───────────────────────────────────────────────────────
+
+/// Apply a new view with an immediate coarse (S/4) pass and upload.
+/// `real_s` is the full-resolution side we want to restore for the full pass.
+/// On success marks full_pass_done=false and starts the idle timer.
+fn applyViewCoarse(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    new_view: viewport.SquareView,
+    real_s: u32,
+) void {
+    // Coarse side: S/4, minimum 1.
+    const coarse_s = @max(real_s / 4, 1);
+
+    // Resize to coarse if the engine is at a different size.
+    if (engine.image_side != coarse_s) {
+        engine.resize(coarse_s) catch |err| {
+            app_log.err("coarse resize to {d} failed ({s})", .{ coarse_s, @errorName(err) });
+            // Fall through: setViewport at the current size still gives feedback.
+        };
+    }
+
+    // Install the new view (re-iterates at whatever size the engine is now).
+    engine.setViewport(new_view) catch |err| {
+        app_log.err("navigation rejected ({s}); keeping previous view", .{@errorName(err)});
+        // Attempt to restore real_s so we aren't stuck at coarse.
+        if (engine.image_side != real_s) {
+            engine.resize(real_s) catch {};
+        }
+        return;
+    };
+
+    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+        app_log.err("coarse re-upload failed ({s})", .{@errorName(err)});
+    };
+
+    // Warn if the new view crossed the precision floor.
+    if (navigate.atPrecisionFloor(new_view)) {
+        var floor_buf: [navigate.floor_message_buf_len]u8 = undefined;
+        if (navigate.precisionFloorMessage(&floor_buf, new_view.side)) |msg| {
+            app_log.warn("{s}", .{msg});
+        } else |_| {}
+    }
+
+    nav.full_pass_done = false;
+    nav.idle_timer = std.time.Timer.start() catch null;
+}
+
+/// Run the full-resolution pass: resize the engine back to real_s, re-upload.
+/// Engine.resize already re-iterates at the current view, so no setViewport needed.
+fn runFullPass(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    real_s: u32,
+) void {
+    // If the engine is already at real_s (e.g. coarse_s == real_s for tiny windows)
+    // skip the resize; the iteration was already done.
+    if (engine.image_side != real_s) {
+        engine.resize(real_s) catch |err| {
+            app_log.err("full-res resize to {d} failed ({s}); display stays coarse", .{ real_s, @errorName(err) });
+            nav.full_pass_done = true; // don't hammer on failure
+            return;
+        };
+    }
+
+    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+        app_log.err("full-res re-upload failed ({s})", .{@errorName(err)});
+    };
+
+    nav.full_pass_done = true;
+    app_log.info("full-res pass complete: S={d}", .{real_s});
+}
+
+// ─── Main event / render loop ─────────────────────────────────────────────────
+
 /// Pump events and render the single fixed window each frame until quit.
-/// On `SDL_EVENT_WINDOW_RESIZED`, recompute `S = min(w, h)`, call `engine.resize(S)`,
-/// recreate the texture at the new `S×S`, and re-upload. A zero `S` (minimized) is
-/// skipped entirely — no error, no log spam. The `image_rect` and `texture` are
-/// owned by `main` (on the stack / defer-destroyed), so we take mutable pointers.
+/// T6: adds navigation input, coarse→fine dispatch, and hover readout.
 fn runLoop(
     window: *c.SDL_Window,
     device: gpu.Device,
@@ -127,10 +221,16 @@ fn runLoop(
         break :blk null;
     };
 
+    var nav = NavState{};
+    // Track the full-resolution S independently of engine.image_side (which may be
+    // at coarse size during a drag).
+    var real_s: u32 = engine.image_side;
+
     var running = true;
     while (running) {
         if (frame_timer) |*t| t.reset();
 
+        // ── SDL event pump ────────────────────────────────────────────────────
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             _ = ui.processEvent(&event);
@@ -139,29 +239,83 @@ fn runLoop(
                 c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                     if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
                 },
-                // T5: recompute S and image_rect on every resize; recreate engine buffers
-                // and GPU texture when S changes. Minimized windows (S==0) are skipped.
+                // T5: resize recomputes S, engine buffers, and GPU texture.
+                // After a resize, real_s follows the new S (it is already full-res).
                 c.SDL_EVENT_WINDOW_RESIZED => {
-                    handleResize(
-                        device,
-                        texture,
-                        image_rect,
-                        engine,
-                        @intCast(event.window.data1),
-                        @intCast(event.window.data2),
-                    );
+                    handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
+                    real_s = engine.image_side;
+                    nav.full_pass_done = true; // resize already ran a full pass
+                },
+                // Scroll-zoom: zoom toward the cursor point (plan A4).
+                c.SDL_EVENT_MOUSE_WHEEL => {
+                    if (event.wheel.y != 0.0) {
+                        var mx: f32 = 0.0;
+                        var my: f32 = 0.0;
+                        _ = c.SDL_GetMouseState(&mx, &my);
+                        const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
+                        if (cursor) |pt| {
+                            const factor = if (event.wheel.y > 0.0)
+                                navigate.zoom_step_in
+                            else
+                                navigate.zoom_step_out;
+                            const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
+                            if (new_view) |v|
+                                applyViewCoarse(device, texture, engine, &nav, v, real_s);
+                        }
+                    }
+                },
+                // Right mouse button down: stash the cursor point for the context menu.
+                c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                    if (event.button.button == c.SDL_BUTTON_RIGHT) {
+                        const cursor = engine.view.cursorCoord(@floatCast(event.button.x), @floatCast(event.button.y), image_rect.*);
+                        if (cursor) |pt| {
+                            nav.right_click_pt = pt;
+                            nav.open_ctx_menu = true;
+                        }
+                    }
                 },
                 else => {},
             }
         }
 
+        // ── ImGui frame ───────────────────────────────────────────────────────
         ui.newFrame();
+
+        // Open the right-click popup at window scope (must be done after newFrame,
+        // before the popup is rendered).
+        if (nav.open_ctx_menu) {
+            ig.igOpenPopup_Str("##nav_ctx", 0);
+            nav.open_ctx_menu = false;
+        }
+
         var quit_requested = false;
-        // `engine.max_iter` (not a local constant): the engine derives it from its
-        // `IterPolicy`, so the panel always shows the count the render actually used.
         panels.draw(device.handle, texture.*, vp, image_rect.*, engine.max_iter, app_stats.*, engine, editor, &quit_requested);
         if (quit_requested) running = false;
+
+        // Navigation ImGui input: box-select, pan, hover readout.
+        // Must be called while the fractal child window is still current (it's the
+        // last child opened in panels.draw, but panels.draw calls igEnd, so we
+        // actually operate at the top-level window scope here).
+        handleNavInput(device, texture, engine, &nav, image_rect.*, real_s);
+
+        // Right-click context menu (drawn at top-level window scope).
+        drawContextMenu(device, texture, engine, &nav, real_s);
+
+        // Hover coordinate readout (tooltip).
+        drawHoverReadout(engine, image_rect.*);
+
         ui.endFrame();
+
+        // ── Coarse→fine pass decision ─────────────────────────────────────────
+        // `interacting` = left dragging OR middle dragging OR Space+left dragging.
+        const interacting = (nav.drag_state == .active) or
+            ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
+            (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
+        const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
+        switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
+            .full => runFullPass(device, texture, engine, &nav, real_s),
+            .coarse, .none => {},
+        }
 
         renderFrame(window, device, ui);
 
@@ -169,10 +323,165 @@ fn runLoop(
     }
 }
 
-/// Handle a window resize: recompute the image rect, and when S changes, resize the
-/// engine buffers, recreate the GPU texture, and re-upload. A zero S (window minimized)
-/// is a no-op. Logs `.app` on success, `.err` on engine/texture failure (and skips
-/// the re-render to avoid rendering with a stale texture).
+// ─── Per-frame navigation input ───────────────────────────────────────────────
+
+/// Rubber-band rect colour: bright white, fully opaque (0xAABBGGRR in ImGui packing).
+const drag_rect_col: ig.ImU32 = 0xFF_FF_FF_FF;
+
+/// Process box-select (left-drag) and pan (middle-drag / Space+left-drag) for one frame.
+fn handleNavInput(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    rect: viewport.ImageRect,
+    real_s: u32,
+) void {
+    const space_held = ig.igIsKeyDown_Nil(ig.key_space);
+
+    // ── Pan: middle-drag or Space+left-drag ───────────────────────────────────
+    const mid_dragging = ig.igIsMouseDragging(ig.mouse_button_middle, -1.0);
+    const space_left_dragging = space_held and ig.igIsMouseDragging(ig.mouse_button_left, -1.0);
+    if (mid_dragging or space_left_dragging) {
+        const btn: c_int = if (mid_dragging) ig.mouse_button_middle else ig.mouse_button_left;
+        const delta = ig.igGetMouseDragDelta(btn, -1.0);
+        // Navigate.panByPixels: "pass the NEGATED mouse delta" so content follows cursor.
+        if (delta.x != 0.0 or delta.y != 0.0) {
+            const new_view = navigate.panByPixels(
+                engine.view,
+                @floatCast(-delta.x),
+                @floatCast(-delta.y),
+                real_s,
+            ) catch |err| blk: {
+                app_log.warn("pan rejected ({s})", .{@errorName(err)});
+                break :blk null;
+            };
+            if (new_view) |v| {
+                applyViewCoarse(device, texture, engine, nav, v, real_s);
+                ig.igResetMouseDragDelta(btn);
+            }
+        }
+    }
+
+    // ── Box-select: left-drag without Space ───────────────────────────────────
+    if (!space_held) {
+        const left_down = ig.igIsMouseDown_Nil(ig.mouse_button_left);
+        const left_dragging = ig.igIsMouseDragging(ig.mouse_button_left, -1.0);
+
+        // Start: button just went down and the cursor is on the image.
+        if (left_down and !left_dragging and nav.drag_state == .none) {
+            var mx: f32 = 0.0;
+            var my: f32 = 0.0;
+            _ = c.SDL_GetMouseState(&mx, &my);
+            const img_px = rect.toImagePixel(@floatCast(mx), @floatCast(my));
+            if (img_px) |px| {
+                nav.drag_state = .active;
+                nav.drag_start_px = px;
+                nav.drag_start_win_x = mx;
+                nav.drag_start_win_y = my;
+            }
+        }
+
+        // While dragging: draw rubber-band rectangle on the window draw list.
+        if (nav.drag_state == .active and left_dragging) {
+            var mx: f32 = 0.0;
+            var my: f32 = 0.0;
+            _ = c.SDL_GetMouseState(&mx, &my);
+            if (ig.igGetWindowDrawList()) |dl| {
+                ig.ImDrawList_AddRect(
+                    dl,
+                    .{ .x = nav.drag_start_win_x, .y = nav.drag_start_win_y },
+                    .{ .x = mx, .y = my },
+                    drag_rect_col,
+                    0.0,
+                    1.5,
+                    0,
+                );
+            }
+        }
+
+        // Commit on left-button release.
+        if (nav.drag_state == .active and !left_down) {
+            var mx: f32 = 0.0;
+            var my: f32 = 0.0;
+            _ = c.SDL_GetMouseState(&mx, &my);
+            const end_px = rect.toImagePixel(@floatCast(mx), @floatCast(my));
+            if (end_px) |ep| {
+                const new_view = navigate.boxSelect(
+                    engine.view,
+                    nav.drag_start_px,
+                    ep,
+                    real_s,
+                ) catch |err| blk: {
+                    app_log.warn("box-select rejected ({s})", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+            }
+            nav.drag_state = .none;
+            ig.igResetMouseDragDelta(ig.mouse_button_left);
+        }
+        // Also cancel if released anywhere (outside image).
+        if (nav.drag_state == .active and !left_down) {
+            nav.drag_state = .none;
+        }
+    } else {
+        // Space is held: cancel any active box-select drag without committing.
+        if (nav.drag_state == .active and !ig.igIsMouseDown_Nil(ig.mouse_button_left)) {
+            nav.drag_state = .none;
+            ig.igResetMouseDragDelta(ig.mouse_button_left);
+        }
+    }
+}
+
+/// Draw the right-click context menu (Zoom in 2× / Zoom out 2×).
+fn drawContextMenu(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    real_s: u32,
+) void {
+    if (ig.igBeginPopup("##nav_ctx", 0)) {
+        const pt = nav.right_click_pt;
+        if (ig.igMenuItem_Bool("Zoom in 2\xc3\x97", null, false, true)) {
+            const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_in) catch null;
+            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+        }
+        if (ig.igMenuItem_Bool("Zoom out 2\xc3\x97", null, false, true)) {
+            const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_out) catch null;
+            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s);
+        }
+        ig.igEndPopup();
+    }
+}
+
+/// Draw the hover coordinate tooltip when the cursor is over the image.
+fn drawHoverReadout(engine: *const engine_mod.Engine, rect: viewport.ImageRect) void {
+    var mx: f32 = 0.0;
+    var my: f32 = 0.0;
+    _ = c.SDL_GetMouseState(&mx, &my);
+    const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), rect) orelse return;
+
+    var coord_buf: [viewport.coord_buf_len]u8 = undefined;
+    const mag = engine.view.magnification();
+    const coord_slice = viewport.formatCoord(&coord_buf, cursor, mag) catch return;
+
+    // Null-terminate for igTextUnformatted.
+    var nt_buf: [viewport.coord_buf_len + 1]u8 = undefined;
+    @memcpy(nt_buf[0..coord_slice.len], coord_slice);
+    nt_buf[coord_slice.len] = 0;
+
+    if (ig.igBeginTooltip()) {
+        ig.igTextUnformatted(nt_buf[0..coord_slice.len :0].ptr, null);
+        ig.igEndTooltip();
+    }
+}
+
+// ─── Resize handler ───────────────────────────────────────────────────────────
+
+/// Handle a window resize: recompute image rect; when S changes, resize engine,
+/// recreate texture, re-upload. Zero S (minimized) is a no-op.
 fn handleResize(
     device: gpu.Device,
     texture: *texture_mod.Texture,
@@ -184,33 +493,27 @@ fn handleResize(
     const new_rect = viewport.computeImageRect(new_w, new_h);
     const new_s = new_rect.side;
 
-    // Degenerate (minimized): skip silently — no error log spam.
     if (new_s == 0) {
         image_rect.* = new_rect;
         return;
     }
 
     const old_s = engine.image_side;
-
-    // Always update the image_rect so T6's cursor mapping stays current.
     image_rect.* = new_rect;
 
-    if (new_s == old_s) return; // S unchanged — no texture/engine work needed.
+    if (new_s == old_s) return;
 
-    // Resize the engine buffers and re-iterate.
     engine.resize(new_s) catch |err| {
         app_log.err("engine resize to {d}×{d} failed ({s}); keeping previous render", .{ new_s, new_s, @errorName(err) });
         return;
     };
 
-    // Destroy the old texture and recreate at the new S×S.
     texture.destroy();
     texture.* = texture_mod.createRgbaTexture(device.handle, new_s, new_s) catch |err| {
         app_log.err("texture recreation at {d}×{d} failed ({s}); display may be stale", .{ new_s, new_s, @errorName(err) });
         return;
     };
 
-    // Re-upload the fresh iteration result.
     texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
         app_log.err("texture re-upload after resize failed ({s})", .{@errorName(err)});
         return;
@@ -219,9 +522,9 @@ fn handleResize(
     app_log.info("resize: window {d}x{d} → image {d}x{d}", .{ new_w, new_h, new_s, new_s });
 }
 
-/// Acquire the swapchain, upload ImGui buffers, and render into a clearing
-/// render pass. When the swapchain texture is unavailable (e.g. minimized),
-/// submit the empty command buffer and skip drawing.
+// ─── Frame rendering ──────────────────────────────────────────────────────────
+
+/// Acquire the swapchain, upload ImGui buffers, and render into a clearing render pass.
 fn renderFrame(window: *c.SDL_Window, device: gpu.Device, ui: ui_mod.Ui) void {
     const cmd = c.SDL_AcquireGPUCommandBuffer(device.handle) orelse {
         app_log.err("SDL_AcquireGPUCommandBuffer failed: {s}", .{std.mem.span(c.SDL_GetError())});
@@ -234,14 +537,11 @@ fn renderFrame(window: *c.SDL_Window, device: gpu.Device, ui: ui_mod.Ui) void {
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         return;
     }
-    // A null swapchain texture is the expected not-ready/minimized case (not an
-    // error): submit the empty command buffer and skip drawing this frame.
     const tex = swapchain_texture orelse {
         _ = c.SDL_SubmitGPUCommandBuffer(cmd);
         return;
     };
 
-    // MANDATORY: upload draw buffers before opening the render pass.
     ui.prepareDrawData(cmd);
 
     var color_target = c.SDL_GPUColorTargetInfo{

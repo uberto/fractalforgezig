@@ -70,3 +70,75 @@ pub extern fn igSliderFloat(label: [*:0]const u8, v: *f32, v_min: f32, v_max: f3
 pub extern fn igCombo_Str_arr(label: [*:0]const u8, current_item: *c_int, items: [*]const [*:0]const u8, items_count: c_int, popup_max_height_in_items: c_int) bool;
 pub extern fn igBeginDisabled(disabled: bool) void;
 pub extern fn igEndDisabled() void;
+
+// Navigation input (T6): mouse IO, draw-list overlay, hover and popup queries.
+
+/// A 2D vector as plain C scalars — no struct-by-value ABI concern because Zig
+/// maps `extern struct { x: f32, y: f32 }` identically to `struct ImVec2_c`.
+pub const ImVec2 = extern struct { x: f32, y: f32 };
+
+/// Unsigned 32-bit RGBA color as packed `0xAABBGGRR`.
+pub const ImU32 = u32;
+
+/// Opaque draw-list handle. Obtain via `igGetWindowDrawList`.
+pub const ImDrawList = opaque {};
+
+/// Mouse button indices used by `igIsMouseDown_Nil` etc.
+pub const mouse_button_left: c_int = 0;
+pub const mouse_button_right: c_int = 1;
+pub const mouse_button_middle: c_int = 2;
+
+/// `ImGuiKey` values for keyboard queries.
+pub const Key = c_int;
+pub const key_space: Key = 524; // ImGuiKey_Space
+
+/// `ImGuiHoveredFlags` — pass 0 for the default (any hovered window).
+pub const HoveredFlags = c_int;
+pub const hovered_flags_none: HoveredFlags = 0;
+
+/// `ImGuiButtonFlags` — pass 0 for the default.
+pub const ButtonFlags = c_int;
+
+/// `ImDrawFlags` — pass 0 for no rounding/anti-aliasing overrides.
+pub const DrawFlags = c_int;
+
+/// `ImGuiCond` — when to apply `igSetNextWindowPos`.
+pub const Cond = c_int;
+pub const cond_always: Cond = 1;
+
+// Mouse/keyboard IO queries
+pub extern fn igIsMouseDown_Nil(button: c_int) bool;
+pub extern fn igIsMouseDragging(button: c_int, lock_threshold: f32) bool;
+pub extern fn igGetMouseDragDelta(button: c_int, lock_threshold: f32) ImVec2;
+pub extern fn igResetMouseDragDelta(button: c_int) void;
+pub extern fn igIsKeyDown_Nil(key: Key) bool;
+pub extern fn igIsWindowHovered(flags: HoveredFlags) bool;
+
+// Draw-list overlay (rubber-band rect for box-select)
+pub extern fn igGetWindowDrawList() ?*ImDrawList;
+pub extern fn ImDrawList_AddRect(
+    self: *ImDrawList,
+    p_min: ImVec2,
+    p_max: ImVec2,
+    col: ImU32,
+    rounding: f32,
+    thickness: f32,
+    flags: DrawFlags,
+) void;
+
+// Context-menu popup (right-click zoom)
+pub extern fn igBeginPopup(str_id: [*:0]const u8, flags: WindowFlags) bool;
+
+// Invisible overlay button over the image (captures hover/click without stealing focus)
+pub extern fn igInvisibleButton(str_id: [*:0]const u8, size: ImVec2, flags: ButtonFlags) bool;
+
+// Cursor position in screen space (used for tooltip / coordinate readout placement)
+pub extern fn igGetCursorScreenPos() ImVec2;
+
+// Foreground draw list: draws on top of all windows; works outside of any window context.
+// Pass null for the main viewport.
+pub extern fn igGetForegroundDrawList_ViewportPtr(viewport: ?*anyopaque) ?*ImDrawList;
+
+// Tooltip (hover coordinate readout)
+pub extern fn igBeginTooltip() bool;
+pub extern fn igEndTooltip() void;

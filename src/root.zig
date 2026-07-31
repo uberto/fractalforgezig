@@ -27,6 +27,7 @@ test {
     _ = @import("fractal/engine.zig");
     _ = @import("ui/stats.zig");
     _ = @import("ui/editor.zig");
+    _ = @import("fractal/refine.zig");
     std.testing.refAllDecls(@This());
 }
 

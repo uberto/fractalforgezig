@@ -10,18 +10,11 @@ edge — keep ImGui/SDL types behind `../c.zig` / `../cimgui.zig`; never leak in
 
 ## Letterbox layout + resize flow (T5)
 
-T5 makes the window resizable. The fractal renders as a centered square `S = min(w, h)` px,
-letterboxed; the SDL clear color fills the bars automatically.
-
-`viewport.computeImageRect(w, h)` — pure, `fractal/viewport.zig`, unit-tested — returns
-`ImageRect{x=(w-S)/2, y=(h-S)/2, side=S}` (`side=0` for degenerate input). `main.zig`
-calls it at startup (after `SDL_GetWindowSize`) and on `SDL_EVENT_WINDOW_RESIZED`
-(`event.window.data1/data2`, screen coords). On resize: `handleResize(device, texture*,
-image_rect*, engine*, new_w, new_h)` — skips silently when `S==0` (minimized, no error
-spam); when `S` changed: `engine.resize(S)` (`.err` on failure), destroy old texture,
-`createRgbaTexture` at `S×S`, re-upload `engine.output()`, log
-`"resize: window WxH → image SxS"` at `.app`. `image_rect` threads through `runLoop` as
-`*ImageRect` so T6 can map mouse events through it.
+Window is resizable. Fractal renders as centered square `S = min(w,h)` px; SDL clear color
+fills bars. `viewport.computeImageRect(w,h)` (pure, tested) → `ImageRect{x,y,side}`.
+`handleResize(device,texture*,image_rect*,engine*,w,h)`: skips `S==0`; on S change:
+`engine.resize(S)`, destroy+recreate texture, re-upload, log `"resize: WxH → SxS"`. Screen
+coords throughout (`SDL_GetWindowSize`/`event.window.data1,2`).
 
 ## Layout: single window, two fixed regions
 
@@ -62,7 +55,25 @@ non-docking window. `../c.zig` (`@cImport`) — SDL3, SDL_GPU, `imgui_bridge.h`.
 `renderDrawData(cmd, pass)`. `processEvent(&event)` for SDL. `shutdown()` tears down
 backends then context. App order: `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
 
+## Navigation input + coarse→fine (T6, main.zig)
+
+All navigation glue in `main.zig`. `NavState{drag_state, drag_start_px, right_click_pt,
+full_pass_done, idle_timer}`. `real_s` = full-res S (engine may be at coarse size).
+
+- **Box-select** (left-drag, no Space): `handleNavInput` → `navigate.boxSelect`→
+  `engine.setViewport` on release; rubber-band via `igGetWindowDrawList`/`ImDrawList_AddRect`.
+- **Pan** (middle-drag / Space+left): `igGetMouseDragDelta`→`navigate.panByPixels`→
+  `engine.setViewport`; `igResetMouseDragDelta` after each apply.
+- **Scroll-zoom** (`SDL_EVENT_MOUSE_WHEEL`): cursor→`cursorCoord`→`navigate.zoomAbout`.
+- **Right-click** (`SDL_BUTTON_RIGHT`→stash point, `igOpenPopup_Str`): `drawContextMenu`
+  renders "Zoom in/out 2×"→`navigate.zoomCentered`.
+- **Hover**: `drawHoverReadout` → `cursorCoord`→`formatCoord`→`igBeginTooltip`; null=skip.
+- **Coarse→fine**: `applyViewCoarse` resizes to `max(real_s/4,1)`, calls `setViewport`,
+  uploads, marks `full_pass_done=false`. `runFullPass` restores `real_s`, uploads, marks
+  done. `refine.decidePass(interacting,idle_ns,full_pass_done)` (pure, tested in
+  `fractal/refine.zig`) drives the per-frame decision: `.full`→`runFullPass`; else skip.
+
 ## Testing
 
-Window/backends/layout are visual: manual smoke + log check. Pure logic (`stats.zig`,
-`editor.zig`) IS unit-tested.
+Visual (window/layout/navigation): manual smoke + log check. Pure (`stats.zig`,
+`editor.zig`, `fractal/refine.zig`) IS unit-tested.
