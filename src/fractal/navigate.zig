@@ -350,9 +350,9 @@ test "panByPixels moves the center of a deep off-center view at its own image si
 }
 
 // A NON-square drag on the deep off-center view above, at `deep_image_side`: 160 px wide by
-// 120 px tall, so the square takes its side from the horizontal axis. The expected side falls
-// ~2 ULP short of the ideal 160 · 1e-3/256 = 6.25e-4 because differencing two corners so close
-// together cancels — hence the long literal.
+// 120 px tall, so the square takes its side from the horizontal axis. The expected side is
+// a fraction of a ULP at the corners' magnitude short of 160 · 1e-3/256 = 6.25e-4 because
+// differencing two corners so close together cancels — hence the long literal.
 const deep_drag_a = Pixel{ .x = 40.0, .y = 60.0 };
 const deep_drag_b = Pixel{ .x = 200.0, .y = 180.0 };
 

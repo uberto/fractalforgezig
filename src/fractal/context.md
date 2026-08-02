@@ -10,7 +10,7 @@ errors (never `unreachable`) + a pure message builder. ONLY `engine.zig` logs (s
 `std.log(.fractal)`, strings from those builders).
 
 Decoupling: ITERATION runs ONCE into a persistent `[]f32`; palette edits rerun ONLY the CHEAP
-color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8; see `engine.zig`).
+color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8).
 
 ## Modules
 
@@ -21,7 +21,8 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
   `fromCenterSide` → `ViewportError.DegenerateRegion` +
   `degenerateRegionMessage(buf[message_buf_len],what,value)`. `pixelToComplex(px,py,S)`/
   `complexToPixel(c,S)` (assert `S>0`); `cursorCoord(wx,wy,ImageRect{x,y,side})`→`?Complex`,
-  null on letterbox; `imageViewport(S)`→M0 `Viewport` for `iterbuf`; `fixedView(w,h)`=M0.
+  null on letterbox; `imageViewport(S)`→M0 `Viewport` for `iterbuf`; `fixedView(w,h)`=M0;
+  `computeImageRect(w,h)`→`ImageRect` (side=min(w,h), centered; side=0 for degenerate).
   Readout: `coordDigits(mag)`=`clamp(4+ceil(log10 mag),4,17)`;
   `formatCoord(buf,c,mag)`→`"a ± bi"`, `coord_buf_len`=64. `Complex{re,im}`;
   `fixed_re_min/max`=-2.5/1.0, `fixed_im_min/max`=∓1.25.
@@ -32,6 +33,8 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
   a drag; `reset()`=`defaultView()`. All→`DegenerateRegion` on non-finite input, zero-area drag,
   `S==0`, side over/underflow. Warn-only floor: `atPrecisionFloor(v)`
   (`side<precision_floor_side`=1e-13); `precisionFloorMessage(buf[floor_message_buf_len],side)`.
+- `refine.zig` — T6 coarse→fine helper. `PassDecision{coarse,full,none}`;
+  `decidePass(interacting,idle_ns,full_pass_done)`; `idle_threshold_ns`=150 ms.
 - `autoiter.zig` — T3 `max_iter` policy (A6); READ, never re-derive.
   `autoMaxIter(mag) AutoIterError!u32`=`clamp(base_max_iter(512)+iter_per_doubling(80)·
   log2(mag/default_magnification),512,max_max_iter(4096))`, round-to-nearest, MONOTONE;
@@ -43,7 +46,7 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
   `effective` (CLAMPED; propagates its error).
 - `mandelbrot.zig` — `iterate(c_re,c_im,max_iter) f32`→smooth escape value, else
   `interior_sentinel`(-1.0).
-- `color.zig` — M0 STOPGAP; `Rgba8 = [4]u8`, `interior_color`.
+- `color.zig` — M0 STOPGAP; `Rgba8=[4]u8`, `interior_color`, `smoothToRgba(smooth,max_iter)`→grayscale RGBA8.
 - `gradient.zig` — palette + LUT bake. `Stop{pos:f32 in [0,1],color:Rgba8}`; `Gradient`=ascending
   fixed-cap (`max_stops`=32) array; `fromStops(slice)` asserts ascending; `stops()`;
   `bakeLut(g,out:*[lut_size=1024]Rgba8)`; `default()`=5-stop opaque.
@@ -53,8 +56,7 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
 - `iterbuf.zig` — ITERATION only. `iterationBufferLen(vp)`=w*h;
   `iterateInto(buf:[]f32,vp,max_iter) iterbuf.IterError!void` PURE (+0.5 pixel centers;
   bad `buf.len`→`BufferSizeMismatch`);
-  `iterate(...)` wraps it → `IterationResult{values,elapsed_ns}` (caller frees);
-  `std.time.Timer` ONLY here.
+  `iterate(...)` wraps it → `IterationResult{values,elapsed_ns}` (caller frees; `std.time.Timer`).
 - `colorpass.zig` — cheap pass.
   `colorInto(rgba,iter,lut:*const [1024]Rgba8,max_iter,params,interior) ColorError!void` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write else
@@ -70,7 +72,7 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
   pixel-count change). Failure-atomic: rejected input/alloc keeps the previous state.
   `setGradient(g)`(→`EmptyGradient` if `g.count==0`)/`setMapping(p)`/`setInterior(c)` rerun
   ONLY the color pass: bump `color_passes`, `iteration_passes` UNCHANGED (THE GUARANTEE, after
-  navigation too). `output()`. Builders: `summary(buf)`/`colorPassSummary(...)`→
+  navigation too). `output()`. Builders: `summary`/`colorPassSummary(...)`→
   `"color pass {n}: mode={s}, stops={k}"`;
   `iterateSummary(buf[iterate_summary_buf_len])`/`iteratePassSummary(buf,pass,view,S,policy)`→
   `"iterate pass 3: center=…, mag=…, max_iter=512 (auto), S=900px"` (max_iter ALWAYS from
@@ -82,5 +84,5 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8;
 
 ## Coordinate convention
 
-Pixel space: origin TOP-LEFT, y DOWN, +0.5 = pixel center; complex `im` UP — pixel→complex
-NEGATES the y term (top row = max im). Centers stay `f64` (M7 defer). Tests in-file, one intent.
+Pixel: origin TOP-LEFT, y DOWN, +0.5=pixel center; `im` UP — pixel→complex NEGATES y (top=max im).
+Centers `f64` (M7 defer). Tests in-file, one intent each.
