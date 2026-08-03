@@ -80,12 +80,16 @@ pub fn draw(
         // Reserve one text line + spacing for the status bar so the image fits.
         const status_bar_h: f32 = ig.igGetTextLineHeightWithSpacing() + 6.0;
 
-        _ = c.ffImguiBeginChild("fractal_region", fractal_w, avail_h - status_bar_h, true);
+        // Group fractal image + status bar so SameLine aligns the data panel to the top.
+        ig.igBeginGroup();
+        const no_scroll: ig.WindowFlags = ig.window_flags_no_scrollbar | ig.window_flags_no_scroll_with_mouse;
+        _ = ig.igBeginChild_Str("fractal_region", .{ .x = fractal_w, .y = avail_h - status_bar_h }, 1, no_scroll);
         drawFractal(texture.handle, image_rect);
-        c.ffImguiEndChild();
+        ig.igEndChild();
 
         // Status bar sits outside the fractal child, directly below it.
         drawStatusBar(engine, image_rect, hover_pt);
+        ig.igEndGroup();
 
         ig.igSameLine(0, region_spacing);
 
@@ -94,7 +98,9 @@ pub fn draw(
         ig.igSpacing();
         drawCoordPanel(device, texture, engine, view_editor);
         ig.igSpacing();
-        drawPalettePanel(device, texture, engine, editor);
+        if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
+            drawPalettePanel(device, texture, engine, editor);
+        }
         c.ffImguiEndChild();
 
         // Context menu must be opened and rendered in the same window scope.

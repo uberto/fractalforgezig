@@ -171,3 +171,18 @@ pub extern fn igCheckbox(label: [*:0]const u8, v: *bool) bool;
 
 /// Button widget. Returns true when clicked. `size` is `{0,0}` for auto-size.
 pub extern fn igButton(label: [*:0]const u8, size: ImVec2) bool;
+
+// Group helpers — treats enclosed widgets as a single item for SameLine / cursor tracking.
+pub extern fn igBeginGroup() void;
+pub extern fn igEndGroup() void;
+
+// Child window with explicit child + window flags.
+pub extern fn igBeginChild_Str(str_id: [*:0]const u8, size: ImVec2, child_flags: c_int, window_flags: WindowFlags) bool;
+pub extern fn igEndChild() void;
+
+pub const window_flags_no_scrollbar: WindowFlags = 1 << 3;
+pub const window_flags_no_scroll_with_mouse: WindowFlags = 1 << 4;
+
+// Collapsible header. Returns true when the section is open/expanded.
+pub const TreeNodeFlags = c_int;
+pub extern fn igCollapsingHeader_TreeNodeFlags(label: [*:0]const u8, flags: TreeNodeFlags) bool;
