@@ -39,17 +39,16 @@ const window_flags: ig.WindowFlags =
     ig.window_flags_no_bring_to_front |
     ig.window_flags_menu_bar;
 
-/// Build one frame of the fixed layout. Call between `Ui.newFrame` and
-/// `Ui.endFrame`. Sets `quit_requested.*` when File→Quit is chosen.
+/// Context-menu action returned from `draw` so `main.zig` can act without re-opening ImGui.
+pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
+
+/// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
+/// Sets `quit_requested.*` when File→Quit is chosen. Returns the context-menu action
+/// selected this frame (`.none` when no menu item was chosen).
 ///
-/// The palette panel edits `editor`; on ANY change it drives the matching engine setter
-/// (`setGradient`/`setMapping`/`setInterior`) and RE-UPLOADS the engine's RGBA buffer to
-/// `texture` — it NEVER calls `iterate`. The data panel surfaces the engine's two pass
-/// counters so that decoupling is visible.
-///
-/// `image_rect` is the letterboxed square in window coordinates (T5), computed by
-/// `viewport.computeImageRect(window_w, window_h)`. The fractal texture is drawn at
-/// that position so that T6 can map input coordinates through the same rect.
+/// `open_ctx_menu` / `right_click_pt` / `hover_pt` come from the navigation layer in
+/// `main.zig`; the popup and status bar are rendered here, inside the ImGui window,
+/// so they share the correct ID stack.
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
@@ -60,22 +59,33 @@ pub fn draw(
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
+    open_ctx_menu: bool,
+    right_click_pt: viewport.Complex,
+    hover_pt: ?viewport.Complex,
     quit_requested: *bool,
-) void {
+) CtxAction {
+    var ctx_action = CtxAction.none;
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
         const open_about = drawMenuBar(quit_requested);
         if (open_about) ig.igOpenPopup_Str(about_popup, 0);
+        // Open the right-click nav popup inside the window so the ID stack is correct.
+        if (open_ctx_menu) ig.igOpenPopup_Str("##nav_ctx", 0);
 
         var avail_w: f32 = 0;
         var avail_h: f32 = 0;
         c.ffImguiContentAvail(&avail_w, &avail_h);
         var fractal_w = avail_w - data_panel_w - region_spacing;
         if (fractal_w < 0) fractal_w = 0;
+        // Reserve one text line + spacing for the status bar so the image fits.
+        const status_bar_h: f32 = ig.igGetTextLineHeightWithSpacing() + 6.0;
 
-        _ = c.ffImguiBeginChild("fractal_region", fractal_w, 0, true);
+        _ = c.ffImguiBeginChild("fractal_region", fractal_w, avail_h - status_bar_h, true);
         drawFractal(texture.handle, image_rect);
         c.ffImguiEndChild();
+
+        // Status bar sits outside the fractal child, directly below it.
+        drawStatusBar(engine, image_rect, hover_pt);
 
         ig.igSameLine(0, region_spacing);
 
@@ -87,9 +97,13 @@ pub fn draw(
         drawPalettePanel(device, texture, engine, editor);
         c.ffImguiEndChild();
 
+        // Context menu must be opened and rendered in the same window scope.
+        ctx_action = drawNavContextMenu(right_click_pt);
+
         drawAboutModal();
     }
     ig.igEnd();
+    return ctx_action;
 }
 
 /// Draw the menu bar. Sets `quit_requested.*` on File→Quit; returns true when
@@ -110,13 +124,66 @@ fn drawMenuBar(quit_requested: *bool) bool {
     return open_about;
 }
 
-/// Draw the Mandelbrot texture at the letterboxed `image_rect` position inside the
-/// fractal child region. The child's cursor is moved to the image_rect origin (relative
-/// to the child's own origin) then the texture is drawn at `S × S` pixels, so bars
-/// appear as the child background (SDL clear color shows through) rather than a stretch.
+/// Draw the Mandelbrot texture at `S × S` pixels inside the fractal child region.
 fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void {
     const s: f32 = @floatFromInt(image_rect.side);
     c.ffImguiImage(texture, s, s);
+}
+
+/// One-line status bar at the bottom of the fractal region: coordinate + iteration value
+/// when the cursor is over the image; blank when over the bars.
+fn drawStatusBar(engine: *const engine_mod.Engine, rect: viewport.ImageRect, hover_pt: ?viewport.Complex) void {
+    ig.igSpacing();
+    if (hover_pt) |pt| {
+        var coord_buf: [viewport.coord_buf_len]u8 = undefined;
+        const mag = engine.view.magnification();
+        const coord_slice = viewport.formatCoord(&coord_buf, pt, mag) catch {
+            ig.igTextUnformatted("---", null);
+            return;
+        };
+
+        // Look up the iteration value for this pixel from the engine's iter buffer.
+        var iter_info_buf: [32]u8 = undefined;
+        const iter_str: []u8 = blk: {
+            if (rect.side == 0) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
+            // Map the complex point back to a pixel index.
+            const px = engine.view.complexToPixel(pt, rect.side);
+            const col: u32 = @intFromFloat(@max(0.0, @min(@as(f64, @floatFromInt(rect.side - 1)), px.x)));
+            const row: u32 = @intFromFloat(@max(0.0, @min(@as(f64, @floatFromInt(rect.side - 1)), px.y)));
+            const idx = row * rect.side + col;
+            if (idx >= engine.iter.len) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
+            const smooth = engine.iter[idx];
+            if (smooth < 0.0) {
+                break :blk std.fmt.bufPrint(&iter_info_buf, "  interior", .{}) catch &iter_info_buf;
+            } else {
+                const iters: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(engine.max_iter)), smooth));
+                break :blk std.fmt.bufPrint(&iter_info_buf, "  iter {d}", .{iters}) catch &iter_info_buf;
+            }
+        };
+
+        // Compose into a single null-terminated line.
+        var line_buf: [viewport.coord_buf_len + 32]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s}", .{ coord_slice, iter_str }) catch coord_slice;
+        var nt: [viewport.coord_buf_len + 33]u8 = undefined;
+        @memcpy(nt[0..line.len], line);
+        nt[line.len] = 0;
+        ig.igTextUnformatted(nt[0..line.len :0].ptr, null);
+    } else {
+        ig.igTextUnformatted("---", null);
+    }
+}
+
+/// Right-click navigation context menu. Must be called inside the ImGui window Begin/End.
+fn drawNavContextMenu(right_click_pt: viewport.Complex) CtxAction {
+    _ = right_click_pt; // used by the caller to act on the returned action
+    var action = CtxAction.none;
+    if (ig.igBeginPopup("##nav_ctx", 0)) {
+        if (ig.igMenuItem_Bool("Zoom in 2\xc3\x97", null, false, true)) action = .zoom_in;
+        if (ig.igMenuItem_Bool("Zoom out 2\xc3\x97", null, false, true)) action = .zoom_out;
+        if (ig.igMenuItem_Bool("Center here", null, false, true)) action = .center_here;
+        ig.igEndPopup();
+    }
+    return action;
 }
 
 /// Read-only observability panel: render/frame ms, the decoupling PASS COUNTERS (iteration

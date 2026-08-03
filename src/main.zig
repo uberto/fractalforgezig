@@ -102,6 +102,8 @@ pub fn main() !void {
 /// Box-select drag state.
 const DragState = enum { none, active };
 
+const history_cap = 64;
+
 /// All navigation state for one run of the event loop. No globals.
 const NavState = struct {
     /// Whether a left-drag box-select is in progress.
@@ -123,7 +125,83 @@ const NavState = struct {
 
     /// Timer measuring idle time since the last navigation action.
     idle_timer: ?std.time.Timer = null,
+
+    /// Undo/redo history. `undo_buf[0..undo_len]` are views we can return to
+    /// (most-recent-first). `redo_buf[0..redo_len]` are views popped by undo.
+    undo_buf: [history_cap]viewport.SquareView = undefined,
+    undo_len: usize = 0,
+    redo_buf: [history_cap]viewport.SquareView = undefined,
+    redo_len: usize = 0,
 };
+
+/// Push `old_view` onto the undo stack before committing a new view.
+/// Clears the redo stack (a new navigation invalidates the redo chain).
+fn historyPush(nav: *NavState, old_view: viewport.SquareView) void {
+    if (nav.undo_len < history_cap) {
+        nav.undo_buf[nav.undo_len] = old_view;
+        nav.undo_len += 1;
+    } else {
+        // Shift oldest entry out to make room (FIFO eviction at the bottom).
+        std.mem.copyForwards(viewport.SquareView, nav.undo_buf[0 .. history_cap - 1], nav.undo_buf[1..history_cap]);
+        nav.undo_buf[history_cap - 1] = old_view;
+    }
+    nav.redo_len = 0;
+}
+
+/// Undo: restore the most recent view on the undo stack, push current onto redo.
+fn historyUndo(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    view_editor: *editor_mod.ViewEditor,
+) void {
+    if (nav.undo_len == 0) return;
+    const prev = nav.undo_buf[nav.undo_len - 1];
+    nav.undo_len -= 1;
+    // Push current view onto redo (without clearing undo — just redo).
+    if (nav.redo_len < history_cap) {
+        nav.redo_buf[nav.redo_len] = engine.view;
+        nav.redo_len += 1;
+    }
+    engine.setViewport(prev) catch |err| {
+        app_log.err("undo rejected ({s})", .{@errorName(err)});
+        return;
+    };
+    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+        app_log.err("undo re-upload failed ({s})", .{@errorName(err)});
+    };
+    nav.full_pass_done = false;
+    nav.idle_timer = std.time.Timer.start() catch null;
+    view_editor.syncFromView(engine.view);
+}
+
+/// Redo: restore the most recent undone view.
+fn historyRedo(
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    view_editor: *editor_mod.ViewEditor,
+) void {
+    if (nav.redo_len == 0) return;
+    const next = nav.redo_buf[nav.redo_len - 1];
+    nav.redo_len -= 1;
+    if (nav.undo_len < history_cap) {
+        nav.undo_buf[nav.undo_len] = engine.view;
+        nav.undo_len += 1;
+    }
+    engine.setViewport(next) catch |err| {
+        app_log.err("redo rejected ({s})", .{@errorName(err)});
+        return;
+    };
+    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+        app_log.err("redo re-upload failed ({s})", .{@errorName(err)});
+    };
+    nav.full_pass_done = false;
+    nav.idle_timer = std.time.Timer.start() catch null;
+    view_editor.syncFromView(engine.view);
+}
 
 // ─── View-change helpers ───────────────────────────────────────────────────────
 
@@ -139,6 +217,8 @@ fn applyViewCoarse(
     real_s: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
+    historyPush(nav, engine.view);
+
     // Coarse side: S/4, minimum 1.
     const coarse_s = @max(real_s / 4, 1);
 
@@ -282,6 +362,18 @@ fn runLoop(
                         }
                     }
                 },
+                // Ctrl+Z = undo, Ctrl+Y = redo.
+                c.SDL_EVENT_KEY_DOWN => {
+                    const mods = c.SDL_GetModState();
+                    const ctrl = (mods & c.SDL_KMOD_CTRL) != 0;
+                    if (ctrl) {
+                        if (event.key.scancode == c.SDL_SCANCODE_Z) {
+                            historyUndo(device, texture, engine, &nav, view_editor);
+                        } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
+                            historyRedo(device, texture, engine, &nav, view_editor);
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -289,28 +381,46 @@ fn runLoop(
         // ── ImGui frame ───────────────────────────────────────────────────────
         ui.newFrame();
 
-        // Open the right-click popup at window scope (must be done after newFrame,
-        // before the popup is rendered).
-        if (nav.open_ctx_menu) {
-            ig.igOpenPopup_Str("##nav_ctx", 0);
-            nav.open_ctx_menu = false;
-        }
+        // Compute hover point before building the UI so the status bar can use it.
+        var mx: f32 = 0.0;
+        var my: f32 = 0.0;
+        _ = c.SDL_GetMouseState(&mx, &my);
+        const hover_pt = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
 
         var quit_requested = false;
-        panels.draw(device.handle, texture.*, vp, image_rect.*, engine.max_iter, app_stats.*, engine, editor, view_editor, &quit_requested);
+        // open_ctx_menu and right_click_pt are consumed inside draw (popup lives there).
+        const ctx_action = panels.draw(
+            device.handle,
+            texture.*,
+            vp,
+            image_rect.*,
+            engine.max_iter,
+            app_stats.*,
+            engine,
+            editor,
+            view_editor,
+            nav.open_ctx_menu,
+            nav.right_click_pt,
+            hover_pt,
+            &quit_requested,
+        );
+        nav.open_ctx_menu = false;
         if (quit_requested) running = false;
 
-        // Navigation ImGui input: box-select, pan, hover readout.
-        // Must be called while the fractal child window is still current (it's the
-        // last child opened in panels.draw, but panels.draw calls igEnd, so we
-        // actually operate at the top-level window scope here).
+        // Act on the context-menu selection.
+        if (ctx_action != .none) {
+            const pt = nav.right_click_pt;
+            const new_view: ?viewport.SquareView = switch (ctx_action) {
+                .zoom_in => navigate.zoomCentered(engine.view, pt, navigate.zoom_step_in) catch null,
+                .zoom_out => navigate.zoomCentered(engine.view, pt, navigate.zoom_step_out) catch null,
+                .center_here => viewport.SquareView.fromCenterSide(pt, engine.view.side) catch null,
+                .none => null,
+            };
+            if (new_view) |v| applyViewCoarse(device, texture, engine, &nav, v, real_s, view_editor);
+        }
+
+        // Navigation ImGui input: box-select and pan.
         handleNavInput(device, texture, engine, &nav, image_rect.*, real_s, view_editor);
-
-        // Right-click context menu (drawn at top-level window scope).
-        drawContextMenu(device, texture, engine, &nav, real_s, view_editor);
-
-        // Hover coordinate readout (tooltip).
-        drawHoverReadout(engine, image_rect.*);
 
         ui.endFrame();
 
@@ -391,12 +501,13 @@ fn handleNavInput(
             }
         }
 
-        // While dragging: draw rubber-band rectangle on the window draw list.
+        // While dragging: draw rubber-band rectangle on the foreground draw list
+        // (always valid, draws on top of all windows).
         if (nav.drag_state == .active and left_dragging) {
             var mx: f32 = 0.0;
             var my: f32 = 0.0;
             _ = c.SDL_GetMouseState(&mx, &my);
-            if (ig.igGetWindowDrawList()) |dl| {
+            if (ig.igGetForegroundDrawList_ViewportPtr(null)) |dl| {
                 ig.ImDrawList_AddRect(
                     dl,
                     .{ .x = nav.drag_start_win_x, .y = nav.drag_start_win_y },
@@ -409,30 +520,35 @@ fn handleNavInput(
             }
         }
 
-        // Commit on left-button release.
+        // Commit on left-button release. Clamp the end point to the image boundary
+        // so a drag that finishes outside the image still zooms to a valid region.
         if (nav.drag_state == .active and !left_down) {
-            var mx: f32 = 0.0;
-            var my: f32 = 0.0;
-            _ = c.SDL_GetMouseState(&mx, &my);
-            const end_px = rect.toImagePixel(@floatCast(mx), @floatCast(my));
-            if (end_px) |ep| {
-                const new_view = navigate.boxSelect(
-                    engine.view,
-                    nav.drag_start_px,
-                    ep,
-                    real_s,
-                ) catch |err| blk: {
-                    app_log.warn("box-select rejected ({s})", .{@errorName(err)});
-                    break :blk null;
+            var ex: f32 = 0.0;
+            var ey: f32 = 0.0;
+            _ = c.SDL_GetMouseState(&ex, &ey);
+            // Use toImagePixel first; if outside the rect, clamp to [0, side).
+            const end_px: viewport.Pixel = rect.toImagePixel(@floatCast(ex), @floatCast(ey)) orelse blk: {
+                if (real_s == 0) break :blk nav.drag_start_px;
+                const s_f: f64 = @floatFromInt(real_s);
+                const ox: f64 = @floatFromInt(rect.x);
+                const oy: f64 = @floatFromInt(rect.y);
+                break :blk .{
+                    .x = @max(0.0, @min(s_f - 1.0, @as(f64, @floatCast(ex)) - ox)),
+                    .y = @max(0.0, @min(s_f - 1.0, @as(f64, @floatCast(ey)) - oy)),
                 };
-                if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
-            }
+            };
+            const new_view = navigate.boxSelect(
+                engine.view,
+                nav.drag_start_px,
+                end_px,
+                real_s,
+            ) catch |err| blk: {
+                app_log.warn("box-select rejected ({s})", .{@errorName(err)});
+                break :blk null;
+            };
+            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
-        }
-        // Also cancel if released anywhere (outside image).
-        if (nav.drag_state == .active and !left_down) {
-            nav.drag_state = .none;
         }
     } else {
         // Space is held: cancel any active box-select drag without committing.
@@ -440,51 +556,6 @@ fn handleNavInput(
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
         }
-    }
-}
-
-/// Draw the right-click context menu (Zoom in 2× / Zoom out 2×).
-fn drawContextMenu(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
-    engine: *engine_mod.Engine,
-    nav: *NavState,
-    real_s: u32,
-    view_editor: *editor_mod.ViewEditor,
-) void {
-    if (ig.igBeginPopup("##nav_ctx", 0)) {
-        const pt = nav.right_click_pt;
-        if (ig.igMenuItem_Bool("Zoom in 2\xc3\x97", null, false, true)) {
-            const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_in) catch null;
-            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
-        }
-        if (ig.igMenuItem_Bool("Zoom out 2\xc3\x97", null, false, true)) {
-            const new_view = navigate.zoomCentered(engine.view, pt, navigate.zoom_step_out) catch null;
-            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
-        }
-        ig.igEndPopup();
-    }
-}
-
-/// Draw the hover coordinate tooltip when the cursor is over the image.
-fn drawHoverReadout(engine: *const engine_mod.Engine, rect: viewport.ImageRect) void {
-    var mx: f32 = 0.0;
-    var my: f32 = 0.0;
-    _ = c.SDL_GetMouseState(&mx, &my);
-    const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), rect) orelse return;
-
-    var coord_buf: [viewport.coord_buf_len]u8 = undefined;
-    const mag = engine.view.magnification();
-    const coord_slice = viewport.formatCoord(&coord_buf, cursor, mag) catch return;
-
-    // Null-terminate for igTextUnformatted.
-    var nt_buf: [viewport.coord_buf_len + 1]u8 = undefined;
-    @memcpy(nt_buf[0..coord_slice.len], coord_slice);
-    nt_buf[coord_slice.len] = 0;
-
-    if (ig.igBeginTooltip()) {
-        ig.igTextUnformatted(nt_buf[0..coord_slice.len :0].ptr, null);
-        ig.igEndTooltip();
     }
 }
 

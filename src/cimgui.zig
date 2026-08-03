@@ -135,6 +135,9 @@ pub extern fn igInvisibleButton(str_id: [*:0]const u8, size: ImVec2, flags: Butt
 // Cursor position in screen space (used for tooltip / coordinate readout placement)
 pub extern fn igGetCursorScreenPos() ImVec2;
 
+// Layout helpers
+pub extern fn igGetTextLineHeightWithSpacing() f32;
+
 // Foreground draw list: draws on top of all windows; works outside of any window context.
 // Pass null for the main viewport.
 pub extern fn igGetForegroundDrawList_ViewportPtr(viewport: ?*anyopaque) ?*ImDrawList;
