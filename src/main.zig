@@ -459,19 +459,7 @@ fn runLoop(
 
         ui.endFrame();
 
-        // ── Deferred texture sync + upload ────────────────────────────────────
-        // Done AFTER ui.endFrame() so ImGui's draw commands for this frame all
-        // reference the OLD texture handle. The new texture is used next frame.
-        if (nav.needs_upload) {
-            syncTexture(device, texture, engine);
-            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-                app_log.err("texture upload failed ({s})", .{@errorName(err)});
-            };
-            nav.needs_upload = false;
-        }
-
         // ── Coarse→fine pass decision ─────────────────────────────────────────
-        // `interacting` = left dragging OR middle dragging OR Space+left dragging.
         const interacting = (nav.drag_state == .active) or
             ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
             (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
@@ -482,6 +470,18 @@ fn runLoop(
         }
 
         renderFrame(window, device, ui);
+
+        // ── Deferred texture sync + upload ────────────────────────────────────
+        // MUST be after renderFrame: ImGui submits the GPU commands (including
+        // the sampler binding for the fractal texture) inside renderFrame.
+        // Only after submission is it safe to destroy and recreate the texture.
+        if (nav.needs_upload) {
+            syncTexture(device, texture, engine);
+            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+                app_log.err("texture upload failed ({s})", .{@errorName(err)});
+            };
+            nav.needs_upload = false;
+        }
 
         if (frame_timer) |*t| app_stats.observeFrame(t.read());
         if (nav.last_render_ns > 0) {
