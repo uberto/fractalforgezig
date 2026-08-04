@@ -102,7 +102,8 @@ pub const ResizeError = IterateError || std.mem.Allocator.Error;
 /// `anyerror` so GPU errors (SDL failures) propagate without widening IterateError.
 pub const IterFn = *const fn (
     view: SquareView,
-    image_side: u32,
+    image_w: u32,
+    image_h: u32,
     max_iter: u32,
     iter: []f32,
 ) anyerror!void;
@@ -121,8 +122,12 @@ pub const Engine = struct {
     /// The M3 view (T1's `SquareView`) the iteration buffer was computed for. Change it
     /// through `setViewport`, never in place, or the buffer and the view drift apart.
     view: SquareView,
-    /// Side `S` of the square image in pixels (plan A2: `S = min(window_w, window_h)`,
-    /// chosen by T5). Always > 0 for an engine built through `init`.
+    /// Width of the render image in pixels. For square renders, equals `image_side`.
+    image_w: u32,
+    /// Height of the render image in pixels. For square renders, equals `image_side`.
+    image_h: u32,
+    /// Navigation square side: `min(image_w, image_h)`. Used for zoom/pan geometry.
+    /// Always > 0 for an engine built through `init`.
     image_side: u32,
     /// How `max_iter` is chosen (T3, plan A6). Change it through `setPolicy`.
     policy: IterPolicy,
@@ -167,19 +172,31 @@ pub const Engine = struct {
         image_side: u32,
         policy: IterPolicy,
     ) ResizeError!Engine {
-        try validateGeometry(view, image_side);
+        return initRect(alloc, view, image_side, image_side, policy);
+    }
+
+    /// Rectangular init. `image_side` = `min(w, h)` for navigation geometry.
+    pub fn initRect(
+        alloc: std.mem.Allocator,
+        view: SquareView,
+        w: u32,
+        h: u32,
+        policy: IterPolicy,
+    ) ResizeError!Engine {
+        const side = @min(w, h);
+        try validateGeometry(view, side);
         const max_iter = try effectiveMaxIter(view, policy);
-        const sizes = try bufferSizes(view, image_side);
+        const sizes = try bufferSizesRect(w, h);
 
         const iter = alloc.alloc(f32, sizes.pixels) catch |err| {
-            logResizeFailure(image_side);
+            logResizeFailure(side);
             return err;
         };
         errdefer alloc.free(iter);
         @memset(iter, 0.0);
 
         const rgba = alloc.alloc(u8, sizes.bytes) catch |err| {
-            logResizeFailure(image_side);
+            logResizeFailure(side);
             return err;
         };
         errdefer alloc.free(rgba);
@@ -189,7 +206,9 @@ pub const Engine = struct {
         var engine = Engine{
             .alloc = alloc,
             .view = view,
-            .image_side = image_side,
+            .image_w = w,
+            .image_h = h,
+            .image_side = side,
             .policy = policy,
             .max_iter = max_iter,
             .iter = iter,
@@ -221,19 +240,18 @@ pub const Engine = struct {
     pub fn iterate(self: *Engine) IterateError!void {
         try validateGeometry(self.view, self.image_side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
+        const vp = self.renderViewport();
         if (self.use_gpu) {
             if (self.gpu_iter_fn) |iter_fn| {
-                iter_fn(self.view, self.image_side, self.max_iter, self.iter) catch |err| {
-                    // GPU failure: fall back to CPU and log a warning.
+                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, self.iter) catch |err| {
                     log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
-                    try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+                    try iterbuf.iterateInto(self.iter, vp, self.max_iter);
                 };
             } else {
-                // use_gpu set but no function wired yet — CPU fallback.
-                try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+                try iterbuf.iterateInto(self.iter, vp, self.max_iter);
             }
         } else {
-            try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+            try iterbuf.iterateInto(self.iter, vp, self.max_iter);
         }
         self.iteration_passes += 1;
         try self.recolor();
@@ -271,17 +289,23 @@ pub const Engine = struct {
     /// previous buffers and side — still renderable — and returns the error after logging the
     /// requested size. The new buffers are zeroed like `init`'s.
     pub fn resize(self: *Engine, image_side: u32) ResizeError!void {
-        try validateGeometry(self.view, image_side);
-        const sizes = try bufferSizes(self.view, image_side);
+        return self.resizeRect(image_side, image_side);
+    }
+
+    /// Resize to a rectangular render target. `image_side` = `min(w, h)` for nav geometry.
+    pub fn resizeRect(self: *Engine, w: u32, h: u32) ResizeError!void {
+        const side = @min(w, h);
+        try validateGeometry(self.view, side);
+        const sizes = try bufferSizesRect(w, h);
 
         if (sizes.pixels != self.iter.len) {
             const iter = self.alloc.alloc(f32, sizes.pixels) catch |err| {
-                logResizeFailure(image_side);
+                logResizeFailure(side);
                 return err;
             };
             const rgba = self.alloc.alloc(u8, sizes.bytes) catch |err| {
                 self.alloc.free(iter);
-                logResizeFailure(image_side);
+                logResizeFailure(side);
                 return err;
             };
             @memset(iter, 0.0);
@@ -291,7 +315,9 @@ pub const Engine = struct {
             self.iter = iter;
             self.rgba = rgba;
         }
-        self.image_side = image_side;
+        self.image_w = w;
+        self.image_h = h;
+        self.image_side = side;
         try self.iterate();
     }
 
@@ -326,11 +352,14 @@ pub const Engine = struct {
         self.color_passes += 1;
     }
 
-    /// The image `Viewport` the current view + image side iterate over — T1's single bridge,
-    /// never a hand-derived `scale`. Precondition: `image_side > 0`, which every mutating
-    /// path validates.
+    /// Square image viewport (navigation geometry). Precondition: `image_side > 0`.
     pub fn imageViewport(self: *const Engine) Viewport {
         return self.view.imageViewport(self.image_side);
+    }
+
+    /// Actual render viewport — rectangular when w ≠ h. Used by iterate().
+    pub fn renderViewport(self: *const Engine) Viewport {
+        return self.view.rectViewport(self.image_w, self.image_h);
     }
 
     /// The current packed RGBA8 image for the app to upload/display (read-only view).
@@ -375,9 +404,14 @@ const BufferSizes = struct { pixels: usize, bytes: usize };
 /// `image_side > 0`. A side so absurd that its byte count does not fit `usize` is reported
 /// as `OutOfMemory` with the requested size — a returned error, never an overflow panic.
 fn bufferSizes(view: SquareView, image_side: u32) std.mem.Allocator.Error!BufferSizes {
-    const pixels = iterbuf.iterationBufferLen(view.imageViewport(image_side));
+    _ = view;
+    return bufferSizesRect(image_side, image_side);
+}
+
+fn bufferSizesRect(w: u32, h: u32) std.mem.Allocator.Error!BufferSizes {
+    const pixels = @as(usize, w) * @as(usize, h);
     const bytes = std.math.mul(usize, pixels, 4) catch {
-        logResizeFailure(image_side);
+        logResizeFailure(@min(w, h));
         return error.OutOfMemory;
     };
     return .{ .pixels = pixels, .bytes = bytes };
@@ -1268,15 +1302,15 @@ test "use_gpu=true with no gpu_iter_fn: CPU fallback runs, iteration_passes incr
 }
 
 test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increments" {
-    // A stub GPU function that fills the buffer with the CPU result.
     const stub = struct {
         fn call(
             view: SquareView,
-            image_side: u32,
+            w: u32,
+            h: u32,
             max_iter: u32,
             iter: []f32,
         ) anyerror!void {
-            try iterbuf.iterateInto(iter, view.imageViewport(image_side), max_iter);
+            try iterbuf.iterateInto(iter, view.rectViewport(w, h), max_iter);
         }
     }.call;
 
@@ -1292,8 +1326,8 @@ test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increm
 
 test "THE GUARANTEE holds with GPU path: setGradient after GPU iterate does not re-iterate" {
     const stub = struct {
-        fn call(view: SquareView, image_side: u32, max_iter: u32, iter: []f32) anyerror!void {
-            try iterbuf.iterateInto(iter, view.imageViewport(image_side), max_iter);
+        fn call(view: SquareView, w: u32, h: u32, max_iter: u32, iter: []f32) anyerror!void {
+            try iterbuf.iterateInto(iter, view.rectViewport(w, h), max_iter);
         }
     }.call;
 

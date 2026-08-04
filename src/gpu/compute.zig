@@ -21,12 +21,13 @@ const log = std.log.scoped(.gpu);
 const msl_source: [*:0]const u8 = @embedFile("shaders/mandelbrot.metal");
 
 /// Uniform block passed to the shader — matches the MSL `MandelbrotUniforms`
-/// struct field-for-field (C layout, no padding between f32 and u32 pairs).
+/// struct field-for-field (C layout).
 pub const MandelbrotUniforms = extern struct {
     center_re: f32,
     center_im: f32,
-    scale: f32,
-    side: u32,
+    scale: f32,   // complex units per pixel (based on min(w,h))
+    width: u32,
+    height: u32,
     max_iter: u32,
 };
 
@@ -92,9 +93,9 @@ pub fn dispatch(
     uniforms: MandelbrotUniforms,
     iter_out: []f32,
 ) Error!void {
-    const pixel_count: u32 = uniforms.side * uniforms.side;
+    const pixel_count: u32 = uniforms.width * uniforms.height;
     if (iter_out.len != pixel_count) {
-        log.err("dispatch: iter_out.len={d} != side*side={d}", .{ iter_out.len, pixel_count });
+        log.err("dispatch: iter_out.len={d} != width*height={d}", .{ iter_out.len, pixel_count });
         return Error.IterBufferSizeMismatch;
     }
 
@@ -208,25 +209,28 @@ pub fn dispatch(
 
     if (opt_timer) |*t| {
         const elapsed_ms = @as(f64, @floatFromInt(t.read())) / 1_000_000.0;
-        log.info("gpu iterate: S={d}, max_iter={d}, {d:.2} ms", .{ uniforms.side, uniforms.max_iter, elapsed_ms });
+        log.info("gpu iterate: {d}x{d}, max_iter={d}, {d:.2} ms", .{ uniforms.width, uniforms.height, uniforms.max_iter, elapsed_ms });
     }
 }
 
-/// High-level GPU iteration: convert a `SquareView` + image side `S` to uniforms,
+/// High-level GPU iteration: convert a `SquareView` + image dimensions to uniforms,
 /// dispatch, download, and log timing. Equivalent of `iterbuf.iterateInto` on GPU.
-/// `iter.len` must equal `S * S`.
+/// `iter.len` must equal `w * h`.
 pub fn gpuIterate(
     pipeline: ComputePipeline,
     view: viewport.SquareView,
-    image_side: u32,
+    w: u32,
+    h: u32,
     max_iter: u32,
     iter: []f32,
 ) Error!void {
+    const scale = view.side / @as(f64, @floatFromInt(@min(w, h)));
     const uniforms = MandelbrotUniforms{
         .center_re = @floatCast(view.center_re),
         .center_im = @floatCast(view.center_im),
-        .scale = @floatCast(view.side / @as(f64, @floatFromInt(image_side))),
-        .side = image_side,
+        .scale = @floatCast(scale),
+        .width = w,
+        .height = h,
         .max_iter = max_iter,
     };
     try dispatch(pipeline, uniforms, iter);

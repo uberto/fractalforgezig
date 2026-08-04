@@ -29,12 +29,13 @@ var g_compute_pipeline: ?compute_mod.ComputePipeline = null;
 /// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled.
 fn gpuIterFn(
     view: viewport.SquareView,
-    image_side: u32,
+    w: u32,
+    h: u32,
     max_iter: u32,
     iter: []f32,
 ) anyerror!void {
     const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
-    try compute_mod.gpuIterate(pl, view, image_side, max_iter, iter);
+    try compute_mod.gpuIterate(pl, view, w, h, max_iter, iter);
 }
 
 const window_title = "fractalforge";
@@ -88,10 +89,11 @@ pub fn main() !void {
         return error.DegenerateWindowSize;
     }
 
-    // Engine: holds the view, S, policy, iteration buffer, RGBA output.
+    // Engine: holds the view, w×h, policy, iteration buffer, RGBA output.
     const view = viewport.SquareView.defaultView();
-    const vp = view.imageViewport(initial_S);
-    var engine = engine_mod.Engine.init(std.heap.page_allocator, view, initial_S, .{}) catch |err| {
+    const init_w = image_rect.side; // start square; first resize will go rectangular
+    const init_h = image_rect.side;
+    var engine = engine_mod.Engine.initRect(std.heap.page_allocator, view, init_w, init_h, .{}) catch |err| {
         app_log.err("color engine init failed ({s}); aborting startup", .{@errorName(err)});
         return err;
     };
@@ -103,17 +105,17 @@ pub fn main() !void {
 
     var iterate_timer = std.time.Timer.start() catch null;
     engine.iterate() catch |err| {
-        app_log.err("CPU Mandelbrot iteration failed ({s}); aborting startup", .{@errorName(err)});
+        app_log.err("Mandelbrot iteration failed ({s}); aborting startup", .{@errorName(err)});
         return err;
     };
     const iterate_ns = if (iterate_timer) |*t| t.read() else 0;
 
-    var texture = try texture_mod.createRgbaTexture(device.handle, initial_S, initial_S);
+    var texture = try texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h);
     defer texture.destroy();
     try texture_mod.upload(device.handle, texture, engine.output());
 
     var summary_buf: [128]u8 = undefined;
-    const summary = try stats_mod.renderSummary(&summary_buf, initial_S, initial_S, engine.max_iter, iterate_ns);
+    const summary = try stats_mod.renderSummary(&summary_buf, engine.image_w, engine.image_h, engine.max_iter, iterate_ns);
     app_log.info("{s}", .{summary});
     var color_buf: [96]u8 = undefined;
     if (engine.summary(&color_buf)) |line| app_log.info("{s}", .{line}) else |_| {}
@@ -123,7 +125,7 @@ pub fn main() !void {
     var view_editor = editor_mod.ViewEditor.initFromView(engine.view);
 
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, &texture, vp, &image_rect, &app_stats, &engine, &editor, &view_editor);
+    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -152,6 +154,8 @@ const NavState = struct {
     /// Whether the full-res pass has been run for the current view.
     /// `true` at startup (the initial iterate counts as a full pass).
     full_pass_done: bool = true,
+    /// Nanoseconds taken by the most recent iteration pass (for render_ms display).
+    last_render_ns: u64 = 0,
 
     /// Timer measuring idle time since the last navigation action.
     idle_timer: ?std.time.Timer = null,
@@ -248,6 +252,7 @@ fn applyViewCoarse(
     view_editor: *editor_mod.ViewEditor,
 ) void {
     historyPush(nav, engine.view);
+    var t = std.time.Timer.start() catch null;
 
     // Coarse side: S/4, minimum 1.
     const coarse_s = @max(real_s / 4, 1);
@@ -282,6 +287,7 @@ fn applyViewCoarse(
         } else |_| {}
     }
 
+    if (t) |*timer| nav.last_render_ns = timer.read();
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
@@ -297,12 +303,22 @@ fn runFullPass(
     real_s: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
-    // If the engine is already at real_s (e.g. coarse_s == real_s for tiny windows)
-    // skip the resize; the iteration was already done.
+    var t = std.time.Timer.start() catch null;
     if (engine.image_side != real_s) {
         engine.resize(real_s) catch |err| {
             app_log.err("full-res resize to {d} failed ({s}); display stays coarse", .{ real_s, @errorName(err) });
-            nav.full_pass_done = true; // don't hammer on failure
+            nav.full_pass_done = true;
+            return;
+        };
+    }
+    if (t) |*timer| nav.last_render_ns = timer.read();
+
+    // Recreate texture if dimensions changed.
+    if (texture.width != engine.image_w or texture.height != engine.image_h) {
+        texture.destroy();
+        texture.* = texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h) catch |err| {
+            app_log.err("texture resize in runFullPass failed ({s})", .{@errorName(err)});
+            nav.full_pass_done = true;
             return;
         };
     }
@@ -313,7 +329,7 @@ fn runFullPass(
 
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = true;
-    app_log.info("full-res pass complete: S={d}", .{real_s});
+    app_log.info("full-res pass complete: {d}×{d}", .{ engine.image_w, engine.image_h });
 }
 
 // ─── Main event / render loop ─────────────────────────────────────────────────
@@ -326,7 +342,6 @@ fn runLoop(
     device: gpu.Device,
     ui: ui_mod.Ui,
     texture: *texture_mod.Texture,
-    vp: viewport.Viewport,
     image_rect: *viewport.ImageRect,
     app_stats: *stats_mod.Stats,
     engine: *engine_mod.Engine,
@@ -347,9 +362,11 @@ fn runLoop(
     while (running) {
         if (frame_timer) |*t| t.reset();
 
-        // ── SDL event pump ────────────────────────────────────────────────────
+        // ── SDL event pump — wait for the first event then drain the queue.
+        // WaitEvent blocks until at least one event arrives, keeping CPU idle.
         var event: c.SDL_Event = undefined;
-        while (c.SDL_PollEvent(&event)) {
+        _ = c.SDL_WaitEvent(&event);
+        while (true) {
             _ = ui.processEvent(&event);
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
@@ -406,6 +423,7 @@ fn runLoop(
                 },
                 else => {},
             }
+            if (!c.SDL_PollEvent(&event)) break;
         }
 
         // ── ImGui frame ───────────────────────────────────────────────────────
@@ -422,7 +440,6 @@ fn runLoop(
         const draw_result = panels.draw(
             device.handle,
             texture.*,
-            vp,
             engine.max_iter,
             app_stats.*,
             engine,
@@ -470,6 +487,10 @@ fn runLoop(
         renderFrame(window, device, ui);
 
         if (frame_timer) |*t| app_stats.observeFrame(t.read());
+        if (nav.last_render_ns > 0) {
+            app_stats.render_ms = stats_mod.nsToMs(nav.last_render_ns);
+            nav.last_render_ns = 0;
+        }
     }
 }
 
@@ -606,29 +627,22 @@ fn handleResize(
     // Approximate the fractal region width (data panel + spacing taken from the right).
     // The exact rect is updated each frame from ImGui geometry; this gives the correct
     // engine size so the first post-resize render uses the right resolution.
+    // Approximate the fractal region dimensions (data panel taken from the right).
     const panel_taken: u32 = @as(u32, @intFromFloat(panels.data_panel_w + panels.region_spacing));
-    const fractal_w = if (new_w > panel_taken) new_w - panel_taken else 1;
-    const new_rect = viewport.computeImageRect(fractal_w, new_h);
-    const new_s = new_rect.side;
+    const frac_w = if (new_w > panel_taken) new_w - panel_taken else 1;
+    const frac_h = if (new_h > 0) new_h else 1;
 
-    if (new_s == 0) {
-        image_rect.* = new_rect;
-        return;
-    }
+    if (frac_w == 0 or frac_h == 0) return;
+    if (frac_w == engine.image_w and frac_h == engine.image_h) return;
 
-    const old_s = engine.image_side;
-    image_rect.* = new_rect;
-
-    if (new_s == old_s) return;
-
-    engine.resize(new_s) catch |err| {
-        app_log.err("engine resize to {d}×{d} failed ({s}); keeping previous render", .{ new_s, new_s, @errorName(err) });
+    engine.resizeRect(frac_w, frac_h) catch |err| {
+        app_log.err("engine resize to {d}×{d} failed ({s}); keeping previous render", .{ frac_w, frac_h, @errorName(err) });
         return;
     };
 
     texture.destroy();
-    texture.* = texture_mod.createRgbaTexture(device.handle, new_s, new_s) catch |err| {
-        app_log.err("texture recreation at {d}×{d} failed ({s}); display may be stale", .{ new_s, new_s, @errorName(err) });
+    texture.* = texture_mod.createRgbaTexture(device.handle, frac_w, frac_h) catch |err| {
+        app_log.err("texture recreation at {d}×{d} failed ({s}); display may be stale", .{ frac_w, frac_h, @errorName(err) });
         return;
     };
 
@@ -637,7 +651,8 @@ fn handleResize(
         return;
     };
 
-    app_log.info("resize: window {d}x{d} → image {d}x{d}", .{ new_w, new_h, new_s, new_s });
+    _ = image_rect; // updated each frame from ImGui geometry
+    app_log.info("resize: window {d}x{d} → fractal {d}×{d}", .{ new_w, new_h, frac_w, frac_h });
 }
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────

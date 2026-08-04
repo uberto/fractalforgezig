@@ -60,7 +60,6 @@ pub const DrawResult = struct {
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
-    vp: viewport.Viewport,
     max_iter: u32,
     s: stats.Stats,
     engine: *engine_mod.Engine,
@@ -73,7 +72,7 @@ pub fn draw(
 ) DrawResult {
     var ctx_action = CtxAction.none;
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
-    var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .side = 0 };
+    var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
 
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
@@ -91,31 +90,22 @@ pub fn draw(
         const status_bar_h: f32 = ig.igGetTextLineHeightWithSpacing() + 6.0;
         const fractal_h = avail_h - status_bar_h;
 
-        // Compute the live image rect from the actual fractal region dimensions.
-        // S = min(fractal_w, fractal_h), centered in the region.
-        const S = @min(fractal_w, fractal_h);
-        const S_u: u32 = if (S > 0) @intFromFloat(S) else 0;
+        const frac_w_u: u32 = if (fractal_w > 0) @intFromFloat(fractal_w) else 0;
+        const frac_h_u: u32 = if (fractal_h > 0) @intFromFloat(fractal_h) else 0;
 
         // Group fractal image + status bar so SameLine aligns the data panel to the top.
         ig.igBeginGroup();
         const no_scroll: ig.WindowFlags = ig.window_flags_no_scrollbar | ig.window_flags_no_scroll_with_mouse;
         _ = ig.igBeginChild_Str("fractal_region", .{ .x = fractal_w, .y = fractal_h }, 1, no_scroll);
 
-        // Advance cursor to center the square image in the child region.
-        const child_avail = ig.igGetContentRegionAvail();
-        const offset_x = @max(0.0, (child_avail.x - S) * 0.5);
-        const offset_y = @max(0.0, (child_avail.y - S) * 0.5);
-        if (offset_x > 0 or offset_y > 0) {
-            const cur = ig.igGetCursorScreenPos();
-            c.ffImguiSetCursorScreenPos(cur.x + offset_x, cur.y + offset_y);
-        }
-
-        // Record the actual screen-space top-left of the image for coord mapping.
+        // Record the actual screen-space top-left for coord mapping.
         const img_origin = ig.igGetCursorScreenPos();
         live_rect = .{
             .x = @intFromFloat(@max(0, img_origin.x)),
             .y = @intFromFloat(@max(0, img_origin.y)),
-            .side = S_u,
+            .w = frac_w_u,
+            .h = frac_h_u,
+            .side = @min(frac_w_u, frac_h_u),
         };
 
         drawFractal(texture.handle, live_rect);
@@ -128,7 +118,7 @@ pub fn draw(
         ig.igSameLine(0, region_spacing);
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
-        drawDataPanel(device, texture, vp, max_iter, s, engine);
+        drawDataPanel(device, texture, engine.renderViewport(), max_iter, s, engine);
         ig.igSpacing();
         drawCoordPanel(device, texture, engine, view_editor);
         ig.igSpacing();
@@ -164,10 +154,11 @@ fn drawMenuBar(quit_requested: *bool) bool {
     return open_about;
 }
 
-/// Draw the Mandelbrot texture at `S × S` pixels inside the fractal child region.
+/// Draw the Mandelbrot texture at its natural `w × h` size.
 fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void {
-    const s: f32 = @floatFromInt(image_rect.side);
-    c.ffImguiImage(texture, s, s);
+    const w: f32 = @floatFromInt(image_rect.w);
+    const h: f32 = @floatFromInt(image_rect.h);
+    c.ffImguiImage(texture, w, h);
 }
 
 /// One-line status bar at the bottom of the fractal region: coordinate + iteration value

@@ -165,10 +165,7 @@ pub const SquareView = struct {
         return self.pixelToComplex(p.x, p.y, rect.side);
     }
 
-    /// Bridge to the M0/M2 `Viewport` that `iterbuf`/`engine` iterate over: the same
-    /// region as a square `image_side × image_side` image. Exists so the pixel↔complex
-    /// math has ONE definition (pinned by a test that both mappings agree); T4 calls it
-    /// instead of deriving `scale` itself. Precondition: `image_side > 0`.
+    /// Bridge to the M0/M2 `Viewport` for a square image. Precondition: `image_side > 0`.
     pub fn imageViewport(self: SquareView, image_side: u32) Viewport {
         std.debug.assert(image_side > 0);
         const s: f64 = @floatFromInt(image_side);
@@ -178,6 +175,22 @@ pub const SquareView = struct {
             .scale = self.side / s,
             .width = image_side,
             .height = image_side,
+        };
+    }
+
+    /// Rectangular viewport: the view's complex square is mapped onto a `w × h` pixel
+    /// region. Scale is chosen so the shorter axis exactly fits `self.side` complex units
+    /// and the longer axis shows more of the plane (no letterboxing, no distortion).
+    /// Precondition: `w > 0` and `h > 0`.
+    pub fn rectViewport(self: SquareView, w: u32, h: u32) Viewport {
+        std.debug.assert(w > 0 and h > 0);
+        const scale = self.side / @as(f64, @floatFromInt(@min(w, h)));
+        return .{
+            .center_re = self.center_re,
+            .center_im = self.center_im,
+            .scale = scale,
+            .width = w,
+            .height = h,
         };
     }
 };
@@ -209,26 +222,25 @@ pub const Pixel = struct {
     y: f64,
 };
 
-/// The letterboxed square image inside the window (plan A2): its top-left origin in
-/// window pixels plus its side `side` px. T5 computes it as
-/// `side = min(window_w, window_h)` centered in the window; this module only CONSUMES it,
-/// so the two concerns stay separately testable.
+/// The image region inside the window: top-left origin `(x, y)` in window pixels,
+/// plus `w × h` dimensions. `side = min(w, h)` is kept for navigation geometry
+/// (zoom/pan math always uses the square navigation side). A zero `side` means degenerate.
 pub const ImageRect = struct {
     x: i32,
     y: i32,
+    w: u32,
+    h: u32,
+    /// Navigation square side: `min(w, h)`. Used by `cursorCoord` / `pixelToComplex`.
     side: u32,
 
-    /// Window-space pixel → image-space pixel, or `null` when the pixel is not on the
-    /// image. The rect is HALF-OPEN (`[x, x + side)`) so every window pixel belongs to at
-    /// most one of image/bar; a zero `side` (minimized window) contains nothing.
+    /// Window-space pixel → image-space pixel, or `null` when outside the image.
     pub fn toImagePixel(self: ImageRect, window_x: f64, window_y: f64) ?Pixel {
         if (self.side == 0) return null;
         const ox: f64 = @floatFromInt(self.x);
         const oy: f64 = @floatFromInt(self.y);
-        const s: f64 = @floatFromInt(self.side);
         const px = window_x - ox;
         const py = window_y - oy;
-        if (px < 0.0 or py < 0.0 or px >= s or py >= s) return null;
+        if (px < 0.0 or py < 0.0 or px >= @as(f64, @floatFromInt(self.w)) or py >= @as(f64, @floatFromInt(self.h))) return null;
         return .{ .x = px, .y = py };
     }
 };
@@ -629,21 +641,21 @@ test "pixel-y grows downward while complex-im grows upward in the square model" 
 }
 
 test "toImagePixel translates a window pixel into image-local pixel coordinates" {
-    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     const p = rect.toImagePixel(150.5, 70.25) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(f64, 50.5), p.x);
     try std.testing.expectEqual(@as(f64, 50.25), p.y);
 }
 
 test "toImagePixel treats the image rect as half-open: the far edge is outside" {
-    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     try std.testing.expect(rect.toImagePixel(100.0, 20.0) != null); // near edge included
     try std.testing.expect(rect.toImagePixel(500.0, 100.0) == null); // x + side excluded
     try std.testing.expect(rect.toImagePixel(200.0, 420.0) == null); // y + side excluded
 }
 
 test "toImagePixel rejects letterbox-bar pixels on every side" {
-    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     try std.testing.expect(rect.toImagePixel(99.9, 200.0) == null); // left bar
     try std.testing.expect(rect.toImagePixel(640.0, 200.0) == null); // right bar
     try std.testing.expect(rect.toImagePixel(200.0, 19.9) == null); // top bar
@@ -651,13 +663,13 @@ test "toImagePixel rejects letterbox-bar pixels on every side" {
 }
 
 test "toImagePixel rejects every pixel of a zero-side image rect" {
-    const rect = ImageRect{ .x = 0, .y = 0, .side = 0 };
+    const rect = ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
     try std.testing.expect(rect.toImagePixel(0.0, 0.0) == null);
 }
 
 test "cursorCoord returns the complex value under a window pixel inside the image" {
     const v = SquareView.defaultView();
-    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     const got = v.cursorCoord(150.5, 70.25, rect) orelse return error.TestUnexpectedResult;
     const want = v.pixelToComplex(50.5, 50.25, rect.side);
     try std.testing.expectEqual(want.re, got.re);
@@ -666,14 +678,14 @@ test "cursorCoord returns the complex value under a window pixel inside the imag
 
 test "cursorCoord returns null over the letterbox bars" {
     const v = SquareView.defaultView();
-    const rect = ImageRect{ .x = 100, .y = 20, .side = 400 };
+    const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     try std.testing.expect(v.cursorCoord(10.0, 200.0, rect) == null);
     try std.testing.expect(v.cursorCoord(200.0, 900.0, rect) == null);
 }
 
 test "cursorCoord returns null for a degenerate zero-side image rect" {
     const v = SquareView.defaultView();
-    try std.testing.expect(v.cursorCoord(0.0, 0.0, .{ .x = 0, .y = 0, .side = 0 }) == null);
+    try std.testing.expect(v.cursorCoord(0.0, 0.0, .{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 }) == null);
 }
 
 test "coordDigits is the base precision at the default view" {
@@ -794,12 +806,13 @@ test "degenerateRegionMessage reports NoSpaceLeft instead of truncating" {
 /// safely for degenerate (0 × anything) input; T5 skips the render pass for those.
 /// The rect is consumed by `cursorCoord` (T6's gesture entry) and the texture upload.
 pub fn computeImageRect(window_w: u32, window_h: u32) ImageRect {
-    if (window_w == 0 or window_h == 0) return .{ .x = 0, .y = 0, .side = 0 };
-    const s = @min(window_w, window_h);
+    if (window_w == 0 or window_h == 0) return .{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
     return .{
-        .x = @intCast((window_w - s) / 2),
-        .y = @intCast((window_h - s) / 2),
-        .side = s,
+        .x = 0,
+        .y = 0,
+        .w = window_w,
+        .h = window_h,
+        .side = @min(window_w, window_h),
     };
 }
 
@@ -826,27 +839,28 @@ test "imageViewport reproduces the square view's pixel mapping" {
 
 // ─── Tests: computeImageRect ─────────────────────────────────────────────────
 
-test "computeImageRect landscape: S=height, centered horizontally" {
-    // 1280x720 landscape: S = min(1280, 720) = 720, centered horizontally.
-    // x = (1280 - 720) / 2 = 280, y = 0
+test "computeImageRect landscape: w=1280 h=720, side=min=720" {
     const r = computeImageRect(1280, 720);
+    try std.testing.expectEqual(@as(u32, 1280), r.w);
+    try std.testing.expectEqual(@as(u32, 720), r.h);
     try std.testing.expectEqual(@as(u32, 720), r.side);
-    try std.testing.expectEqual(@as(i32, 280), r.x);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
     try std.testing.expectEqual(@as(i32, 0), r.y);
 }
 
-test "computeImageRect portrait: S=width, centered vertically" {
-    // 600x900 portrait: S = min(600, 900) = 600, centered vertically.
-    // x = 0, y = (900 - 600) / 2 = 150
+test "computeImageRect portrait: w=600 h=900, side=min=600" {
     const r = computeImageRect(600, 900);
+    try std.testing.expectEqual(@as(u32, 600), r.w);
+    try std.testing.expectEqual(@as(u32, 900), r.h);
     try std.testing.expectEqual(@as(u32, 600), r.side);
     try std.testing.expectEqual(@as(i32, 0), r.x);
-    try std.testing.expectEqual(@as(i32, 150), r.y);
+    try std.testing.expectEqual(@as(i32, 0), r.y);
 }
 
-test "computeImageRect square: S=side, no bars" {
-    // 800x800 square: S = 800, no bars.
+test "computeImageRect square: w=h=800, side=800" {
     const r = computeImageRect(800, 800);
+    try std.testing.expectEqual(@as(u32, 800), r.w);
+    try std.testing.expectEqual(@as(u32, 800), r.h);
     try std.testing.expectEqual(@as(u32, 800), r.side);
     try std.testing.expectEqual(@as(i32, 0), r.x);
     try std.testing.expectEqual(@as(i32, 0), r.y);
@@ -869,13 +883,11 @@ test "computeImageRect degenerate zero-both: side=0, origin at zero" {
     try std.testing.expectEqual(@as(i32, 0), r.y);
 }
 
-test "computeImageRect image is always centered: x+side+x == window_w and y+side+y == window_h" {
-    // For landscape 1920x1080: S=1080, x=(1920-1080)/2=420
+test "computeImageRect fills full window: w=w, h=h, side=min(w,h), origin at (0,0)" {
     const r = computeImageRect(1920, 1080);
+    try std.testing.expectEqual(@as(u32, 1920), r.w);
+    try std.testing.expectEqual(@as(u32, 1080), r.h);
     try std.testing.expectEqual(@as(u32, 1080), r.side);
-    // x + side + x should equal window_w
-    try std.testing.expectEqual(
-        @as(u32, 1920),
-        @as(u32, @intCast(r.x)) + r.side + @as(u32, @intCast(r.x)),
-    );
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(i32, 0), r.y);
 }

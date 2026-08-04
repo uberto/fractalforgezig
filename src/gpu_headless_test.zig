@@ -61,20 +61,17 @@ test "compute: gpuIterate interior pixels match CPU (deep interior, no precision
     const view = try vp.SquareView.fromCenterSide(.{ .re = 0.0, .im = 0.0 }, 0.1);
 
     var gpu_iter: [S * S]f32 = undefined;
-    try compute.gpuIterate(pipeline, view, S, max_iter, &gpu_iter);
+    try compute.gpuIterate(pipeline, view, S, S, max_iter, &gpu_iter);
 
-    // Every pixel near the Mandelbrot center is interior; verify GPU agrees.
     var interior_count: u32 = 0;
     for (gpu_iter) |v| {
         if (v < 0.0) interior_count += 1;
     }
-    // All 256 pixels should be interior.
     try std.testing.expectEqual(@as(u32, S * S), interior_count);
 
-    // Also spot-check a known-exterior point (c = 2 + 2i escapes in 1 iteration).
     const exterior_view = try vp.SquareView.fromCenterSide(.{ .re = 2.0, .im = 2.0 }, 0.01);
     var exterior_iter: [S * S]f32 = undefined;
-    try compute.gpuIterate(pipeline, exterior_view, S, max_iter, &exterior_iter);
+    try compute.gpuIterate(pipeline, exterior_view, S, S, max_iter, &exterior_iter);
 
     // CPU reference for center pixel.
     const scale: f64 = exterior_view.side / @as(f64, @floatFromInt(S));
@@ -99,7 +96,8 @@ test "compute: dispatch at S=4 produces 16 finite results" {
         .center_re = -0.75,
         .center_im = 0.0,
         .scale = @floatCast(3.5 / 4.0),
-        .side = 4,
+        .width = 4,
+        .height = 4,
         .max_iter = 64,
     };
 
