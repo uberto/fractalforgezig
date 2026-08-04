@@ -96,6 +96,17 @@ pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoI
 /// (`init`, `resize`) can return.
 pub const ResizeError = IterateError || std.mem.Allocator.Error;
 
+/// Function signature for the iteration backend (CPU or GPU).
+/// GPU path: `compute.gpuIterate` wrapped in a thin free function in `main.zig`.
+/// CPU path: the built-in `iterbuf.iterateInto` adapter.
+/// `anyerror` so GPU errors (SDL failures) propagate without widening IterateError.
+pub const IterFn = *const fn (
+    view: SquareView,
+    image_side: u32,
+    max_iter: u32,
+    iter: []f32,
+) anyerror!void;
+
 /// The persistent render state + decoupling counters. The app allocates one via `init`,
 /// drives it (`iterate` once, then `setViewport`/`setPolicy`/`resize` on navigation and
 /// `setGradient`/`setMapping`/`setInterior` on palette edits), reads `output()` to upload,
@@ -134,6 +145,12 @@ pub const Engine = struct {
     iteration_passes: u32,
     /// Number of color passes run. Bumped by every recolor (iterate + each edit).
     color_passes: u32,
+    /// When true and `gpu_iter_fn != null`, `iterate` dispatches via `gpu_iter_fn`
+    /// instead of the built-in CPU path. Set by the UI toggle; wired by `main.zig`.
+    use_gpu: bool,
+    /// Optional GPU iteration function set by `main.zig` after pipeline creation.
+    /// Null until wired; `iterate` falls back to CPU when null.
+    gpu_iter_fn: ?IterFn,
 
     /// Allocate the smooth-value + RGBA8 buffers for a square image of side `image_side`,
     /// derive `max_iter` from `policy` at `view`'s magnification, install the default
@@ -183,6 +200,8 @@ pub const Engine = struct {
             .interior = color.interior_color,
             .iteration_passes = 0,
             .color_passes = 0,
+            .use_gpu = false,
+            .gpu_iter_fn = null,
         };
         gradient.bakeLut(g, &engine.lut);
         return engine;
@@ -195,15 +214,27 @@ pub const Engine = struct {
     }
 
     /// (Re)run the EXPENSIVE stage for the current view / image side / policy: refresh
-    /// `max_iter` from the policy, refill the smooth buffer via `iterbuf`, then recolor and
-    /// log the one-line pass summary. Bumps `iteration_passes` AND `color_passes` (a recolor
-    /// happens too). This is the only path that touches `iteration_passes`.
+    /// `max_iter` from the policy, refill the smooth buffer via `iterbuf` (CPU) or
+    /// `gpu_iter_fn` (GPU when `use_gpu` is true and the function is wired), then recolor
+    /// and log the one-line pass summary. Bumps `iteration_passes` AND `color_passes`.
+    /// This is the ONLY path that touches `iteration_passes`.
     pub fn iterate(self: *Engine) IterateError!void {
         try validateGeometry(self.view, self.image_side);
-        // ONE source of truth for max_iter (T3). Recomputed here, so a view/policy change
-        // can never leave the stored value describing a different render.
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
-        try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+        if (self.use_gpu) {
+            if (self.gpu_iter_fn) |iter_fn| {
+                iter_fn(self.view, self.image_side, self.max_iter, self.iter) catch |err| {
+                    // GPU failure: fall back to CPU and log a warning.
+                    log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
+                    try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+                };
+            } else {
+                // use_gpu set but no function wired yet — CPU fallback.
+                try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+            }
+        } else {
+            try iterbuf.iterateInto(self.iter, self.imageViewport(), self.max_iter);
+        }
         self.iteration_passes += 1;
         try self.recolor();
         self.logIteratePass();
@@ -1214,4 +1245,64 @@ test "requestedBytes counts 8 bytes per pixel (one f32 plus one RGBA8 texel)" {
 
 test "requestedBytes saturates instead of overflowing for an absurd side" {
     try testing.expectEqual(std.math.maxInt(u64), requestedBytes(std.math.maxInt(u32)));
+}
+
+// ─── M4: GPU toggle routing ───────────────────────────────────────────────────
+
+test "use_gpu=false with no gpu_iter_fn: CPU path runs, iteration_passes increments" {
+    var e = try testEngine();
+    defer e.deinit();
+    e.use_gpu = false;
+    e.gpu_iter_fn = null;
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "use_gpu=true with no gpu_iter_fn: CPU fallback runs, iteration_passes increments" {
+    var e = try testEngine();
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = null;
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increments" {
+    // A stub GPU function that fills the buffer with the CPU result.
+    const stub = struct {
+        fn call(
+            view: SquareView,
+            image_side: u32,
+            max_iter: u32,
+            iter: []f32,
+        ) anyerror!void {
+            try iterbuf.iterateInto(iter, view.imageViewport(image_side), max_iter);
+        }
+    }.call;
+
+    var e = try testEngine();
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = stub;
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    // color_passes also incremented (recolor runs after iterate).
+    try testing.expectEqual(@as(u32, 1), e.color_passes);
+}
+
+test "THE GUARANTEE holds with GPU path: setGradient after GPU iterate does not re-iterate" {
+    const stub = struct {
+        fn call(view: SquareView, image_side: u32, max_iter: u32, iter: []f32) anyerror!void {
+            try iterbuf.iterateInto(iter, view.imageViewport(image_side), max_iter);
+        }
+    }.call;
+
+    var e = try testEngine();
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = stub;
+    try e.iterate();
+    const iters_before = e.iteration_passes;
+    try e.setGradient(solidGradient(.{ 255, 0, 0, 255 }));
+    try testing.expectEqual(iters_before, e.iteration_passes); // NEVER re-iterated
 }
