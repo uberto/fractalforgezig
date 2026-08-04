@@ -239,9 +239,18 @@ fn historyRedo(
 
 // ─── View-change helpers ───────────────────────────────────────────────────────
 
+/// Recreate the GPU texture if its dimensions differ from engine.image_w × engine.image_h.
+fn syncTexture(device: gpu.Device, texture: *texture_mod.Texture, engine: *engine_mod.Engine) void {
+    if (texture.width == engine.image_w and texture.height == engine.image_h) return;
+    texture.destroy();
+    texture.* = texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h) catch |err| {
+        app_log.err("texture sync to {d}×{d} failed ({s})", .{ engine.image_w, engine.image_h, @errorName(err) });
+        return;
+    };
+}
+
 /// Apply a new view with an immediate coarse (S/4) pass and upload.
-/// `real_s` is the full-resolution side we want to restore for the full pass.
-/// On success marks full_pass_done=false and starts the idle timer.
+/// `real_w/real_h` are the full-resolution dimensions to restore for the full pass.
 fn applyViewCoarse(
     device: gpu.Device,
     texture: *texture_mod.Texture,
@@ -254,27 +263,26 @@ fn applyViewCoarse(
     historyPush(nav, engine.view);
     var t = std.time.Timer.start() catch null;
 
-    // Coarse side: S/4, minimum 1.
+    // Coarse: real_s/4 (square navigation side / 4) for both dimensions.
+    // Using the navigation square side keeps the coarse pass square for simplicity.
     const coarse_s = @max(real_s / 4, 1);
+    const coarse_w = coarse_s;
+    const coarse_h = coarse_s;
 
-    // Resize to coarse if the engine is at a different size.
-    if (engine.image_side != coarse_s) {
-        engine.resize(coarse_s) catch |err| {
-            app_log.err("coarse resize to {d} failed ({s})", .{ coarse_s, @errorName(err) });
-            // Fall through: setViewport at the current size still gives feedback.
+    // Resize to coarse if dimensions changed.
+    if (engine.image_w != coarse_w or engine.image_h != coarse_h) {
+        engine.resizeRect(coarse_w, coarse_h) catch |err| {
+            app_log.err("coarse resize to {d}×{d} failed ({s})", .{ coarse_w, coarse_h, @errorName(err) });
         };
     }
 
-    // Install the new view (re-iterates at whatever size the engine is now).
+    // Install the new view (re-iterates at current size).
     engine.setViewport(new_view) catch |err| {
         app_log.err("navigation rejected ({s}); keeping previous view", .{@errorName(err)});
-        // Attempt to restore real_s so we aren't stuck at coarse.
-        if (engine.image_side != real_s) {
-            engine.resize(real_s) catch {};
-        }
         return;
     };
 
+    syncTexture(device, texture, engine);
     texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
         app_log.err("coarse re-upload failed ({s})", .{@errorName(err)});
     };
@@ -293,36 +301,27 @@ fn applyViewCoarse(
     nav.idle_timer = std.time.Timer.start() catch null;
 }
 
-/// Run the full-resolution pass: resize the engine back to real_s, re-upload.
-/// Engine.resize already re-iterates at the current view, so no setViewport needed.
+/// Restore full-resolution dimensions, re-iterate, sync texture, re-upload.
 fn runFullPass(
     device: gpu.Device,
     texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
-    real_s: u32,
+    real_w: u32,
+    real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     var t = std.time.Timer.start() catch null;
-    if (engine.image_side != real_s) {
-        engine.resize(real_s) catch |err| {
-            app_log.err("full-res resize to {d} failed ({s}); display stays coarse", .{ real_s, @errorName(err) });
+    if (engine.image_w != real_w or engine.image_h != real_h) {
+        engine.resizeRect(real_w, real_h) catch |err| {
+            app_log.err("full-res resize to {d}×{d} failed ({s}); display stays coarse", .{ real_w, real_h, @errorName(err) });
             nav.full_pass_done = true;
             return;
         };
     }
     if (t) |*timer| nav.last_render_ns = timer.read();
 
-    // Recreate texture if dimensions changed.
-    if (texture.width != engine.image_w or texture.height != engine.image_h) {
-        texture.destroy();
-        texture.* = texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h) catch |err| {
-            app_log.err("texture resize in runFullPass failed ({s})", .{@errorName(err)});
-            nav.full_pass_done = true;
-            return;
-        };
-    }
-
+    syncTexture(device, texture, engine);
     texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
         app_log.err("full-res re-upload failed ({s})", .{@errorName(err)});
     };
@@ -354,8 +353,11 @@ fn runLoop(
     };
 
     var nav = NavState{};
-    // Track the full-resolution S independently of engine.image_side (which may be
-    // at coarse size during a drag).
+    // Track the full-resolution dimensions independently of engine.image_w/h (which may
+    // be at coarse size during a drag).
+    var real_w: u32 = engine.image_w;
+    var real_h: u32 = engine.image_h;
+    // Keeping real_s for the few remaining callers that still need a nav-square side.
     var real_s: u32 = engine.image_side;
 
     var running = true;
@@ -377,8 +379,10 @@ fn runLoop(
                 // After a resize, real_s follows the new S (it is already full-res).
                 c.SDL_EVENT_WINDOW_RESIZED => {
                     handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
+                    real_w = engine.image_w;
+                    real_h = engine.image_h;
                     real_s = engine.image_side;
-                    nav.full_pass_done = true; // resize already ran a full pass
+                    nav.full_pass_done = true;
                     view_editor.syncFromView(engine.view);
                 },
                 // Scroll-zoom: zoom toward the cursor point (plan A4).
@@ -480,7 +484,7 @@ fn runLoop(
             (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
         const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
         switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
-            .full => runFullPass(device, texture, engine, &nav, real_s, view_editor),
+            .full => runFullPass(device, texture, engine, &nav, real_w, real_h, view_editor),
             .coarse, .none => {},
         }
 
