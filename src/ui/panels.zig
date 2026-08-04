@@ -24,9 +24,9 @@ const window_name = "fractalforge";
 const about_popup = "About fractalforge";
 
 /// Width (px) reserved for the data panel; the fractal region gets the rest.
-const data_panel_w: f32 = 260.0;
+pub const data_panel_w: f32 = 260.0;
 /// Horizontal gap between the fractal region and the data panel.
-const region_spacing: f32 = 8.0;
+pub const region_spacing: f32 = 8.0;
 
 /// Flags for the single fixed window: a fixed, non-movable, non-resizable frame
 /// with a menu bar and no persisted state (so the layout is deterministic).
@@ -42,6 +42,14 @@ const window_flags: ig.WindowFlags =
 /// Context-menu action returned from `draw` so `main.zig` can act without re-opening ImGui.
 pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 
+/// Result of one `draw` call: the context-menu action and the live image rect.
+/// The image rect is derived from the actual ImGui child dimensions this frame —
+/// main.zig must use this (not the OS window size) for coordinate mapping and resize.
+pub const DrawResult = struct {
+    ctx_action: CtxAction,
+    image_rect: viewport.ImageRect,
+};
+
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
 /// Sets `quit_requested.*` when File→Quit is chosen. Returns the context-menu action
 /// selected this frame (`.none` when no menu item was chosen).
@@ -53,7 +61,6 @@ pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
     vp: viewport.Viewport,
-    image_rect: viewport.ImageRect,
     max_iter: u32,
     s: stats.Stats,
     engine: *engine_mod.Engine,
@@ -63,8 +70,11 @@ pub fn draw(
     right_click_pt: viewport.Complex,
     hover_pt: ?viewport.Complex,
     quit_requested: *bool,
-) CtxAction {
+) DrawResult {
     var ctx_action = CtxAction.none;
+    // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
+    var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .side = 0 };
+
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
         const open_about = drawMenuBar(quit_requested);
@@ -79,16 +89,40 @@ pub fn draw(
         if (fractal_w < 0) fractal_w = 0;
         // Reserve one text line + spacing for the status bar so the image fits.
         const status_bar_h: f32 = ig.igGetTextLineHeightWithSpacing() + 6.0;
+        const fractal_h = avail_h - status_bar_h;
+
+        // Compute the live image rect from the actual fractal region dimensions.
+        // S = min(fractal_w, fractal_h), centered in the region.
+        const S = @min(fractal_w, fractal_h);
+        const S_u: u32 = if (S > 0) @intFromFloat(S) else 0;
 
         // Group fractal image + status bar so SameLine aligns the data panel to the top.
         ig.igBeginGroup();
         const no_scroll: ig.WindowFlags = ig.window_flags_no_scrollbar | ig.window_flags_no_scroll_with_mouse;
-        _ = ig.igBeginChild_Str("fractal_region", .{ .x = fractal_w, .y = avail_h - status_bar_h }, 1, no_scroll);
-        drawFractal(texture.handle, image_rect);
+        _ = ig.igBeginChild_Str("fractal_region", .{ .x = fractal_w, .y = fractal_h }, 1, no_scroll);
+
+        // Advance cursor to center the square image in the child region.
+        const child_avail = ig.igGetContentRegionAvail();
+        const offset_x = @max(0.0, (child_avail.x - S) * 0.5);
+        const offset_y = @max(0.0, (child_avail.y - S) * 0.5);
+        if (offset_x > 0 or offset_y > 0) {
+            const cur = ig.igGetCursorScreenPos();
+            c.ffImguiSetCursorScreenPos(cur.x + offset_x, cur.y + offset_y);
+        }
+
+        // Record the actual screen-space top-left of the image for coord mapping.
+        const img_origin = ig.igGetCursorScreenPos();
+        live_rect = .{
+            .x = @intFromFloat(@max(0, img_origin.x)),
+            .y = @intFromFloat(@max(0, img_origin.y)),
+            .side = S_u,
+        };
+
+        drawFractal(texture.handle, live_rect);
         ig.igEndChild();
 
         // Status bar sits outside the fractal child, directly below it.
-        drawStatusBar(engine, image_rect, hover_pt);
+        drawStatusBar(engine, live_rect, hover_pt);
         ig.igEndGroup();
 
         ig.igSameLine(0, region_spacing);
@@ -109,7 +143,7 @@ pub fn draw(
         drawAboutModal();
     }
     ig.igEnd();
-    return ctx_action;
+    return .{ .ctx_action = ctx_action, .image_rect = live_rect };
 }
 
 /// Draw the menu bar. Sets `quit_requested.*` on File→Quit; returns true when

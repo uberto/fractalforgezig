@@ -135,6 +135,9 @@ pub extern fn igInvisibleButton(str_id: [*:0]const u8, size: ImVec2, flags: Butt
 // Cursor position in screen space (used for tooltip / coordinate readout placement)
 pub extern fn igGetCursorScreenPos() ImVec2;
 
+// Size of the current window's content region (inner size, not including scrollbars).
+pub extern fn igGetContentRegionAvail() ImVec2;
+
 // Layout helpers
 pub extern fn igGetTextLineHeightWithSpacing() f32;
 

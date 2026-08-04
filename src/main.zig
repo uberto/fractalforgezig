@@ -74,10 +74,13 @@ pub fn main() !void {
     defer ui.shutdown();
 
     // T5: read initial window size and compute the letterboxed image rect.
+    // Use the approximate fractal region width (full width minus data panel + spacing).
     var win_w: c_int = 0;
     var win_h: c_int = 0;
     _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
-    var image_rect = viewport.computeImageRect(@intCast(win_w), @intCast(win_h));
+    const panel_taken: u32 = @as(u32, @intFromFloat(panels.data_panel_w + panels.region_spacing));
+    const fractal_w_init: u32 = if (@as(u32, @intCast(win_w)) > panel_taken) @as(u32, @intCast(win_w)) - panel_taken else 1;
+    var image_rect = viewport.computeImageRect(fractal_w_init, @intCast(win_h));
     const initial_S = image_rect.side;
 
     if (initial_S == 0) {
@@ -416,11 +419,10 @@ fn runLoop(
 
         var quit_requested = false;
         // open_ctx_menu and right_click_pt are consumed inside draw (popup lives there).
-        const ctx_action = panels.draw(
+        const draw_result = panels.draw(
             device.handle,
             texture.*,
             vp,
-            image_rect.*,
             engine.max_iter,
             app_stats.*,
             engine,
@@ -431,13 +433,16 @@ fn runLoop(
             hover_pt,
             &quit_requested,
         );
+        // Update image_rect from the live ImGui geometry every frame so coordinate
+        // mapping and resize use the actual fractal region (not the OS window size).
+        if (draw_result.image_rect.side > 0) image_rect.* = draw_result.image_rect;
         nav.open_ctx_menu = false;
         if (quit_requested) running = false;
 
         // Act on the context-menu selection.
-        if (ctx_action != .none) {
+        if (draw_result.ctx_action != .none) {
             const pt = nav.right_click_pt;
-            const new_view: ?viewport.SquareView = switch (ctx_action) {
+            const new_view: ?viewport.SquareView = switch (draw_result.ctx_action) {
                 .zoom_in => navigate.zoomCentered(engine.view, pt, navigate.zoom_step_in) catch null,
                 .zoom_out => navigate.zoomCentered(engine.view, pt, navigate.zoom_step_out) catch null,
                 .center_here => viewport.SquareView.fromCenterSide(pt, engine.view.side) catch null,
@@ -598,7 +603,12 @@ fn handleResize(
     new_w: u32,
     new_h: u32,
 ) void {
-    const new_rect = viewport.computeImageRect(new_w, new_h);
+    // Approximate the fractal region width (data panel + spacing taken from the right).
+    // The exact rect is updated each frame from ImGui geometry; this gives the correct
+    // engine size so the first post-resize render uses the right resolution.
+    const panel_taken: u32 = @as(u32, @intFromFloat(panels.data_panel_w + panels.region_spacing));
+    const fractal_w = if (new_w > panel_taken) new_w - panel_taken else 1;
+    const new_rect = viewport.computeImageRect(fractal_w, new_h);
     const new_s = new_rect.side;
 
     if (new_s == 0) {
