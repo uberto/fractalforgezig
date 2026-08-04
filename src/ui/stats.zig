@@ -14,8 +14,7 @@ pub fn nsToMs(ns: u64) f64 {
 }
 
 /// Read-only render/frame statistics shown in the data panel. NO ImGui/GPU deps so
-/// the aggregation stays unit-testable. `dispatch_count` is 0 in M0 (CPU render, no
-/// GPU compute) and is surfaced so the panel can prove it; M1 will increment it.
+/// the aggregation stays unit-testable.
 pub const Stats = struct {
     /// CPU Mandelbrot render time (ms), from the one-time startup render.
     render_ms: f64,
@@ -23,15 +22,16 @@ pub const Stats = struct {
     frame_ms: f64,
     /// GPU compute dispatches issued this milestone. Always 0 in M0.
     dispatch_count: u32,
+    /// GPU iteration time (ms) for the last GPU dispatch. 0 when CPU path is active.
+    gpu_render_ms: f64,
 
     /// Build stats from the startup render's elapsed nanoseconds. Frame time starts
     /// at 0 (no frame measured yet); dispatch count at 0 (M0 has no GPU compute).
     pub fn fromRender(render_elapsed_ns: u64) Stats {
-        return .{ .render_ms = nsToMs(render_elapsed_ns), .frame_ms = 0.0, .dispatch_count = 0 };
+        return .{ .render_ms = nsToMs(render_elapsed_ns), .frame_ms = 0.0, .dispatch_count = 0, .gpu_render_ms = 0.0 };
     }
 
-    /// Record the latest frame duration (ns). Touches only `frame_ms`; the one-time
-    /// render time and the dispatch count are left unchanged.
+    /// Record the latest frame duration (ns). Touches only `frame_ms`.
     pub fn observeFrame(self: *Stats, frame_elapsed_ns: u64) void {
         self.frame_ms = nsToMs(frame_elapsed_ns);
     }
@@ -71,11 +71,12 @@ test "nsToMs converts nanoseconds to milliseconds" {
     try testing.expectEqual(@as(f64, 0.0), nsToMs(0));
 }
 
-test "Stats.fromRender sets render_ms and zeroes frame_ms and dispatch_count" {
+test "Stats.fromRender sets render_ms and zeroes frame_ms, dispatch_count, and gpu_render_ms" {
     const s = Stats.fromRender(12_345_678);
     try testing.expectApproxEqAbs(@as(f64, 12.345678), s.render_ms, 1e-9);
     try testing.expectEqual(@as(f64, 0.0), s.frame_ms);
     try testing.expectEqual(@as(u32, 0), s.dispatch_count);
+    try testing.expectEqual(@as(f64, 0.0), s.gpu_render_ms);
 }
 
 test "Stats.observeFrame updates only frame_ms" {

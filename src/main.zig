@@ -15,12 +15,27 @@ const viewport = @import("fractal/viewport.zig");
 const navigate = @import("fractal/navigate.zig");
 const engine_mod = @import("fractal/engine.zig");
 const texture_mod = @import("gpu/texture.zig");
+const compute_mod = @import("gpu/compute.zig");
 const stats_mod = @import("ui/stats.zig");
 const editor_mod = @import("ui/editor.zig");
 const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
 
 const app_log = std.log.scoped(.app);
+
+/// Module-level compute pipeline so the IterFn (which has no closure) can reach it.
+var g_compute_pipeline: ?compute_mod.ComputePipeline = null;
+
+/// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled.
+fn gpuIterFn(
+    view: viewport.SquareView,
+    image_side: u32,
+    max_iter: u32,
+    iter: []f32,
+) anyerror!void {
+    const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
+    try compute_mod.gpuIterate(pl, view, image_side, max_iter, iter);
+}
 
 const window_title = "fractalforge";
 const initial_window_w = 1280;
@@ -47,6 +62,14 @@ pub fn main() !void {
     const device = try gpu.Device.create(window);
     defer device.destroy();
 
+    // Initialize the Metal compute pipeline for GPU iteration (M4).
+    // Failure is non-fatal: the GPU checkbox in the UI will be disabled if null.
+    g_compute_pipeline = compute_mod.ComputePipeline.create(device.handle) catch |err| blk: {
+        app_log.warn("GPU compute pipeline init failed ({s}); GPU mode unavailable", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (g_compute_pipeline) |pl| pl.destroy();
+
     const ui = try ui_mod.Ui.init(window, device);
     defer ui.shutdown();
 
@@ -70,6 +93,10 @@ pub fn main() !void {
         return err;
     };
     defer engine.deinit();
+    // Wire GPU iteration function if the pipeline is available (M4).
+    if (g_compute_pipeline != null) {
+        engine.gpu_iter_fn = gpuIterFn;
+    }
 
     var iterate_timer = std.time.Timer.start() catch null;
     engine.iterate() catch |err| {

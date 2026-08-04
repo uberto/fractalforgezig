@@ -94,7 +94,7 @@ pub fn draw(
         ig.igSameLine(0, region_spacing);
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
-        drawDataPanel(vp, max_iter, s, engine);
+        drawDataPanel(device, texture, vp, max_iter, s, engine);
         ig.igSpacing();
         drawCoordPanel(device, texture, engine, view_editor);
         ig.igSpacing();
@@ -192,11 +192,9 @@ fn drawNavContextMenu(right_click_pt: viewport.Complex) CtxAction {
     return action;
 }
 
-/// Read-only observability panel: render/frame ms, the decoupling PASS COUNTERS (iteration
-/// vs color) plus the live mode + stop count, the visible complex-plane bounds, and
-/// max_iter. The counters make the milestone guarantee visible: a palette/mapping edit
-/// bumps `color passes` while `iteration passes` stays fixed.
-fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *const engine_mod.Engine) void {
+/// Render stats + GPU/CPU toggle panel. Shows render/frame ms, decoupling PASS COUNTERS,
+/// viewport bounds, max_iter, and (M4) a GPU checkbox + gpu_render_ms timing line.
+fn drawDataPanel(device: *c.SDL_GPUDevice, texture: texture_mod.Texture, vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *engine_mod.Engine) void {
     const w: f64 = @floatFromInt(vp.width);
     const h: f64 = @floatFromInt(vp.height);
     const re_min = vp.center_re - (w / 2.0) * vp.scale;
@@ -208,10 +206,26 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
     ig.igSeparator();
     textf("CPU render: {d:.2} ms", .{s.render_ms});
     textf("Frame: {d:.2} ms", .{s.frame_ms});
+    if (s.gpu_render_ms > 0.0) textf("GPU render: {d:.2} ms", .{s.gpu_render_ms});
     textf("iteration passes: {d}", .{engine.iteration_passes});
     textf("color passes: {d}", .{engine.color_passes});
     textf("mode: {s}", .{@tagName(engine.params.mode)});
     textf("stops: {d}", .{engine.gradient.count});
+
+    // M4: GPU/CPU toggle. Disabled if no compute pipeline is wired.
+    const gpu_available = engine.gpu_iter_fn != null;
+    ig.igBeginDisabled(!gpu_available);
+    if (ig.igCheckbox("GPU", &engine.use_gpu)) {
+        // Re-iterate immediately so the first frame after toggle uses the new path.
+        engine.iterate() catch |err| {
+            ui_log.err("GPU toggle re-iterate failed ({s})", .{@errorName(err)});
+            engine.use_gpu = !engine.use_gpu; // revert
+        };
+        texture_mod.upload(device, texture, engine.output()) catch |err| {
+            ui_log.err("GPU toggle re-upload failed ({s})", .{@errorName(err)});
+        };
+    }
+    ig.igEndDisabled();
 
     ig.igSpacing();
     ig.igTextUnformatted("Viewport", null);
