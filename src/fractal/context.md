@@ -61,26 +61,19 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8)
   `colorInto(rgba,iter,lut:*const [1024]Rgba8,max_iter,params,interior) ColorError!void` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write else
   `BufferSizeMismatch`; sentinel→`interior`; alpha FORCED 255.
-- `engine.zig` — DECOUPLING crux + M3 state. `Engine` owns `view: SquareView`,
+- `engine.zig` — DECOUPLING crux + M3 state + M4 GPU routing. `Engine` owns `view: SquareView`,
   `image_side`(S px), `policy`, DERIVED `max_iter`, `iter:[]f32`/`rgba:[]u8`, `gradient`+`lut`,
   `params`, `interior`, read-only `iteration_passes`/`color_passes`.
-  `init(alloc,view,image_side,policy) ResizeError!Engine` allocs+zeroes, installs
-  `default()`/linear/opaque-black WITHOUT iterating; `deinit()` frees.
-  `iterate() IterateError!void` refreshes `max_iter` via `policy.effective`, refills via
-  `imageViewport()`, recolors, logs; bumps BOTH counters — the ONLY `iteration_passes` path,
-  shared by `setViewport(v)`/`setPolicy(p)`/`resize(S) ResizeError!void` (reallocs only on a
-  pixel-count change). Failure-atomic: rejected input/alloc keeps the previous state.
-  `setGradient(g)`(→`EmptyGradient` if `g.count==0`)/`setMapping(p)`/`setInterior(c)` rerun
-  ONLY the color pass: bump `color_passes`, `iteration_passes` UNCHANGED (THE GUARANTEE, after
-  navigation too). `output()`. Builders: `summary`/`colorPassSummary(...)`→
-  `"color pass {n}: mode={s}, stops={k}"`;
-  `iterateSummary(buf[iterate_summary_buf_len])`/`iteratePassSummary(buf,pass,view,S,policy)`→
-  `"iterate pass 3: center=…, mag=…, max_iter=512 (auto), S=900px"` (max_iter ALWAYS from
-  `policySummary`); `degenerateViewMessage(buf[viewport.message_buf_len],view)`;
-  `imageSideMessage(buf[image_side_message_buf_len],S)`;
-  `resizeFailureMessage(buf[resize_message_buf_len],S,bytes)`; `requestedBytes(S)` saturating.
-  `EngineError{EmptyGradient,BufferSizeMismatch,DegenerateImageSide}`;
-  `IterateError`=+`ViewportError`+`AutoIterError`; `ResizeError`=+`OutOfMemory`.
+  **M4**: `use_gpu: bool` (default false), `gpu_iter_fn: ?IterFn` (null until wired by `main.zig`).
+  `IterFn = fn(view, S, max_iter, iter: []f32) anyerror!void`. `iterate()` routes to `gpu_iter_fn`
+  when `use_gpu=true` and fn≠null; falls back to CPU with `.warn` on failure or null fn.
+  `init` — does NOT iterate; counters start at 0. `deinit()` frees buffers.
+  `iterate() IterateError!void` — refreshes `max_iter`, routes CPU/GPU, recolors, logs; bumps
+  BOTH counters. THE ONLY `iteration_passes` path. Called by `setViewport`/`setPolicy`/`resize`.
+  `setGradient(g)`/`setMapping(p)`/`setInterior(c)` — ONLY color pass; `iteration_passes`
+  UNCHANGED (THE GUARANTEE). `output()`. Pure builders: `colorPassSummary`, `iteratePassSummary`,
+  `degenerateViewMessage`, `imageSideMessage`, `resizeFailureMessage`, `requestedBytes`.
+  `EngineError{EmptyGradient,BufferSizeMismatch,DegenerateImageSide}`. `IterateError`=+`ViewportError`+`AutoIterError`.
 
 ## Coordinate convention
 

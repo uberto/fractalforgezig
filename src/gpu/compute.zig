@@ -93,7 +93,10 @@ pub fn dispatch(
     iter_out: []f32,
 ) Error!void {
     const pixel_count: u32 = uniforms.side * uniforms.side;
-    if (iter_out.len != pixel_count) return Error.IterBufferSizeMismatch;
+    if (iter_out.len != pixel_count) {
+        log.err("dispatch: iter_out.len={d} != side*side={d}", .{ iter_out.len, pixel_count });
+        return Error.IterBufferSizeMismatch;
+    }
 
     const device = pipeline.device;
     const byte_size: u32 = pixel_count * @sizeOf(f32);
