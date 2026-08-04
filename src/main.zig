@@ -154,6 +154,9 @@ const NavState = struct {
     /// Whether the full-res pass has been run for the current view.
     /// `true` at startup (the initial iterate counts as a full pass).
     full_pass_done: bool = true,
+    /// Set when engine output changed and needs to be uploaded to the GPU texture.
+    /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
+    needs_upload: bool = false,
     /// Nanoseconds taken by the most recent iteration pass (for render_ms display).
     last_render_ns: u64 = 0,
 
@@ -184,8 +187,6 @@ fn historyPush(nav: *NavState, old_view: viewport.SquareView) void {
 
 /// Undo: restore the most recent view on the undo stack, push current onto redo.
 fn historyUndo(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     view_editor: *editor_mod.ViewEditor,
@@ -193,7 +194,6 @@ fn historyUndo(
     if (nav.undo_len == 0) return;
     const prev = nav.undo_buf[nav.undo_len - 1];
     nav.undo_len -= 1;
-    // Push current view onto redo (without clearing undo — just redo).
     if (nav.redo_len < history_cap) {
         nav.redo_buf[nav.redo_len] = engine.view;
         nav.redo_len += 1;
@@ -202,9 +202,7 @@ fn historyUndo(
         app_log.err("undo rejected ({s})", .{@errorName(err)});
         return;
     };
-    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-        app_log.err("undo re-upload failed ({s})", .{@errorName(err)});
-    };
+    nav.needs_upload = true;
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
     view_editor.syncFromView(engine.view);
@@ -212,8 +210,6 @@ fn historyUndo(
 
 /// Redo: restore the most recent undone view.
 fn historyRedo(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     view_editor: *editor_mod.ViewEditor,
@@ -229,9 +225,7 @@ fn historyRedo(
         app_log.err("redo rejected ({s})", .{@errorName(err)});
         return;
     };
-    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-        app_log.err("redo re-upload failed ({s})", .{@errorName(err)});
-    };
+    nav.needs_upload = true;
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
     view_editor.syncFromView(engine.view);
@@ -252,8 +246,6 @@ fn syncTexture(device: gpu.Device, texture: *texture_mod.Texture, engine: *engin
 /// Apply a new view with an immediate coarse (S/4) pass and upload.
 /// `real_w/real_h` are the full-resolution dimensions to restore for the full pass.
 fn applyViewCoarse(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     new_view: viewport.SquareView,
@@ -282,11 +274,6 @@ fn applyViewCoarse(
         return;
     };
 
-    syncTexture(device, texture, engine);
-    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-        app_log.err("coarse re-upload failed ({s})", .{@errorName(err)});
-    };
-
     // Warn if the new view crossed the precision floor.
     if (navigate.atPrecisionFloor(new_view)) {
         var floor_buf: [navigate.floor_message_buf_len]u8 = undefined;
@@ -296,6 +283,7 @@ fn applyViewCoarse(
     }
 
     if (t) |*timer| nav.last_render_ns = timer.read();
+    nav.needs_upload = true;
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
@@ -303,8 +291,6 @@ fn applyViewCoarse(
 
 /// Restore full-resolution dimensions, re-iterate, sync texture, re-upload.
 fn runFullPass(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     real_w: u32,
@@ -321,11 +307,7 @@ fn runFullPass(
     }
     if (t) |*timer| nav.last_render_ns = timer.read();
 
-    syncTexture(device, texture, engine);
-    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-        app_log.err("full-res re-upload failed ({s})", .{@errorName(err)});
-    };
-
+    nav.needs_upload = true;
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = true;
     app_log.info("full-res pass complete: {d}×{d}", .{ engine.image_w, engine.image_h });
@@ -399,7 +381,7 @@ fn runLoop(
                                 navigate.zoom_step_out;
                             const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
                             if (new_view) |v|
-                                applyViewCoarse(device, texture, engine, &nav, v, real_s, view_editor);
+                                applyViewCoarse(engine, &nav, v, real_s, view_editor);
                         }
                     }
                 },
@@ -419,9 +401,9 @@ fn runLoop(
                     const ctrl = (mods & c.SDL_KMOD_CTRL) != 0;
                     if (ctrl) {
                         if (event.key.scancode == c.SDL_SCANCODE_Z) {
-                            historyUndo(device, texture, engine, &nav, view_editor);
+                            historyUndo(engine, &nav, view_editor);
                         } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
-                            historyRedo(device, texture, engine, &nav, view_editor);
+                            historyRedo(engine, &nav, view_editor);
                         }
                     }
                 },
@@ -469,13 +451,24 @@ fn runLoop(
                 .center_here => viewport.SquareView.fromCenterSide(pt, engine.view.side) catch null,
                 .none => null,
             };
-            if (new_view) |v| applyViewCoarse(device, texture, engine, &nav, v, real_s, view_editor);
+            if (new_view) |v| applyViewCoarse(engine, &nav, v, real_s, view_editor);
         }
 
         // Navigation ImGui input: box-select and pan.
-        handleNavInput(device, texture, engine, &nav, image_rect.*, real_s, view_editor);
+        handleNavInput(engine, &nav, image_rect.*, real_s, view_editor);
 
         ui.endFrame();
+
+        // ── Deferred texture sync + upload ────────────────────────────────────
+        // Done AFTER ui.endFrame() so ImGui's draw commands for this frame all
+        // reference the OLD texture handle. The new texture is used next frame.
+        if (nav.needs_upload) {
+            syncTexture(device, texture, engine);
+            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+                app_log.err("texture upload failed ({s})", .{@errorName(err)});
+            };
+            nav.needs_upload = false;
+        }
 
         // ── Coarse→fine pass decision ─────────────────────────────────────────
         // `interacting` = left dragging OR middle dragging OR Space+left dragging.
@@ -484,7 +477,7 @@ fn runLoop(
             (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
         const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
         switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
-            .full => runFullPass(device, texture, engine, &nav, real_w, real_h, view_editor),
+            .full => runFullPass(engine, &nav, real_w, real_h, view_editor),
             .coarse, .none => {},
         }
 
@@ -505,8 +498,6 @@ const drag_rect_col: ig.ImU32 = 0xFF_FF_FF_FF;
 
 /// Process box-select (left-drag) and pan (middle-drag / Space+left-drag) for one frame.
 fn handleNavInput(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     rect: viewport.ImageRect,
@@ -533,7 +524,7 @@ fn handleNavInput(
                 break :blk null;
             };
             if (new_view) |v| {
-                applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
+                applyViewCoarse(engine, nav, v, real_s, view_editor);
                 ig.igResetMouseDragDelta(btn);
             }
         }
@@ -603,7 +594,7 @@ fn handleNavInput(
                 app_log.warn("box-select rejected ({s})", .{@errorName(err)});
                 break :blk null;
             };
-            if (new_view) |v| applyViewCoarse(device, texture, engine, nav, v, real_s, view_editor);
+            if (new_view) |v| applyViewCoarse(engine, nav, v, real_s, view_editor);
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
         }
