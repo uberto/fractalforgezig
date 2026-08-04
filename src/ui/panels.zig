@@ -45,9 +45,12 @@ pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 /// Result of one `draw` call: the context-menu action and the live image rect.
 /// The image rect is derived from the actual ImGui child dimensions this frame —
 /// main.zig must use this (not the OS window size) for coordinate mapping and resize.
+/// `needs_rerender` is set when an in-panel toggle (e.g. GPU/CPU) changed the iteration
+/// path — main.zig must call engine.iterate() + upload after the frame.
 pub const DrawResult = struct {
     ctx_action: CtxAction,
     image_rect: viewport.ImageRect,
+    needs_rerender: bool = false,
 };
 
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
@@ -71,6 +74,7 @@ pub fn draw(
     quit_requested: *bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
+    var needs_rerender = false;
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
 
@@ -118,7 +122,7 @@ pub fn draw(
         ig.igSameLine(0, region_spacing);
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
-        drawDataPanel(device, texture, engine.renderViewport(), max_iter, s, engine);
+        if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
         ig.igSpacing();
         drawCoordPanel(device, texture, engine, view_editor);
         ig.igSpacing();
@@ -133,7 +137,7 @@ pub fn draw(
         drawAboutModal();
     }
     ig.igEnd();
-    return .{ .ctx_action = ctx_action, .image_rect = live_rect };
+    return .{ .ctx_action = ctx_action, .image_rect = live_rect, .needs_rerender = needs_rerender };
 }
 
 /// Draw the menu bar. Sets `quit_requested.*` on File→Quit; returns true when
@@ -217,9 +221,9 @@ fn drawNavContextMenu(right_click_pt: viewport.Complex) CtxAction {
     return action;
 }
 
-/// Render stats + GPU/CPU toggle panel. Shows render/frame ms, decoupling PASS COUNTERS,
-/// viewport bounds, max_iter, and (M4) a GPU checkbox + gpu_render_ms timing line.
-fn drawDataPanel(device: *c.SDL_GPUDevice, texture: texture_mod.Texture, vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *engine_mod.Engine) void {
+/// Render stats + GPU/CPU toggle panel. Returns true when the GPU toggle was flipped
+/// so main.zig can re-iterate and upload after the frame (never do GPU work inside ImGui).
+fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *engine_mod.Engine) bool {
     const w: f64 = @floatFromInt(vp.width);
     const h: f64 = @floatFromInt(vp.height);
     const re_min = vp.center_re - (w / 2.0) * vp.scale;
@@ -238,18 +242,10 @@ fn drawDataPanel(device: *c.SDL_GPUDevice, texture: texture_mod.Texture, vp: vie
     textf("stops: {d}", .{engine.gradient.count});
 
     // M4: GPU/CPU toggle. Disabled if no compute pipeline is wired.
+    // Flipping this sets needs_rerender=true so main.zig does the actual iterate+upload.
     const gpu_available = engine.gpu_iter_fn != null;
     ig.igBeginDisabled(!gpu_available);
-    if (ig.igCheckbox("GPU", &engine.use_gpu)) {
-        // Re-iterate immediately so the first frame after toggle uses the new path.
-        engine.iterate() catch |err| {
-            ui_log.err("GPU toggle re-iterate failed ({s})", .{@errorName(err)});
-            engine.use_gpu = !engine.use_gpu; // revert
-        };
-        texture_mod.upload(device, texture, engine.output()) catch |err| {
-            ui_log.err("GPU toggle re-upload failed ({s})", .{@errorName(err)});
-        };
-    }
+    const toggled = ig.igCheckbox("GPU", &engine.use_gpu);
     ig.igEndDisabled();
 
     ig.igSpacing();
@@ -258,6 +254,8 @@ fn drawDataPanel(device: *c.SDL_GPUDevice, texture: texture_mod.Texture, vp: vie
     textf("re: [{d:.4}, {d:.4}]", .{ re_min, re_max });
     textf("im: [{d:.4}, {d:.4}]", .{ im_min, im_max });
     textf("max_iter: {d}", .{max_iter});
+
+    return toggled;
 }
 
 /// The coordinate editing panel: center+magnification and corners (both forms, kept in

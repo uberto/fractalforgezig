@@ -442,6 +442,26 @@ fn runLoop(
         nav.open_ctx_menu = false;
         if (quit_requested) running = false;
 
+        // GPU/CPU toggle: re-iterate on the new path, upload will happen in the deferred block.
+        if (draw_result.needs_rerender) {
+            var t = std.time.Timer.start() catch null;
+            engine.iterate() catch |err| {
+                app_log.err("GPU toggle re-iterate failed ({s}); reverting", .{@errorName(err)});
+                engine.use_gpu = !engine.use_gpu;
+            };
+            if (t) |*timer| {
+                const ns = timer.read();
+                if (engine.use_gpu) {
+                    app_stats.gpu_render_ms = stats_mod.nsToMs(ns);
+                    app_stats.render_ms = 0.0;
+                } else {
+                    app_stats.render_ms = stats_mod.nsToMs(ns);
+                    app_stats.gpu_render_ms = 0.0;
+                }
+            }
+            nav.needs_upload = true;
+        }
+
         // Act on the context-menu selection.
         if (draw_result.ctx_action != .none) {
             const pt = nav.right_click_pt;
