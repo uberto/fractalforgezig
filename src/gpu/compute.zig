@@ -13,7 +13,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const message = @import("message.zig");
-const viewport_mod = @import("../fractal/viewport.zig");
+const viewport = @import("../fractal/viewport.zig");
 
 const log = std.log.scoped(.gpu);
 
@@ -60,8 +60,8 @@ pub const ComputePipeline = struct {
             .num_readonly_storage_textures = 0,
             .num_readonly_storage_buffers = 0,
             .num_readwrite_storage_textures = 0,
-            .num_readwrite_storage_buffers = 1, // iter_out buffer(0)
-            .num_uniform_buffers = 1, // MandelbrotUniforms buffer(1)
+            .num_readwrite_storage_buffers = 1, // iter_out — MSL buffer(1) (after uniforms)
+            .num_uniform_buffers = 1, // MandelbrotUniforms — MSL buffer(0) (uniforms first)
             .threadcount_x = 64,
             .threadcount_y = 1,
             .threadcount_z = 1,
@@ -207,6 +207,26 @@ pub fn dispatch(
         const elapsed_ms = @as(f64, @floatFromInt(t.read())) / 1_000_000.0;
         log.info("gpu iterate: S={d}, max_iter={d}, {d:.2} ms", .{ uniforms.side, uniforms.max_iter, elapsed_ms });
     }
+}
+
+/// High-level GPU iteration: convert a `SquareView` + image side `S` to uniforms,
+/// dispatch, download, and log timing. Equivalent of `iterbuf.iterateInto` on GPU.
+/// `iter.len` must equal `S * S`.
+pub fn gpuIterate(
+    pipeline: ComputePipeline,
+    view: viewport.SquareView,
+    image_side: u32,
+    max_iter: u32,
+    iter: []f32,
+) Error!void {
+    const uniforms = MandelbrotUniforms{
+        .center_re = @floatCast(view.center_re),
+        .center_im = @floatCast(view.center_im),
+        .scale = @floatCast(view.side / @as(f64, @floatFromInt(image_side))),
+        .side = image_side,
+        .max_iter = max_iter,
+    };
+    try dispatch(pipeline, uniforms, iter);
 }
 
 fn logSdlFailure(call: []const u8) void {

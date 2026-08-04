@@ -22,6 +22,10 @@
 //   extra_iterations    = 2    (after escape crossing, 2 more z=z^2+c steps)
 //   smooth = n + 1.0 - log2(log2(length(z)))  evaluated after extra steps
 //   NaN/Inf guard: falls back to float(escape_n) — the plain escape count.
+//
+// SDL_GPU MSL buffer slot order (IMPORTANT — must match SDL_CreateGPUComputePipeline layout):
+//   [[buffer(0)]]: uniform buffers first   → MandelbrotUniforms
+//   [[buffer(1)]]: read-write storage last → iter_out
 
 #include <metal_stdlib>
 using namespace metal;
@@ -35,8 +39,8 @@ struct MandelbrotUniforms {
 };
 
 kernel void mandelbrot_iterate(
-    device float*                 iter_out [[ buffer(0) ]],
-    constant MandelbrotUniforms&  u        [[ buffer(1) ]],
+    constant MandelbrotUniforms&  u        [[ buffer(0) ]],  // uniform first
+    device float*                 iter_out [[ buffer(1) ]],  // readwrite storage last
     uint                          gid      [[ thread_position_in_grid ]]
 ) {
     uint total = u.side * u.side;

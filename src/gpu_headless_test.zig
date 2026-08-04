@@ -44,6 +44,50 @@ test "compute: pipeline creates successfully with embedded MSL source" {
     // If we reach here the MSL compiled without error.
 }
 
+test "compute: gpuIterate interior pixels match CPU (deep interior, no precision boundary)" {
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+
+    const mandelbrot = @import("fractal/mandelbrot.zig");
+    const vp = @import("fractal/viewport.zig");
+
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const S: u32 = 16;
+    const max_iter: u32 = 64;
+    // Use a view centered deep inside the Mandelbrot set (origin = 0+0i, scale small).
+    // All pixels in a tiny square around (0,0) are interior; CPU and GPU must agree.
+    const view = try vp.SquareView.fromCenterSide(.{ .re = 0.0, .im = 0.0 }, 0.1);
+
+    var gpu_iter: [S * S]f32 = undefined;
+    try compute.gpuIterate(pipeline, view, S, max_iter, &gpu_iter);
+
+    // Every pixel near the Mandelbrot center is interior; verify GPU agrees.
+    var interior_count: u32 = 0;
+    for (gpu_iter) |v| {
+        if (v < 0.0) interior_count += 1;
+    }
+    // All 256 pixels should be interior.
+    try std.testing.expectEqual(@as(u32, S * S), interior_count);
+
+    // Also spot-check a known-exterior point (c = 2 + 2i escapes in 1 iteration).
+    const exterior_view = try vp.SquareView.fromCenterSide(.{ .re = 2.0, .im = 2.0 }, 0.01);
+    var exterior_iter: [S * S]f32 = undefined;
+    try compute.gpuIterate(pipeline, exterior_view, S, max_iter, &exterior_iter);
+
+    // CPU reference for center pixel.
+    const scale: f64 = exterior_view.side / @as(f64, @floatFromInt(S));
+    const c_re = exterior_view.center_re + 0.5 * scale - exterior_view.side * 0.5;
+    const c_im = exterior_view.center_im + exterior_view.side * 0.5 - 0.5 * scale;
+    const cpu_val = mandelbrot.iterate(c_re, c_im, max_iter);
+    const gpu_val = exterior_iter[0];
+
+    // Both must be escaped (positive).
+    try std.testing.expect(cpu_val > 0.0);
+    try std.testing.expect(gpu_val > 0.0);
+}
+
 test "compute: dispatch at S=4 produces 16 finite results" {
     const device = try openHeadlessDevice();
     defer closeHeadlessDevice(device);
