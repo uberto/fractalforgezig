@@ -46,29 +46,10 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Metal shader compilation.
-    // Requires full Xcode (not just Command Line Tools) — xcrun must be able to
-    // resolve the `metal` and `metallib` utilities in the macOS SDK.
-    //
-    // Step 1: compile mandelbrot.metal -> mandelbrot.air (Metal IR).
-    const metal_src = b.path("src/gpu/shaders/mandelbrot.metal");
-    const metal_compile = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-c" });
-    metal_compile.addFileArg(metal_src);
-    metal_compile.addArg("-o");
-    const air_file = metal_compile.addOutputFileArg("mandelbrot.air");
-
-    // Step 2: link .air -> mandelbrot.metallib.
-    const metallib_link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib" });
-    metallib_link.addFileArg(air_file);
-    metallib_link.addArg("-o");
-    const metallib_file = metallib_link.addOutputFileArg("mandelbrot.metallib");
-
-    // Install the .metallib to zig-out/shaders/mandelbrot.metallib so T2 can
-    // @embedFile it via a relative path from the source tree.
-    const install_metallib = b.addInstallFile(metallib_file, "shaders/mandelbrot.metallib");
-
-    // Wire: exe depends on the installed metallib; install step covers the rest.
-    exe.step.dependOn(&install_metallib.step);
+    // The Metal compute shader source lives in src/gpu/shaders/mandelbrot.metal.
+    // It is @embedFile'd as raw MSL text and passed to SDL_CreateGPUComputePipeline
+    // with SDL_GPU_SHADERFORMAT_MSL — no xcrun/metallib build step required.
+    // Full Xcode (for the metal compiler) is therefore not a build dependency.
 
     b.installArtifact(exe);
 
