@@ -33,6 +33,23 @@ and behind `../c.zig`; never leak them into the pure fractal core.
     fence -> `SDL_WaitForGPUFences` -> map/memcpy/unmap.
   - All SDL failures log `std.log.err` via `message.sdlFailure` and return a Zig
     `Error` variant — never `unreachable`.
+- `compute.zig` (M4 T2) — Metal compute pipeline for GPU Mandelbrot iteration.
+  - `MandelbrotUniforms` extern struct: `{center_re, center_im, scale: f32, side, max_iter: u32}`.
+    Must match the MSL `MandelbrotUniforms` in `shaders/mandelbrot.metal` field-for-field.
+  - `ComputePipeline.create(device) Error!ComputePipeline` — compiles the embedded MSL
+    source (`@embedFile("shaders/mandelbrot.metal")`) via `SDL_CreateGPUComputePipeline`
+    with `SDL_GPU_SHADERFORMAT_MSL`. Entry point `"mandelbrot_iterate"`, threadcount 64×1×1,
+    1 readwrite storage buffer, 1 uniform buffer. Logs + returns `ShaderCompilationFailed`
+    on failure.
+  - `ComputePipeline.destroy()` — releases the pipeline.
+  - `dispatch(pipeline, uniforms, iter_out: []f32) Error!void` — synchronous: acquires
+    command buffer → compute pass (bind pipeline + storage buffer + push uniforms) →
+    dispatch `(side*side + 63)/64` threadgroups → end pass → submit → copy pass to
+    transfer buffer → submit + wait fence → map + memcpy into `iter_out`. The caller's
+    `iter_out` is valid on return. `iter_out.len` must equal `side*side` or
+    `IterBufferSizeMismatch`.
+  - `shaders/mandelbrot.metal` — MSL compute kernel; `half` is reserved in MSL, use
+    `side_half` for the viewport-center variable.
 - `message.zig` — PURE log/summary string builders (`sdlFailure`, `deviceReady`),
   no SDL import, unit-tested in the fast tier. `device.zig` uses them for the
   strings it hands to `std.log`. Add new observability strings here so they stay

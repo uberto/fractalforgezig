@@ -46,9 +46,9 @@ kernel void mandelbrot_iterate(
     uint row = gid / u.side;
 
     // Pixel-to-complex: pixel center at (col + 0.5, row + 0.5), y-axis inverted.
-    float half = float(u.side) * 0.5f;
-    float c_re = u.center_re + (float(col) + 0.5f - half) * u.scale;
-    float c_im = u.center_im + (half - float(row) - 0.5f) * u.scale;
+    float side_half = float(u.side) * 0.5f;
+    float c_re = u.center_re + (float(col) + 0.5f - side_half) * u.scale;
+    float c_im = u.center_im + (side_half - float(row) - 0.5f) * u.scale;
 
     // Mandelbrot iteration: z = z^2 + c, starting from z = 0.
     float z_re = 0.0f;
