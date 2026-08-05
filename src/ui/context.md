@@ -18,7 +18,8 @@ coords throughout (`SDL_GetWindowSize`/`event.window.data1,2`).
 
 ## Layout: single window, two fixed regions
 
-`panels.zig` — `draw(device,texture,max_iter,stats,engine,editor,view_editor,…)→DrawResult{ctx_action,image_rect,needs_rerender}`.
+`panels.zig` — `draw(device,texture,max_iter,stats,engine,editor,view_editor,…)→DrawResult`.
+`DrawResult{ctx_action,image_rect,needs_rerender,save_requested,open_requested}`.
 Left: fractal image. Right: data+coord+palette panels. Menu: File→Save…/Open…/Quit, Help→About.
 Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period slider, interior.
 `applyEdits`→setter→re-upload; NEVER re-iterates. `editor.zig` (PURE): `Editor`+`toGradient`+`addStop`/`removeStop`.
