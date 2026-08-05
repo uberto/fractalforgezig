@@ -156,6 +156,9 @@ const NavState = struct {
     /// Whether the full-res pass has been run for the current view.
     /// `true` at startup (the initial iterate counts as a full pass).
     full_pass_done: bool = true,
+    /// True while a coarse pass is shown and the full-res pass hasn't run yet.
+    /// Passed to panels.draw so the UI can visually indicate rendering in progress.
+    rendering: bool = false,
     /// Set when engine output changed and needs to be uploaded to the GPU texture.
     /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
     needs_upload: bool = false,
@@ -286,6 +289,7 @@ fn applyViewCoarse(
 
     if (t) |*timer| nav.last_render_ns = timer.read();
     nav.needs_upload = true;
+    nav.rendering = true;
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = false;
     nav.idle_timer = std.time.Timer.start() catch null;
@@ -310,6 +314,7 @@ fn runFullPass(
     if (t) |*timer| nav.last_render_ns = timer.read();
 
     nav.needs_upload = true;
+    nav.rendering = false;
     view_editor.syncFromView(engine.view);
     nav.full_pass_done = true;
     app_log.info("full-res pass complete: {d}×{d}", .{ engine.image_w, engine.image_h });
@@ -437,6 +442,7 @@ fn runLoop(
             nav.open_ctx_menu,
             nav.right_click_pt,
             hover_pt,
+            nav.rendering,
             &quit_requested,
         );
         // Update image_rect from the live ImGui geometry every frame so coordinate
@@ -502,6 +508,7 @@ fn runLoop(
         // MUST be after renderFrame: ImGui submits the GPU commands (including
         // the sampler binding for the fractal texture) inside renderFrame.
         // Only after submission is it safe to destroy and recreate the texture.
+        const did_upload = nav.needs_upload;
         if (nav.needs_upload) {
             syncTexture(device, texture, engine);
             texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
@@ -515,7 +522,10 @@ fn runLoop(
             handleDialogResult(result, device, texture, engine, &nav, view_editor);
         }
 
-        if (frame_timer) |*t| app_stats.observeFrame(t.read());
+        // Only update frame_ms when the fractal actually re-rendered; skip mouse-move frames.
+        if (did_upload) {
+            if (frame_timer) |*t| app_stats.observeFrame(t.read());
+        }
         if (nav.last_render_ns > 0) {
             app_stats.render_ms = stats_mod.nsToMs(nav.last_render_ns);
             nav.last_render_ns = 0;

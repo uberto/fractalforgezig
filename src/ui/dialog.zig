@@ -67,6 +67,7 @@ fn dialogCallback(
     };
 
     const src = std.mem.span(first);
+    log.info("dialog callback: path={s}", .{src});
     if (src.len > max_path_len) {
         log.warn("dialog path truncated ({d} > {d} bytes)", .{ src.len, max_path_len });
     }
@@ -87,6 +88,7 @@ pub fn showSave(window: *c.SDL_Window, pending: *PendingDialog) void {
     pending.path_len = 0;
     pending.callback_fired = false;
     c.SDL_ShowSaveFileDialog(dialogCallback, pending, window, &fractal_filter, 1, null);
+    log.info("save dialog requested", .{});
 }
 
 /// Show the OS open dialog. No-op if a dialog result is already pending.
@@ -96,6 +98,7 @@ pub fn showOpen(window: *c.SDL_Window, pending: *PendingDialog) void {
     pending.path_len = 0;
     pending.callback_fired = false;
     c.SDL_ShowOpenFileDialog(dialogCallback, pending, window, &fractal_filter, 1, null, false);
+    log.info("open dialog requested", .{});
 }
 
 /// Check whether a dialog completed. Returns `null` if no result is ready yet or the user

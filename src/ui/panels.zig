@@ -75,6 +75,7 @@ pub fn draw(
     open_ctx_menu: bool,
     right_click_pt: viewport.Complex,
     hover_pt: ?viewport.Complex,
+    rendering: bool,
     quit_requested: *bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
@@ -130,6 +131,7 @@ pub fn draw(
         ig.igSameLine(0, region_spacing);
 
         _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
+        ig.igBeginDisabled(rendering);
         if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
         ig.igSpacing();
         drawCoordPanel(device, texture, engine, view_editor);
@@ -137,6 +139,7 @@ pub fn draw(
         if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
             drawPalettePanel(device, texture, engine, editor);
         }
+        ig.igEndDisabled();
         c.ffImguiEndChild();
 
         // Context menu must be opened and rendered in the same window scope.
