@@ -47,10 +47,14 @@ pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 /// main.zig must use this (not the OS window size) for coordinate mapping and resize.
 /// `needs_rerender` is set when an in-panel toggle (e.g. GPU/CPU) changed the iteration
 /// path — main.zig must call engine.iterate() + upload after the frame.
+/// `save_requested` / `open_requested` are set when File→Save… / File→Open… is clicked;
+/// main.zig opens the appropriate SDL dialog after the frame.
 pub const DrawResult = struct {
     ctx_action: CtxAction,
     image_rect: viewport.ImageRect,
     needs_rerender: bool = false,
+    save_requested: bool = false,
+    open_requested: bool = false,
 };
 
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
@@ -75,13 +79,17 @@ pub fn draw(
 ) DrawResult {
     var ctx_action = CtxAction.none;
     var needs_rerender = false;
+    var save_requested = false;
+    var open_requested = false;
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
 
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
-        const open_about = drawMenuBar(quit_requested);
-        if (open_about) ig.igOpenPopup_Str(about_popup, 0);
+        const menu = drawMenuBar(quit_requested);
+        if (menu.open_about) ig.igOpenPopup_Str(about_popup, 0);
+        if (menu.save_requested) save_requested = true;
+        if (menu.open_requested) open_requested = true;
         // Open the right-click nav popup inside the window so the ID stack is correct.
         if (open_ctx_menu) ig.igOpenPopup_Str("##nav_ctx", 0);
 
@@ -137,25 +145,39 @@ pub fn draw(
         drawAboutModal();
     }
     ig.igEnd();
-    return .{ .ctx_action = ctx_action, .image_rect = live_rect, .needs_rerender = needs_rerender };
+    return .{
+        .ctx_action = ctx_action,
+        .image_rect = live_rect,
+        .needs_rerender = needs_rerender,
+        .save_requested = save_requested,
+        .open_requested = open_requested,
+    };
 }
 
-/// Draw the menu bar. Sets `quit_requested.*` on File→Quit; returns true when
-/// Help→About was clicked so the caller can open the modal at window scope.
-fn drawMenuBar(quit_requested: *bool) bool {
-    var open_about = false;
+const MenuResult = struct {
+    open_about: bool = false,
+    save_requested: bool = false,
+    open_requested: bool = false,
+};
+
+/// Draw the menu bar. Sets `quit_requested.*` on File→Quit.
+fn drawMenuBar(quit_requested: *bool) MenuResult {
+    var result = MenuResult{};
     if (ig.igBeginMenuBar()) {
         if (ig.igBeginMenu("File", true)) {
+            if (ig.igMenuItem_Bool("Save\xe2\x80\xa6", null, false, true)) result.save_requested = true;
+            if (ig.igMenuItem_Bool("Open\xe2\x80\xa6", null, false, true)) result.open_requested = true;
+            ig.igSeparator();
             if (ig.igMenuItem_Bool("Quit", null, false, true)) quit_requested.* = true;
             ig.igEndMenu();
         }
         if (ig.igBeginMenu("Help", true)) {
-            if (ig.igMenuItem_Bool("About", null, false, true)) open_about = true;
+            if (ig.igMenuItem_Bool("About", null, false, true)) result.open_about = true;
             ig.igEndMenu();
         }
         ig.igEndMenuBar();
     }
-    return open_about;
+    return result;
 }
 
 /// Draw the Mandelbrot texture at its natural `w × h` size.

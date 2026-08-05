@@ -78,7 +78,7 @@ called from `applyViewCoarse`, `runFullPass`, and after `handleResize`.
 `PendingDialog{kind:Kind,path_buf,path_len}` — stack-alloc in `runLoop`, lifetime outlives callbacks.
 `showSave(window,pending)` / `showOpen(window,pending)` — no-op if `kind != .none` (one dialog at a time).
 `takePending(pending) ?PendingResult` — returns `null` on cancel or no pending result, resets to `.none`.
-C callback (`callconv(.C)`) writes path into `path_buf`; never allocates. Filter `*.fractal`.
+C callback (`callconv(.c)`) writes path into `path_buf`; never allocates. Filter `*.fractal`.
 
 ## Testing
 

@@ -20,6 +20,8 @@ const stats_mod = @import("ui/stats.zig");
 const editor_mod = @import("ui/editor.zig");
 const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
+const persist = @import("fractal/persist.zig");
+const dialog = @import("ui/dialog.zig");
 
 const app_log = std.log.scoped(.app);
 
@@ -335,6 +337,7 @@ fn runLoop(
     };
 
     var nav = NavState{};
+    var pending_dialog = dialog.PendingDialog{};
     // Track the full-resolution dimensions independently of engine.image_w/h (which may
     // be at coarse size during a drag).
     var real_w: u32 = engine.image_w;
@@ -462,6 +465,10 @@ fn runLoop(
             nav.needs_upload = true;
         }
 
+        // Open file dialogs when menu items were clicked (after the ImGui frame).
+        if (draw_result.save_requested) dialog.showSave(window, &pending_dialog);
+        if (draw_result.open_requested) dialog.showOpen(window, &pending_dialog);
+
         // Act on the context-menu selection.
         if (draw_result.ctx_action != .none) {
             const pt = nav.right_click_pt;
@@ -503,11 +510,90 @@ fn runLoop(
             nav.needs_upload = false;
         }
 
+        // ── File dialog result processing ─────────────────────────────────────
+        if (dialog.takePending(&pending_dialog)) |result| {
+            handleDialogResult(result, device, texture, engine, &nav, view_editor);
+        }
+
         if (frame_timer) |*t| app_stats.observeFrame(t.read());
         if (nav.last_render_ns > 0) {
             app_stats.render_ms = stats_mod.nsToMs(nav.last_render_ns);
             nav.last_render_ns = 0;
         }
+    }
+}
+
+/// Process a completed file-dialog result: save state to disk or load from disk.
+fn handleDialogResult(
+    result: dialog.PendingResult,
+    device: gpu.Device,
+    texture: *texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    view_editor: *editor_mod.ViewEditor,
+) void {
+    const alloc = std.heap.page_allocator;
+    const path = result.path;
+
+    switch (result.kind) {
+        .save => {
+            const state = persist.fromEngine(engine, alloc) catch |err| {
+                app_log.err("save: fromEngine failed ({s})", .{@errorName(err)});
+                return;
+            };
+            defer persist.freeState(state, alloc);
+
+            // Ensure path ends in .fractal; use path as-is (SDL dialog already filters).
+            const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+                app_log.err("save: cannot create '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            defer file.close();
+
+            var json_buf: [8192]u8 = undefined;
+            const json_bytes = persist.toJson(state, &json_buf) catch |err| {
+                app_log.err("save: toJson failed ({s})", .{@errorName(err)});
+                return;
+            };
+            file.writeAll(json_bytes) catch |err| {
+                app_log.err("save: write failed for '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            app_log.info("state saved to '{s}'", .{path});
+        },
+        .open => {
+            const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+                app_log.err("open: cannot read '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            defer file.close();
+
+            var file_buf: [8192]u8 = undefined;
+            const n = file.readAll(&file_buf) catch |err| {
+                app_log.err("open: read failed for '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            const json_bytes = file_buf[0..n];
+
+            const state = persist.fromJson(json_bytes, alloc) catch |err| {
+                app_log.err("open: parse failed for '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            defer persist.freeState(state, alloc);
+
+            persist.applyToEngine(state, engine) catch |err| {
+                app_log.err("open: applyToEngine failed for '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+
+            syncTexture(device, texture, engine);
+            view_editor.syncFromView(engine.view);
+            nav.needs_upload = true;
+            nav.full_pass_done = false;
+            nav.idle_timer = std.time.Timer.start() catch null;
+            app_log.info("state loaded from '{s}'", .{path});
+        },
+        .none => {},
     }
 }
 

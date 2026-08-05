@@ -49,7 +49,7 @@ fn dialogCallback(
     userdata: ?*anyopaque,
     filelist: [*c]const [*c]const u8,
     filter: c_int,
-) callconv(.C) void {
+) callconv(.c) void {
     _ = filter;
     const pending: *PendingDialog = @ptrCast(@alignCast(userdata orelse return));
 
