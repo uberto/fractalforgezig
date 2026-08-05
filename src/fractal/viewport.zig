@@ -160,9 +160,12 @@ pub const SquareView = struct {
     /// image rect, or `null` when the pixel is on a letterbox bar (or the rect is
     /// degenerate, e.g. a minimized window). This is the hover-readout and gesture-anchor
     /// entry point: T6 feeds it raw mouse coordinates plus T5's image rect.
+    /// Uses the full w×h rectangle for correct re-axis mapping on non-square images.
     pub fn cursorCoord(self: SquareView, window_x: f64, window_y: f64, rect: ImageRect) ?Complex {
+        if (rect.w == 0 or rect.h == 0) return null;
         const p = rect.toImagePixel(window_x, window_y) orelse return null;
-        return self.pixelToComplex(p.x, p.y, rect.side);
+        const vp = self.rectViewport(rect.w, rect.h);
+        return vp.pixelToComplex(p.x, p.y);
     }
 
     /// Bridge to the M0/M2 `Viewport` for a square image. Precondition: `image_side > 0`.
@@ -671,9 +674,20 @@ test "cursorCoord returns the complex value under a window pixel inside the imag
     const v = SquareView.defaultView();
     const rect = ImageRect{ .x = 100, .y = 20, .w = 400, .h = 400, .side = 400 };
     const got = v.cursorCoord(150.5, 70.25, rect) orelse return error.TestUnexpectedResult;
-    const want = v.pixelToComplex(50.5, 50.25, rect.side);
-    try std.testing.expectEqual(want.re, got.re);
-    try std.testing.expectEqual(want.im, got.im);
+    // Square rect: use rectViewport as the reference (same formula cursorCoord now uses).
+    const vp = v.rectViewport(rect.w, rect.h);
+    const want = vp.pixelToComplex(50.5, 50.25);
+    try std.testing.expectApproxEqAbs(want.re, got.re, 1e-12);
+    try std.testing.expectApproxEqAbs(want.im, got.im, 1e-12);
+}
+
+test "cursorCoord rectangular image: center pixel maps to view center" {
+    const v = SquareView.defaultView();
+    // Wide image: 800×400, side=400. Center pixel = (400, 200).
+    const rect = ImageRect{ .x = 0, .y = 0, .w = 800, .h = 400, .side = 400 };
+    const got = v.cursorCoord(400.0, 200.0, rect) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(v.center_re, got.re, 1e-12);
+    try std.testing.expectApproxEqAbs(v.center_im, got.im, 1e-12);
 }
 
 test "cursorCoord returns null over the letterbox bars" {
