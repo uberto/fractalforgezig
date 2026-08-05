@@ -18,14 +18,11 @@ coords throughout (`SDL_GetWindowSize`/`event.window.data1,2`).
 
 ## Layout: single window, two fixed regions
 
-`panels.zig` — `draw(device,texture,vp,image_rect,max_iter,stats,engine,editor,view_editor,
-quit_requested)`. ImGui edge. Left child: fractal image. Right child: data panel, coord
-panel (T7), palette panel. Menu: File→Quit, Help→About. **Palette + recolor (M2)**: per
-stop `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, `igCombo_Str_arr` mode, period
-slider, interior color. Changes OR into `Edits`. `applyEdits`→setter→re-upload→log; NEVER
-re-iterates. `editor.zig` (PURE): `Editor{stops_buf,count,mode_index,period,interior}`;
-`initDefault`; `toGradient` sorts ascending; `addStop`/`removeStop`; `modeToIndex`+
-`mode_items`. `stats.zig` (PURE): `Stats{render_ms,frame_ms}`; `renderSummary`.
+`panels.zig` — `draw(device,texture,max_iter,stats,engine,editor,view_editor,…)→DrawResult{ctx_action,image_rect,needs_rerender}`.
+Left: fractal image. Right: data+coord+palette panels. Menu: File→Save…/Open…/Quit, Help→About.
+Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period slider, interior.
+`applyEdits`→setter→re-upload; NEVER re-iterates. `editor.zig` (PURE): `Editor`+`toGradient`+`addStop`/`removeStop`.
+`stats.zig` (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`; `renderSummary`.
 
 ## Bridge helpers (vendor/bridge)
 
@@ -76,7 +73,14 @@ null-terminated). `parseAndApplyCenterMag`→`?SquareView` (re/im/mag as f64,
 Errors log `.err`. `view_editor` created in `main.zig` after engine init; `syncFromView`
 called from `applyViewCoarse`, `runFullPass`, and after `handleResize`.
 
+## File dialog (M5): dialog.zig
+
+`PendingDialog{kind:Kind,path_buf,path_len}` — stack-alloc in `runLoop`, lifetime outlives callbacks.
+`showSave(window,pending)` / `showOpen(window,pending)` — no-op if `kind != .none` (one dialog at a time).
+`takePending(pending) ?PendingResult` — returns `null` on cancel or no pending result, resets to `.none`.
+C callback (`callconv(.C)`) writes path into `path_buf`; never allocates. Filter `*.fractal`.
+
 ## Testing
 
 Visual (window/layout/navigation/coord panel): manual smoke + log check. Pure (`stats.zig`,
-`editor.zig`, `fractal/refine.zig`) IS unit-tested.
+`editor.zig`, `fractal/refine.zig`) IS unit-tested. `dialog.zig` is glue; no unit tests.
