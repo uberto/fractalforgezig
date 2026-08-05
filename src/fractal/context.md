@@ -61,19 +61,17 @@ color pass (`iterbuf`→`colorpass`, baked `gradient` LUT + `mapping` → RGBA8)
   `colorInto(rgba,iter,lut:*const [1024]Rgba8,max_iter,params,interior) ColorError!void` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write else
   `BufferSizeMismatch`; sentinel→`interior`; alpha FORCED 255.
-- `engine.zig` — DECOUPLING crux + M3 state + M4 GPU routing. `Engine` owns `view: SquareView`,
-  `image_side`(S px), `policy`, DERIVED `max_iter`, `iter:[]f32`/`rgba:[]u8`, `gradient`+`lut`,
-  `params`, `interior`, read-only `iteration_passes`/`color_passes`.
-  **M4**: `use_gpu: bool` (default false), `gpu_iter_fn: ?IterFn` (null until wired by `main.zig`).
-  `IterFn = fn(view, S, max_iter, iter: []f32) anyerror!void`. `iterate()` routes to `gpu_iter_fn`
-  when `use_gpu=true` and fn≠null; falls back to CPU with `.warn` on failure or null fn.
-  `init` — does NOT iterate; counters start at 0. `deinit()` frees buffers.
-  `iterate() IterateError!void` — refreshes `max_iter`, routes CPU/GPU, recolors, logs; bumps
-  BOTH counters. THE ONLY `iteration_passes` path. Called by `setViewport`/`setPolicy`/`resize`.
-  `setGradient(g)`/`setMapping(p)`/`setInterior(c)` — ONLY color pass; `iteration_passes`
-  UNCHANGED (THE GUARANTEE). `output()`. Pure builders: `colorPassSummary`, `iteratePassSummary`,
-  `degenerateViewMessage`, `imageSideMessage`, `resizeFailureMessage`, `requestedBytes`.
+- `engine.zig` — DECOUPLING crux. `Engine` owns `view`,`image_side`,`policy`,DERIVED `max_iter`,
+  `iter:[]f32`/`rgba:[]u8`,`gradient`+`lut`,`params`,`interior`,`iteration_passes`/`color_passes`.
+  M4: `use_gpu:bool`,`gpu_iter_fn:?IterFn`; `iterate()` routes CPU/GPU, falls back on failure.
+  `init` — does NOT iterate. `setViewport`/`setPolicy`/`resize` → re-iterate (bumps BOTH counters).
+  `setGradient`/`setMapping`/`setInterior` — color pass ONLY; `iteration_passes` UNCHANGED (THE GUARANTEE).
   `EngineError{EmptyGradient,BufferSizeMismatch,DegenerateImageSide}`. `IterateError`=+`ViewportError`+`AutoIterError`.
+
+- `persist.zig` (M5) — pure JSON save/restore. No SDL/GPU. `AppState` (heap-owns `stops:[]SerialStop`+
+  `mapping_mode:[]u8`); ALWAYS call `freeState(state,alloc)`. API: `fromEngine`→`toJson(buf:[]u8)→[]u8`;
+  `fromJson(json,alloc)→AppState`; `applyToEngine` (color setters first, `setViewport` LAST).
+  `ParseError`: `InvalidJson|MissingField|InvalidField|GradientEmpty|GradientNotSorted`.
 
 ## Coordinate convention
 
