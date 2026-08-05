@@ -25,6 +25,9 @@ pub const Kind = enum { none, save, open };
 /// Stack-allocate one in `runLoop`; its lifetime must outlive all dialog callbacks.
 pub const PendingDialog = struct {
     kind: Kind = .none,
+    /// Set to true by the callback when it fires (even on cancel). Distinguishes
+    /// "waiting for callback" from "user cancelled (path_len == 0)".
+    callback_fired: bool = false,
     path_buf: [max_path_len + 1]u8 = undefined,
     path_len: usize = 0,
 };
@@ -53,9 +56,15 @@ fn dialogCallback(
     _ = filter;
     const pending: *PendingDialog = @ptrCast(@alignCast(userdata orelse return));
 
-    // filelist is null or filelist[0] is null on cancel.
-    if (filelist == null) return;
-    const first = filelist[0] orelse return;
+    // filelist is null or filelist[0] is null on cancel — still mark as fired.
+    if (filelist == null) {
+        pending.callback_fired = true;
+        return;
+    }
+    const first = filelist[0] orelse {
+        pending.callback_fired = true;
+        return;
+    };
 
     const src = std.mem.span(first);
     if (src.len > max_path_len) {
@@ -65,7 +74,7 @@ fn dialogCallback(
     @memcpy(pending.path_buf[0..copy_len], src[0..copy_len]);
     pending.path_buf[copy_len] = 0;
     pending.path_len = copy_len;
-    // kind is set by showSave/showOpen before the dialog opens; callback only fills the path.
+    pending.callback_fired = true;
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -76,6 +85,7 @@ pub fn showSave(window: *c.SDL_Window, pending: *PendingDialog) void {
     if (pending.kind != .none) return;
     pending.kind = .save;
     pending.path_len = 0;
+    pending.callback_fired = false;
     c.SDL_ShowSaveFileDialog(dialogCallback, pending, window, &fractal_filter, 1, null);
 }
 
@@ -84,16 +94,19 @@ pub fn showOpen(window: *c.SDL_Window, pending: *PendingDialog) void {
     if (pending.kind != .none) return;
     pending.kind = .open;
     pending.path_len = 0;
+    pending.callback_fired = false;
     c.SDL_ShowOpenFileDialog(dialogCallback, pending, window, &fractal_filter, 1, null, false);
 }
 
-/// Check whether a dialog completed. Returns `null` if no result is ready or the user
+/// Check whether a dialog completed. Returns `null` if no result is ready yet or the user
 /// cancelled (path_len == 0). Resets `pending` to `.none` so the next dialog can open.
 pub fn takePending(pending: *PendingDialog) ?PendingResult {
     if (pending.kind == .none) return null;
+    if (!pending.callback_fired) return null; // dialog still open
     const kind = pending.kind;
     const path_len = pending.path_len;
     pending.kind = .none;
+    pending.callback_fired = false;
     if (path_len == 0) return null; // cancelled
     return PendingResult{
         .kind = kind,

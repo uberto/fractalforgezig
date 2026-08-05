@@ -680,22 +680,22 @@ fn handleNavInput(
             var ex: f32 = 0.0;
             var ey: f32 = 0.0;
             _ = c.SDL_GetMouseState(&ex, &ey);
-            // Use toImagePixel first; if outside the rect, clamp to [0, side).
+            // Use toImagePixel first; if outside the rect, clamp to [0, w) × [0, h).
             const end_px: viewport.Pixel = rect.toImagePixel(@floatCast(ex), @floatCast(ey)) orelse blk: {
-                if (real_s == 0) break :blk nav.drag_start_px;
-                const s_f: f64 = @floatFromInt(real_s);
+                if (rect.w == 0 or rect.h == 0) break :blk nav.drag_start_px;
                 const ox: f64 = @floatFromInt(rect.x);
                 const oy: f64 = @floatFromInt(rect.y);
                 break :blk .{
-                    .x = @max(0.0, @min(s_f - 1.0, @as(f64, @floatCast(ex)) - ox)),
-                    .y = @max(0.0, @min(s_f - 1.0, @as(f64, @floatCast(ey)) - oy)),
+                    .x = @max(0.0, @min(@as(f64, @floatFromInt(rect.w)) - 1.0, @as(f64, @floatCast(ex)) - ox)),
+                    .y = @max(0.0, @min(@as(f64, @floatFromInt(rect.h)) - 1.0, @as(f64, @floatCast(ey)) - oy)),
                 };
             };
             const new_view = navigate.boxSelect(
                 engine.view,
                 nav.drag_start_px,
                 end_px,
-                real_s,
+                rect.w,
+                rect.h,
             ) catch |err| blk: {
                 app_log.warn("box-select rejected ({s})", .{@errorName(err)});
                 break :blk null;

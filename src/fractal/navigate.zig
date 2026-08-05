@@ -79,17 +79,18 @@ pub fn panByPixels(v: SquareView, dpx: f64, dpy: f64, image_side: u32) ViewportE
 }
 
 /// The view a rubber-band selection commits to: map the drag's two corner PIXELS (any two
-/// opposite corners, in any order, on a square image of side `image_side` px) through T1's
-/// mapping and snap the result to the square that CONTAINS them — `fromCorners` grows the
-/// shorter axis only, so the selection is never cropped and never distorted (plan A1).
-/// A drag along a single axis is still usable (the other axis supplies the side); only a
-/// genuinely zero-area selection (a click with no drag) is a `DegenerateRegion`, as is a
-/// non-finite corner or `image_side == 0`.
-pub fn boxSelect(v: SquareView, a: Pixel, b: Pixel, image_side: u32) ViewportError!SquareView {
-    if (image_side == 0) return ViewportError.DegenerateRegion;
+/// opposite corners, in any order, on an image of `image_w × image_h` px) through the
+/// rectangular mapping (`rectViewport`) and snap the result to the square that CONTAINS
+/// them — `fromCorners` grows the shorter axis only, so the selection is never cropped and
+/// never distorted (plan A1). A drag along a single axis is still usable (the other axis
+/// supplies the side); only a genuinely zero-area selection (a click with no drag) is a
+/// `DegenerateRegion`, as is a non-finite corner or zero dimensions.
+pub fn boxSelect(v: SquareView, a: Pixel, b: Pixel, image_w: u32, image_h: u32) ViewportError!SquareView {
+    if (image_w == 0 or image_h == 0) return ViewportError.DegenerateRegion;
+    const vp = v.rectViewport(image_w, image_h);
     return SquareView.fromCorners(
-        v.pixelToComplex(a.x, a.y, image_side),
-        v.pixelToComplex(b.x, b.y, image_side),
+        vp.pixelToComplex(a.x, a.y),
+        vp.pixelToComplex(b.x, b.y),
     );
 }
 
@@ -358,7 +359,7 @@ const deep_drag_b = Pixel{ .x = 200.0, .y = 180.0 };
 
 test "boxSelect maps the drag through the given view at the given image side" {
     const v = try SquareView.fromCenterSide(deep_center, deep_side);
-    const selected = try boxSelect(v, deep_drag_a, deep_drag_b, deep_image_side);
+    const selected = try boxSelect(v, deep_drag_a, deep_drag_b, deep_image_side, deep_image_side);
     // Mapping through the default view instead would give side ≈ 2.1875 (3500× too wide);
     // mapping at 512 instead of 256 would halve every number here.
     try std.testing.expectEqual(@as(f64, -0.74303125), selected.center_re);
@@ -374,19 +375,19 @@ const drag_a = Pixel{ .x = 100.0, .y = 150.0 };
 const drag_b = Pixel{ .x = 400.0, .y = 250.0 };
 
 test "boxSelect snaps a non-square selection to a square sized by its longer axis" {
-    const selected = try boxSelect(SquareView.defaultView(), drag_a, drag_b, test_side);
+    const selected = try boxSelect(SquareView.defaultView(), drag_a, drag_b, test_side, test_side);
     try std.testing.expectEqual(@as(f64, 2.05078125), selected.side);
 }
 
 test "boxSelect centers the new view on the selection midpoint" {
-    const selected = try boxSelect(SquareView.defaultView(), drag_a, drag_b, test_side);
+    const selected = try boxSelect(SquareView.defaultView(), drag_a, drag_b, test_side, test_side);
     try std.testing.expectEqual(@as(f64, -0.791015625), selected.center_re);
     try std.testing.expectEqual(@as(f64, 0.3828125), selected.center_im);
 }
 
 test "boxSelect contains the selection, expanding only the shorter axis" {
     const v = SquareView.defaultView();
-    const selected = try boxSelect(v, drag_a, drag_b, test_side);
+    const selected = try boxSelect(v, drag_a, drag_b, test_side, test_side);
     const c = selected.corners();
     const top_left = v.pixelToComplex(drag_a.x, drag_a.y, test_side);
     const bottom_right = v.pixelToComplex(drag_b.x, drag_b.y, test_side);
@@ -408,14 +409,14 @@ const tall_drag_a = Pixel{ .x = 200.0, .y = 100.0 };
 const tall_drag_b = Pixel{ .x = 300.0, .y = 400.0 };
 
 test "boxSelect sizes a taller-than-wide selection from its vertical axis" {
-    const selected = try boxSelect(SquareView.defaultView(), tall_drag_a, tall_drag_b, test_side);
+    const selected = try boxSelect(SquareView.defaultView(), tall_drag_a, tall_drag_b, test_side, test_side);
     // The 300 px height, not the 100 px width (which would give 0.68359375).
     try std.testing.expectEqual(@as(f64, 2.05078125), selected.side);
 }
 
 test "boxSelect contains a taller-than-wide selection, expanding only the horizontal axis" {
     const v = SquareView.defaultView();
-    const selected = try boxSelect(v, tall_drag_a, tall_drag_b, test_side);
+    const selected = try boxSelect(v, tall_drag_a, tall_drag_b, test_side, test_side);
     const c = selected.corners();
     const top_left = v.pixelToComplex(tall_drag_a.x, tall_drag_a.y, test_side);
     const bottom_right = v.pixelToComplex(tall_drag_b.x, tall_drag_b.y, test_side);
@@ -430,8 +431,8 @@ test "boxSelect contains a taller-than-wide selection, expanding only the horizo
 test "boxSelect accepts the drag corners in either order" {
     const v = SquareView.defaultView();
     try std.testing.expectEqual(
-        try boxSelect(v, drag_a, drag_b, test_side),
-        try boxSelect(v, drag_b, drag_a, test_side),
+        try boxSelect(v, drag_a, drag_b, test_side, test_side),
+        try boxSelect(v, drag_b, drag_a, test_side, test_side),
     );
 }
 
@@ -439,7 +440,7 @@ test "boxSelect rejects a zero-area selection from a click without a drag" {
     const p = Pixel{ .x = 256.0, .y = 256.0 };
     try std.testing.expectError(
         ViewportError.DegenerateRegion,
-        boxSelect(SquareView.defaultView(), p, p, test_side),
+        boxSelect(SquareView.defaultView(), p, p, test_side, test_side),
     );
 }
 
@@ -450,14 +451,19 @@ test "boxSelect keeps a zero-height drag usable by sizing it on the horizontal a
         .{ .x = 100.0, .y = 200.0 },
         .{ .x = 228.0, .y = 200.0 },
         test_side,
+        test_side,
     );
     try std.testing.expectEqual(@as(f64, 0.875), selected.side);
 }
 
-test "boxSelect rejects a zero image side instead of asserting" {
+test "boxSelect rejects zero image dimensions instead of asserting" {
     try std.testing.expectError(
         ViewportError.DegenerateRegion,
-        boxSelect(SquareView.defaultView(), drag_a, drag_b, 0),
+        boxSelect(SquareView.defaultView(), drag_a, drag_b, 0, test_side),
+    );
+    try std.testing.expectError(
+        ViewportError.DegenerateRegion,
+        boxSelect(SquareView.defaultView(), drag_a, drag_b, test_side, 0),
     );
 }
 
@@ -465,8 +471,8 @@ test "boxSelect rejects a non-finite pixel corner" {
     const v = SquareView.defaultView();
     const nan_corner = Pixel{ .x = std.math.nan(f64), .y = 10.0 };
     const inf_corner = Pixel{ .x = 10.0, .y = std.math.inf(f64) };
-    try std.testing.expectError(ViewportError.DegenerateRegion, boxSelect(v, nan_corner, drag_b, test_side));
-    try std.testing.expectError(ViewportError.DegenerateRegion, boxSelect(v, drag_a, inf_corner, test_side));
+    try std.testing.expectError(ViewportError.DegenerateRegion, boxSelect(v, nan_corner, drag_b, test_side, test_side));
+    try std.testing.expectError(ViewportError.DegenerateRegion, boxSelect(v, drag_a, inf_corner, test_side, test_side));
 }
 
 test "reset returns the default view" {
