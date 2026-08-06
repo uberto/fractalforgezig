@@ -356,68 +356,72 @@ fn runLoop(
 
         // ── SDL event pump — wait for the first event then drain the queue.
         // WaitEvent blocks until at least one event arrives, keeping CPU idle.
+        // When a dialog is pending we use a short timeout so the Cocoa runloop
+        // keeps pumping and can deliver the file-dialog completion callback.
         var event: c.SDL_Event = undefined;
-        _ = c.SDL_WaitEvent(&event);
-        while (true) {
-            _ = ui.processEvent(&event);
-            switch (event.type) {
-                c.SDL_EVENT_QUIT => running = false,
-                c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
-                    if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
-                },
-                // T5: resize recomputes S, engine buffers, and GPU texture.
-                // After a resize, real_s follows the new S (it is already full-res).
-                c.SDL_EVENT_WINDOW_RESIZED => {
-                    handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
-                    real_w = engine.image_w;
-                    real_h = engine.image_h;
-                    real_s = engine.image_side;
-                    nav.full_pass_done = true;
-                    view_editor.syncFromView(engine.view);
-                },
-                // Scroll-zoom: zoom toward the cursor point (plan A4).
-                c.SDL_EVENT_MOUSE_WHEEL => {
-                    if (event.wheel.y != 0.0) {
-                        var mx: f32 = 0.0;
-                        var my: f32 = 0.0;
-                        _ = c.SDL_GetMouseState(&mx, &my);
-                        const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
-                        if (cursor) |pt| {
-                            const factor = if (event.wheel.y > 0.0)
-                                navigate.zoom_step_in
-                            else
-                                navigate.zoom_step_out;
-                            const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
-                            if (new_view) |v|
-                                applyViewCoarse(engine, &nav, v, real_s, view_editor);
+        const wait_ms: i32 = if (pending_dialog.kind != dialog.Kind.none) 16 else -1;
+        if (c.SDL_WaitEventTimeout(&event, wait_ms)) {
+            while (true) {
+                _ = ui.processEvent(&event);
+                switch (event.type) {
+                    c.SDL_EVENT_QUIT => running = false,
+                    c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
+                        if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
+                    },
+                    // T5: resize recomputes S, engine buffers, and GPU texture.
+                    // After a resize, real_s follows the new S (it is already full-res).
+                    c.SDL_EVENT_WINDOW_RESIZED => {
+                        handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
+                        real_w = engine.image_w;
+                        real_h = engine.image_h;
+                        real_s = engine.image_side;
+                        nav.full_pass_done = true;
+                        view_editor.syncFromView(engine.view);
+                    },
+                    // Scroll-zoom: zoom toward the cursor point (plan A4).
+                    c.SDL_EVENT_MOUSE_WHEEL => {
+                        if (event.wheel.y != 0.0) {
+                            var mx: f32 = 0.0;
+                            var my: f32 = 0.0;
+                            _ = c.SDL_GetMouseState(&mx, &my);
+                            const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
+                            if (cursor) |pt| {
+                                const factor = if (event.wheel.y > 0.0)
+                                    navigate.zoom_step_in
+                                else
+                                    navigate.zoom_step_out;
+                                const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
+                                if (new_view) |v|
+                                    applyViewCoarse(engine, &nav, v, real_s, view_editor);
+                            }
                         }
-                    }
-                },
-                // Right mouse button down: stash the cursor point for the context menu.
-                c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
-                    if (event.button.button == c.SDL_BUTTON_RIGHT) {
-                        const cursor = engine.view.cursorCoord(@floatCast(event.button.x), @floatCast(event.button.y), image_rect.*);
-                        if (cursor) |pt| {
-                            nav.right_click_pt = pt;
-                            nav.open_ctx_menu = true;
+                    },
+                    // Right mouse button down: stash the cursor point for the context menu.
+                    c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                        if (event.button.button == c.SDL_BUTTON_RIGHT) {
+                            const cursor = engine.view.cursorCoord(@floatCast(event.button.x), @floatCast(event.button.y), image_rect.*);
+                            if (cursor) |pt| {
+                                nav.right_click_pt = pt;
+                                nav.open_ctx_menu = true;
+                            }
                         }
-                    }
-                },
-                // Ctrl+Z = undo, Ctrl+Y = redo.
-                c.SDL_EVENT_KEY_DOWN => {
-                    const mods = c.SDL_GetModState();
-                    const ctrl = (mods & c.SDL_KMOD_CTRL) != 0;
-                    if (ctrl) {
-                        if (event.key.scancode == c.SDL_SCANCODE_Z) {
-                            historyUndo(engine, &nav, view_editor);
-                        } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
-                            historyRedo(engine, &nav, view_editor);
+                    },
+                    // Ctrl+Z = undo, Ctrl+Y = redo.
+                    c.SDL_EVENT_KEY_DOWN => {
+                        const mods = c.SDL_GetModState();
+                        const ctrl = (mods & c.SDL_KMOD_CTRL) != 0;
+                        if (ctrl) {
+                            if (event.key.scancode == c.SDL_SCANCODE_Z) {
+                                historyUndo(engine, &nav, view_editor);
+                            } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
+                                historyRedo(engine, &nav, view_editor);
+                            }
                         }
-                    }
-                },
-                else => {},
+                    },
+                    else => {},
+                }
+                if (!c.SDL_PollEvent(&event)) break;
             }
-            if (!c.SDL_PollEvent(&event)) break;
         }
 
         // ── ImGui frame ───────────────────────────────────────────────────────
