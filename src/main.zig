@@ -29,16 +29,19 @@ const app_log = std.log.scoped(.app);
 /// Module-level compute pipeline so the IterFn (which has no closure) can reach it.
 var g_compute_pipeline: ?compute_mod.ComputePipeline = null;
 
-/// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled.
+/// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled. One BAND per call
+/// (`engine.IterFn`), so a GPU render is chunked across frames like the CPU one.
 fn gpuIterFn(
     view: viewport.SquareView,
     w: u32,
     h: u32,
     max_iter: u32,
-    iter: []f32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
 ) anyerror!void {
     const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
-    try compute_mod.gpuIterate(pl, view, w, h, max_iter, iter);
+    try compute_mod.gpuIterateRows(pl, view, w, h, max_iter, y0, rows, iter_band);
 }
 
 const window_title = "fractalforge";

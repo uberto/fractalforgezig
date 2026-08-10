@@ -13,8 +13,8 @@ native macOS window with a Dear ImGui shell. This folder holds all first-party Z
   runs the event loop (render one ImGui window per frame), tears down cleanly. Keep it thin:
   wire modules together, push logic into pure modules. The loop NEVER blocks on a full-res
   render: an input change shows a blocky coarse preview, then `engine.stepPass()` refines it one
-  ~12 ms chunk per frame while the status bar shows a progress bar and the edit panels are
-  disabled. See `ui/context.md` for the helper set.
+  self-timed row band per frame (~0.5 s of work each, CPU or GPU) while the status bar shows a
+  progress bar and the edit panels are disabled. See `ui/context.md` for the helper set.
 - `root.zig` — library/test root. `zig build test` compiles this file. Its top-level
   `test { ... }` block aggregates PURE submodule tests via `_ = @import("...");` (never C
   edges). Also hosts small pure helpers (e.g. `startupLine`).

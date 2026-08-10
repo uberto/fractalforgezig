@@ -85,21 +85,41 @@ pub fn iterateRowsInto(buf: []f32, vp: Viewport, max_iter: u32, y0: u32, rows: u
     const end = @as(u64, y0) + @as(u64, rows);
     if (end > @as(u64, vp.height)) return IterError.RowRangeOutOfBounds;
 
-    var y: u32 = y0;
-    while (y < y0 + rows) : (y += 1) {
+    const start = @as(usize, y0) * @as(usize, vp.width);
+    const len = @as(usize, rows) * @as(usize, vp.width);
+    return iterateBandInto(buf[start..][0..len], vp, max_iter, y0, rows);
+}
+
+/// Iterate image rows `y0 .. y0 + rows` of `vp` into a BAND-LOCAL buffer: `band.len` is
+/// `rows * width` and row `y0` lands at index 0. This is the same contract the GPU backend
+/// implements (`gpu/compute.zig`'s `gpuIterateRows` writes a band-local download), so an
+/// `engine.IterFn` can be satisfied by either side without the caller reshuffling indices.
+///
+/// PURE and deterministic. A `band.len` that is not `rows * width` returns
+/// `IterError.BufferSizeMismatch`, and a band running past the last row
+/// `IterError.RowRangeOutOfBounds` — rejected, never clamped, so a scheduler bug fails
+/// loudly. `rows == 0` is a legal no-op.
+pub fn iterateBandInto(band: []f32, vp: Viewport, max_iter: u32, y0: u32, rows: u32) IterError!void {
+    if (band.len != @as(usize, rows) * @as(usize, vp.width)) return IterError.BufferSizeMismatch;
+    const end = @as(u64, y0) + @as(u64, rows);
+    if (end > @as(u64, vp.height)) return IterError.RowRangeOutOfBounds;
+
+    var y: u32 = 0;
+    while (y < rows) : (y += 1) {
         var x: u32 = 0;
         while (x < vp.width) : (x += 1) {
-            // Sample the pixel CENTER (see the file header on the +0.5 convention).
+            // Sample the pixel CENTER (see the file header on the +0.5 convention). The row is
+            // the GLOBAL one (`y0 + y`): the mapping is anchored on the image, not the band.
             const px = @as(f64, @floatFromInt(x)) + 0.5;
-            const py = @as(f64, @floatFromInt(y)) + 0.5;
+            const py = @as(f64, @floatFromInt(y0 + y)) + 0.5;
             const c = vp.pixelToComplex(px, py);
             const smooth = mandelbrot.iterate(c.re, c.im, max_iter);
 
             const idx = @as(usize, y) * @as(usize, vp.width) + @as(usize, x);
-            // Per-pixel bounds guard (habit for M1's tiled writes). `expected ==
-            // buf.len` already guarantees this holds for every in-range pixel.
-            std.debug.assert(idx < buf.len);
-            buf[idx] = smooth;
+            // Per-pixel bounds guard (habit for M1's tiled writes). The length check above
+            // already guarantees this holds for every in-range pixel.
+            std.debug.assert(idx < band.len);
+            band[idx] = smooth;
         }
     }
 }
@@ -262,6 +282,40 @@ test "iterateRowsInto with zero rows is a no-op" {
     @memset(&buf, 0.0);
     try iterateRowsInto(&buf, vp, golden_iter, 5, 0);
     try std.testing.expectEqual(@as(f32, 0.0), valueAt(&buf, golden_w, 0, 5));
+}
+
+test "iterateBandInto fills a band-local buffer with the SAME values as the full-buffer band" {
+    // The GPU backend downloads band-local (`gpu/compute.zig`), the CPU pass writes into the
+    // full buffer; both go through this function, so the two must be scalar-identical.
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    const y0: u32 = 9;
+    const rows: u32 = 4;
+
+    var whole: [golden_w * golden_h]f32 = undefined;
+    try iterateRowsInto(&whole, vp, golden_iter, y0, rows);
+
+    var band: [golden_w * 4]f32 = undefined;
+    try iterateBandInto(&band, vp, golden_iter, y0, rows);
+
+    try std.testing.expectEqualSlices(f32, whole[y0 * golden_w ..][0 .. rows * golden_w], &band);
+}
+
+test "iterateBandInto rejects a band buffer that is not rows*width" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var band: [golden_w * 2 + 1]f32 = undefined;
+    try std.testing.expectError(
+        IterError.BufferSizeMismatch,
+        iterateBandInto(&band, vp, golden_iter, 0, 2),
+    );
+}
+
+test "iterateBandInto rejects a band that runs past the last row" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var band: [golden_w * 3]f32 = undefined;
+    try std.testing.expectError(
+        IterError.RowRangeOutOfBounds,
+        iterateBandInto(&band, vp, golden_iter, golden_h - 2, 3),
+    );
 }
 
 test "iterate wrapper allocates the buffer and populates a non-zero elapsed_ns" {

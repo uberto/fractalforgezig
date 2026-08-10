@@ -34,6 +34,7 @@ fn closeHeadlessDevice(device: *c.SDL_GPUDevice) void {
 // ─── Compute pipeline smoke tests ────────────────────────────────────────────
 
 const compute = @import("gpu/compute.zig");
+const viewport = @import("fractal/viewport.zig");
 
 test "compute: pipeline creates successfully with embedded MSL source" {
     const device = try openHeadlessDevice();
@@ -99,6 +100,7 @@ test "compute: dispatch at S=4 produces 16 finite results" {
         .width = 4,
         .height = 4,
         .max_iter = 64,
+        .band_rows = 4,
     };
 
     var iter_out: [4 * 4]f32 = undefined;
@@ -107,4 +109,57 @@ test "compute: dispatch at S=4 produces 16 finite results" {
     for (iter_out) |v| {
         try std.testing.expect(std.math.isFinite(v));
     }
+}
+
+test "compute: a band dispatch equals those rows of the whole-image dispatch" {
+    // The band's whole reason to exist is progressive GPU rendering, so the claim that matters
+    // is that splitting an image into bands changes NOTHING about the values — if `row_offset`
+    // were dropped from the complex mapping, the band would render the top of the image.
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const S: u32 = 16;
+    const max_iter: u32 = 128;
+    // Off-center and non-square so a row mix-up cannot coincidentally still match.
+    const view = try viewport.SquareView.fromCenterSide(.{ .re = -0.4, .im = 0.35 }, 1.25);
+    const w: u32 = S;
+    const h: u32 = S / 2;
+
+    var whole: [S * (S / 2)]f32 = undefined;
+    try compute.gpuIterate(pipeline, view, w, h, max_iter, &whole);
+
+    // Same image, computed as three uneven bands.
+    var banded: [S * (S / 2)]f32 = undefined;
+    const bands = [_][2]u32{ .{ 0, 3 }, .{ 3, 1 }, .{ 4, h - 4 } };
+    for (bands) |b| {
+        const start: usize = @as(usize, b[0]) * @as(usize, w);
+        const len: usize = @as(usize, b[1]) * @as(usize, w);
+        try compute.gpuIterateRows(pipeline, view, w, h, max_iter, b[0], b[1], banded[start..][0..len]);
+    }
+
+    try std.testing.expectEqualSlices(f32, &whole, &banded);
+}
+
+test "compute: a band that runs past the last row is rejected, not clamped" {
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    var band: [4 * 2]f32 = undefined;
+    const uniforms = compute.MandelbrotUniforms{
+        .center_re = -0.75,
+        .center_im = 0.0,
+        .scale = @floatCast(3.5 / 4.0),
+        .width = 4,
+        .height = 4,
+        .max_iter = 16,
+        .row_offset = 3, // 3 + 2 > 4
+        .band_rows = 2,
+    };
+    try std.testing.expectError(compute.Error.BandOutOfBounds, compute.dispatch(pipeline, uniforms, &band));
 }

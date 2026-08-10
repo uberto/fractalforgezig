@@ -7,10 +7,18 @@
 //   uint   width      — image width in pixels
 //   uint   height     — image height in pixels
 //   uint   max_iter   — maximum iteration count before declaring interior
+//   uint   row_offset  — global image row this band starts at
+//   uint   band_rows   — rows in this band (band_rows == height ⇒ whole image)
+//
+// BANDS: one dispatch covers `band_rows` rows starting at `row_offset`, and `iter_out` holds
+// ONLY those rows (band-local indices). `height` stays the FULL image height because the
+// complex mapping is anchored on the image center, not the band's. This is what lets a
+// high max_iter be split across frames instead of one multi-second dispatch the GPU
+// watchdog would abort.
 //
 // Pixel-to-complex mapping (matches viewport.zig rectViewport / pixelToComplex):
 //   re = center_re + (col + 0.5 - width  / 2.0) * scale
-//   im = center_im + (height / 2.0 - row - 0.5) * scale   // y-axis inverted
+//   im = center_im + (height / 2.0 - row - 0.5) * scale   // y-axis inverted, GLOBAL row
 //
 // SDL_GPU MSL buffer slot order: uniforms first (buffer(0)), readwrite last (buffer(1)).
 
@@ -24,6 +32,8 @@ struct MandelbrotUniforms {
     uint  width;
     uint  height;
     uint  max_iter;
+    uint  row_offset;
+    uint  band_rows;
 };
 
 kernel void mandelbrot_iterate(
@@ -31,11 +41,11 @@ kernel void mandelbrot_iterate(
     device float*                 iter_out [[ buffer(1) ]],
     uint                          gid      [[ thread_position_in_grid ]]
 ) {
-    uint total = u.width * u.height;
+    uint total = u.width * u.band_rows;
     if (gid >= total) return;
 
     uint col = gid % u.width;
-    uint row = gid / u.width;
+    uint row = gid / u.width + u.row_offset;  // GLOBAL row: the mapping is image-anchored
 
     float w_half = float(u.width)  * 0.5f;
     float h_half = float(u.height) * 0.5f;

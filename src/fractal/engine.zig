@@ -101,16 +101,26 @@ pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoI
 /// (`init`, `resize`) can return.
 pub const ResizeError = IterateError || std.mem.Allocator.Error;
 
-/// Function signature for the iteration backend (CPU or GPU).
-/// GPU path: `compute.gpuIterate` wrapped in a thin free function in `main.zig`.
-/// CPU path: the built-in `iterbuf.iterateInto` adapter.
+/// Function signature for the iteration backend (CPU or GPU). It iterates ONE ROW BAND:
+/// rows `y0 .. y0+rows` of an `image_w x image_h` image, writing `iter_band` — the band
+/// ALONE, exactly `rows * image_w` values from index 0. The whole image is the band
+/// `(0, image_h)`.
+///
+/// The band is what lets the progressive pass chunk the GPU the same way it chunks the CPU;
+/// a whole-image-only backend would either freeze the frame or, at a high `max_iter`, run
+/// long enough for the GPU's command-buffer watchdog to abort it.
+///
+/// GPU path: `compute.gpuIterateRows` wrapped in a thin free function in `main.zig`.
+/// CPU path: the built-in `iterbuf.iterateRowsInto` adapter.
 /// `anyerror` so GPU errors (SDL failures) propagate without widening IterateError.
 pub const IterFn = *const fn (
     view: SquareView,
     image_w: u32,
     image_h: u32,
     max_iter: u32,
-    iter: []f32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
 ) anyerror!void;
 
 /// The persistent render state + decoupling counters. The app allocates one via `init`,
@@ -256,7 +266,7 @@ pub const Engine = struct {
         const vp = self.renderViewport();
         if (self.use_gpu) {
             if (self.gpu_iter_fn) |iter_fn| {
-                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, self.iter) catch |err| {
+                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter) catch |err| {
                     log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
                     try iterbuf.iterateInto(self.iter, vp, self.max_iter);
                 };
@@ -418,8 +428,8 @@ pub const Engine = struct {
     /// Run ONE time-budgeted chunk of the in-flight pass and return whether the pass is now
     /// complete (`true` also when no pass is in flight, i.e. the image is already final).
     /// Measures the chunk's wall-clock cost and re-times the next one through
-    /// `progressive.Pass.advance`, so a chunk costs ~`progressive.target_chunk_ns` whatever
-    /// the view, `max_iter` or machine. The clock affects only the CHUNK SIZE, never the
+    /// `progressive.Pass.advance`, so a chunk costs ~`progressive.target_chunk_ns` (500 ms)
+    /// whatever the view, `max_iter` or machine. The clock affects only the CHUNK SIZE, never the
     /// values — `stepPassRows` is the deterministic path the tests drive.
     pub fn stepPass(self: *Engine) IterateError!bool {
         const p = self.pass orelse return true;
@@ -436,30 +446,39 @@ pub const Engine = struct {
     /// by one each, clears `pass`, and logs the same one-line summary as `iterate`.
     /// Deterministic (no clock): `stepPass` is the timed wrapper.
     ///
-    /// GPU mode is whole-image by nature (one compute dispatch cannot be split by row here),
-    /// so when `use_gpu` is set and a `gpu_iter_fn` is wired the first chunk runs the ENTIRE
-    /// image and completes the pass — GPU passes are fast enough not to need chunking.
+    /// GPU and CPU take the SAME shape here — one band per chunk. A GPU dispatch is per-band
+    /// too (`IterFn` takes `y0`/`rows`), so a pinned `max_iter` in the millions progresses a
+    /// band at a time instead of one dispatch long enough for the GPU watchdog to abort. A
+    /// failed GPU band falls back to the CPU for THAT BAND only, so the fallback costs one
+    /// chunk, not a whole frozen image.
     pub fn stepPassRows(self: *Engine, rows: u32) IterateError!bool {
         var p = self.pass orelse return true;
         try validateGeometry(self.view, self.image_side);
         const vp = self.renderViewport();
 
+        const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
+        const y0 = p.rows_done;
+        var done_on_gpu = false;
         if (self.use_gpu) {
             if (self.gpu_iter_fn) |iter_fn| {
-                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, self.iter) catch |err| {
-                    log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
-                    try iterbuf.iterateInto(self.iter, vp, self.max_iter);
-                };
-                try self.recolorRows(0, self.image_h);
-                p.rows_done = p.rows_total;
-                self.pass = p;
-                return self.finishPass();
+                const band_start: usize = @as(usize, y0) * @as(usize, self.image_w);
+                const band_len: usize = @as(usize, chunk) * @as(usize, self.image_w);
+                if (band_start + band_len <= self.iter.len) {
+                    const band = self.iter[band_start..][0..band_len];
+                    if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band)) |_| {
+                        done_on_gpu = true;
+                    } else |err| {
+                        log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
+                            @errorName(err),
+                            y0,
+                            y0 + chunk,
+                        });
+                    }
+                }
             }
         }
-
-        const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
-        try iterbuf.iterateRowsInto(self.iter, vp, self.max_iter, p.rows_done, chunk);
-        try self.recolorRows(p.rows_done, chunk);
+        if (!done_on_gpu) try iterbuf.iterateRowsInto(self.iter, vp, self.max_iter, y0, chunk);
+        try self.recolorRows(y0, chunk);
         p.rows_done += chunk;
         self.pass = p;
         return self.finishPass();
@@ -831,6 +850,14 @@ fn zoomedView() viewport.ViewportError!SquareView {
 /// An engine on the golden view at the golden side with the default (auto) policy.
 fn testEngine() !Engine {
     return Engine.init(testing.allocator, testView(), golden_side, .{});
+}
+
+/// A CPU-backed `IterFn` for the GPU-path tests: iterates the requested band into the
+/// BAND-LOCAL buffer, which is exactly what `gpu/compute.zig`'s `gpuIterateRows` does. It
+/// calls `iterbuf.iterateBandInto` rather than re-deriving the mapping, so these tests cannot
+/// pass against a stub that disagrees with the real backends.
+fn bandStub(view: SquareView, w: u32, h: u32, max_iter: u32, y0: u32, rows: u32, band: []f32) anyerror!void {
+    try iterbuf.iterateBandInto(band, view.rectViewport(w, h), max_iter, y0, rows);
 }
 
 fn pixelAt(rgba: []const u8, x: usize, y: usize) Rgba8 {
@@ -1717,9 +1744,11 @@ test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increm
             w: u32,
             h: u32,
             max_iter: u32,
-            iter: []f32,
+            y0: u32,
+            rows: u32,
+            band: []f32,
         ) anyerror!void {
-            try iterbuf.iterateInto(iter, view.rectViewport(w, h), max_iter);
+            try bandStub(view, w, h, max_iter, y0, rows, band);
         }
     }.call;
 
@@ -1735,8 +1764,8 @@ test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increm
 
 test "THE GUARANTEE holds with GPU path: setGradient after GPU iterate does not re-iterate" {
     const stub = struct {
-        fn call(view: SquareView, w: u32, h: u32, max_iter: u32, iter: []f32) anyerror!void {
-            try iterbuf.iterateInto(iter, view.rectViewport(w, h), max_iter);
+        fn call(view: SquareView, w: u32, h: u32, max_iter: u32, y0: u32, rows: u32, band: []f32) anyerror!void {
+            try bandStub(view, w, h, max_iter, y0, rows, band);
         }
     }.call;
 

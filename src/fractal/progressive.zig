@@ -27,13 +27,20 @@ pub const UpsampleError = error{
     DegenerateSize,
 };
 
-/// Wall-clock cost one chunk should aim for. 12 ms leaves room in a 16.7 ms frame for the
-/// ImGui build + the GPU submit, so the window keeps repainting (and the progress bar keeps
-/// moving) while the pass runs.
-pub const target_chunk_ns: u64 = 12_000_000;
+/// Wall-clock cost one chunk should aim for — the repaint interval DURING a render, and also
+/// the worst-case input lag (an event is handled between chunks, not inside one).
+///
+/// 500 ms, not one display frame: this is a fractal renderer, not a game. A ~2 fps progress
+/// bar reads as "working" perfectly well, and a chunk two orders of magnitude longer than a
+/// frame amortises the per-chunk overhead — the recolor of the band, and on the GPU path a
+/// whole dispatch + download per chunk — over far more useful work. The adaptive sizing can
+/// overshoot when a band turns out costlier than the one it was timed from, capped at 4×
+/// growth, so the practical worst case is a second or two.
+pub const target_chunk_ns: u64 = 500_000_000;
 
 /// Rows in the FIRST chunk of a pass, before any measurement exists. Deliberately small: an
-/// over-long first chunk is a visible stall, whereas a too-short one only costs one frame.
+/// over-long first chunk is a visible stall, whereas a too-short one only costs one frame —
+/// and the ramp (≤4× per chunk) reaches the budget in a handful of cheap chunks.
 pub const initial_chunk_rows: u32 = 4;
 
 /// Upper bound on a chunk, so a very cheap view (deep interior, low `max_iter`) cannot ramp
@@ -84,8 +91,8 @@ pub const Pass = struct {
 /// row count so the next chunk lands on `target_ns`. Guards, in order:
 ///   * `rows == 0` (nothing measured) → start over at `initial_chunk_rows`.
 ///   * `elapsed_ns == 0` (too fast for the timer's resolution) → grow by the 4× cap.
-///   * growth is capped at 4× per chunk so one suspiciously fast chunk (an all-interior
-///     band) cannot produce a chunk that stalls the next frame.
+///   * growth is capped at 4× per chunk so one suspiciously fast chunk (an all-exterior band
+///     that escapes immediately) cannot produce a chunk that overruns the budget 100×.
 ///   * the result is clamped to `1 .. max_chunk_rows`, so a pass always makes progress.
 pub fn adaptChunkRows(rows: u32, elapsed_ns: u64, target_ns: u64) u32 {
     if (rows == 0) return initial_chunk_rows;

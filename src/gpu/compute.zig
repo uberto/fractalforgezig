@@ -8,9 +8,17 @@
 //! DATA FLOW: uniforms → GPU compute → f32 storage buffer → download → iter []f32.
 //! The iter buffer is then handed to the existing CPU colorpass unchanged.
 //!
+//! BANDS: a dispatch covers a horizontal BAND of the image (`row_offset`, `band_rows`), so the
+//! progressive pass can split a render across frames on the GPU exactly as it does on the CPU.
+//! A whole-image dispatch is just the band `(0, height)`. This matters at a high `max_iter`:
+//! one dispatch over the full image can run for seconds and be aborted by the GPU's
+//! command-buffer watchdog, which would then drop the whole render onto the CPU inside a
+//! single frame.
+//!
 //! On any SDL failure every function logs `std.log.err` (scope `.gpu`) with the
 //! SDL error string and returns a Zig error — never `unreachable`.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const message = @import("message.zig");
 const viewport = @import("../fractal/viewport.zig");
@@ -27,8 +35,14 @@ pub const MandelbrotUniforms = extern struct {
     center_im: f32,
     scale: f32, // complex units per pixel (based on min(w,h))
     width: u32,
+    /// The FULL image height, even for a one-row band: the complex mapping is anchored on the
+    /// image center, so a band that lied about the height would render the wrong region.
     height: u32,
     max_iter: u32,
+    /// First image row this dispatch computes.
+    row_offset: u32 = 0,
+    /// Rows this dispatch computes; `iter_out` holds exactly `width * band_rows` values.
+    band_rows: u32,
 };
 
 pub const Error = error{
@@ -40,6 +54,8 @@ pub const Error = error{
     GpuFenceSubmitFailed,
     GpuFenceWaitFailed,
     IterBufferSizeMismatch,
+    /// `row_offset + band_rows` runs past `height`, so the band is not inside the image.
+    BandOutOfBounds,
 };
 
 /// A compiled Metal compute pipeline for `mandelbrot_iterate`.
@@ -82,8 +98,9 @@ pub const ComputePipeline = struct {
     }
 };
 
-/// Run the Mandelbrot compute shader for one full frame and download the results
-/// into `iter_out`. `iter_out.len` must equal `u.side * u.side`.
+/// Run the Mandelbrot compute shader for ONE BAND and download the results into `iter_out`,
+/// whose length must equal `u.width * u.band_rows` — the band only, indexed from 0. The band
+/// must lie inside the image (`row_offset + band_rows <= height`).
 ///
 /// Synchronous: when this returns (success), `iter_out` contains valid f32 iter
 /// values — negatives are interior pixels (sentinel -1.0), positives are smooth
@@ -93,11 +110,20 @@ pub fn dispatch(
     uniforms: MandelbrotUniforms,
     iter_out: []f32,
 ) Error!void {
-    const pixel_count: u32 = uniforms.width * uniforms.height;
+    if (uniforms.row_offset + uniforms.band_rows > uniforms.height) {
+        emitErr("dispatch: band rows {d}..{d} runs past the image height {d}", .{
+            uniforms.row_offset,
+            uniforms.row_offset + uniforms.band_rows,
+            uniforms.height,
+        });
+        return Error.BandOutOfBounds;
+    }
+    const pixel_count: u32 = uniforms.width * uniforms.band_rows;
     if (iter_out.len != pixel_count) {
-        log.err("dispatch: iter_out.len={d} != width*height={d}", .{ iter_out.len, pixel_count });
+        emitErr("dispatch: iter_out.len={d} != width*band_rows={d}", .{ iter_out.len, pixel_count });
         return Error.IterBufferSizeMismatch;
     }
+    if (pixel_count == 0) return; // an empty band is a no-op, not a zero-sized GPU buffer
 
     const device = pipeline.device;
     const byte_size: u32 = pixel_count * @sizeOf(f32);
@@ -209,20 +235,31 @@ pub fn dispatch(
 
     if (opt_timer) |*t| {
         const elapsed_ms = @as(f64, @floatFromInt(t.read())) / 1_000_000.0;
-        log.info("gpu iterate: {d}x{d}, max_iter={d}, {d:.2} ms", .{ uniforms.width, uniforms.height, uniforms.max_iter, elapsed_ms });
+        log.info("gpu iterate: {d}x{d} rows {d}..{d}, max_iter={d}, {d:.2} ms", .{
+            uniforms.width,
+            uniforms.height,
+            uniforms.row_offset,
+            uniforms.row_offset + uniforms.band_rows,
+            uniforms.max_iter,
+            elapsed_ms,
+        });
     }
 }
 
-/// High-level GPU iteration: convert a `SquareView` + image dimensions to uniforms,
-/// dispatch, download, and log timing. Equivalent of `iterbuf.iterateInto` on GPU.
-/// `iter.len` must equal `w * h`.
-pub fn gpuIterate(
+/// High-level GPU iteration for the ROW BAND `y0 .. y0+rows` of a `w x h` image: build the
+/// uniforms, dispatch, download, log timing. The GPU equivalent of
+/// `iterbuf.iterateRowsInto`, and like it, `iter_band` is the band ALONE — exactly `rows * w`
+/// values, written from index 0. `scale` uses `min(w, h)` (the whole image), so bands of one
+/// image always agree on the mapping.
+pub fn gpuIterateRows(
     pipeline: ComputePipeline,
     view: viewport.SquareView,
     w: u32,
     h: u32,
     max_iter: u32,
-    iter: []f32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
 ) Error!void {
     const scale = view.side / @as(f64, @floatFromInt(@min(w, h)));
     const uniforms = MandelbrotUniforms{
@@ -232,13 +269,37 @@ pub fn gpuIterate(
         .width = w,
         .height = h,
         .max_iter = max_iter,
+        .row_offset = y0,
+        .band_rows = rows,
     };
-    try dispatch(pipeline, uniforms, iter);
+    try dispatch(pipeline, uniforms, iter_band);
+}
+
+/// Whole-image GPU iteration: the band `(0, h)`. Equivalent of `iterbuf.iterateInto` on GPU.
+/// `iter.len` must equal `w * h`.
+pub fn gpuIterate(
+    pipeline: ComputePipeline,
+    view: viewport.SquareView,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    iter: []f32,
+) Error!void {
+    try gpuIterateRows(pipeline, view, w, h, max_iter, 0, h, iter);
 }
 
 fn logSdlFailure(call: []const u8) void {
     var buf: [256]u8 = undefined;
     const sdl_error = std.mem.span(c.SDL_GetError());
     const msg = message.sdlFailure(&buf, call, sdl_error) catch call;
-    log.err("{s}", .{msg});
+    emitErr("{s}", .{msg});
+}
+
+/// `std.log.err` (scope `.gpu`) in the app, a NO-OP in tests — same reason as
+/// `fractal/engine.zig`'s `emitErr`: Zig 0.15's test runner panics on any logged error, so a
+/// test that drives a rejection path (e.g. an out-of-bounds band) could never be green.
+/// The typed error is still returned and asserted; nothing observable is lost.
+fn emitErr(comptime format: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    log.err(format, args);
 }
