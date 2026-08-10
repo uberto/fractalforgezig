@@ -1168,11 +1168,15 @@ test "setPolicy re-iterates with the new effective max_iter" {
 }
 
 test "setPolicy clamps a hand-built out-of-range manual value instead of rendering it" {
-    var e = try testEngine();
+    // Deliberately a 1×1 view far OUTSIDE the set: the clamped count is 2^24, and this test
+    // asserts the count, not the pixels — every pixel here escapes on the first iteration, so
+    // the assertion stays free instead of running 16.7M iterations per pixel.
+    const escapes_at_once = try SquareView.fromCenterSide(.{ .re = 10.0, .im = 10.0 }, 1.0e-3);
+    var e = try Engine.init(testing.allocator, escapes_at_once, 1, .{});
     defer e.deinit();
     try e.iterate();
-    try e.setPolicy(.{ .auto = false, .manual_value = 1_000_000 });
-    try testing.expectEqual(autoiter.max_max_iter, e.max_iter);
+    try e.setPolicy(.{ .auto = false, .manual_value = std.math.maxInt(u32) });
+    try testing.expectEqual(autoiter.max_manual_iter, e.max_iter);
 }
 
 test "a policy the current magnification cannot satisfy leaves the previous policy in place" {
@@ -1551,13 +1555,13 @@ test "iteratePassSummary annotates a pinned max_iter as manual and gains center 
 
 test "iteratePassSummary reports the clamped effective max_iter, not a raw manual_value" {
     // Guards the one-source-of-truth premise: a line formatted from `manual_value` would
-    // advertise 5000 while the render used 4096. 5000 has the same digit count as 4096, so
-    // the claim is about the value and cannot be satisfied by a buffer-length accident.
+    // advertise 99999999 while the render used 16777216. Both have 8 digits, so the claim is
+    // about the value and cannot be satisfied by a buffer-length accident.
     var buf: [iterate_summary_buf_len]u8 = undefined;
-    const line = try iteratePassSummary(&buf, 1, testView(), golden_side, .{ .auto = false, .manual_value = 5000 });
+    const line = try iteratePassSummary(&buf, 1, testView(), golden_side, .{ .auto = false, .manual_value = 99_999_999 });
     try testing.expectEqualStrings(
         "iterate pass 1: center=-0.7500 + 0.0000i, mag=2.0203050891044214e-1, " ++
-            "max_iter=4096 (manual), S=64px",
+            "max_iter=16777216 (manual), S=64px",
         line,
     );
 }

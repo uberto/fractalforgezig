@@ -7,7 +7,7 @@
 //! THE HEURISTIC (`autoMaxIter`), spelled out because T7's tooltip and T8's docs quote it:
 //!
 //!     max_iter = clamp(base_max_iter + iter_per_doubling · log2(magnification / mag0),
-//!                      base_max_iter, max_max_iter)
+//!                      base_max_iter, auto_max_iter)
 //!
 //! where `mag0` is the DEFAULT view's magnification (read from T1's
 //! `SquareView.defaultView().magnification()`, never recomputed here) and
@@ -18,23 +18,28 @@
 //!     extra iterations. Linear-in-log2 is the standard ramp: escape-time detail near the
 //!     boundary needs roughly a constant number of extra iterations per zoom step, and a
 //!     linear-in-log law is what keeps it monotone and predictable to the user.
-//!   * `max_max_iter = 4096` bounds CPU cost (8× the M0 count; at M3's letterboxed
-//!     ~900×900 square that is ~3.3e9 worst-case iterations, the point where the
-//!     coarse→fine refine of plan A7 stops hiding the wait).
-//!   * `80` is not arbitrary: `(4096 − 512)/80 = 44.8` doublings puts the cap at side
-//!     ≈ 1.15e-13, i.e. essentially exactly `navigate.precision_floor_side` (1e-13, the
-//!     deepest zoom f64 supports). So the ramp climbs across the WHOLE usable zoom range
-//!     and the cap only bites where the image has already stopped improving. Pinned by
-//!     the tests, so changing one constant without the others breaks the build.
+//!   * `auto_max_iter = 4096` is where the AUTO ramp stops. Not a cost limit but a
+//!     usefulness limit: `80` is not arbitrary — `(4096 − 512)/80 = 44.8` doublings puts
+//!     that value at side ≈ 1.15e-13, i.e. essentially exactly
+//!     `navigate.precision_floor_side` (1e-13, the deepest zoom f64 supports). So the ramp
+//!     climbs across the WHOLE usable zoom range and only tops out where f64 has run out of
+//!     precision and the image cannot improve anyway. Pinned by the tests, so changing one
+//!     constant without the others breaks the build.
 //!
-//! Both clamps are load-bearing: zooming OUT past the home view never drops below the M0
-//! baseline, and no zoom, however deep, can ask the CPU for an unbounded iteration count.
+//! Both auto clamps are load-bearing: zooming OUT past the home view never drops below the
+//! M0 baseline, and the auto ramp can never ask for a count the zoom depth cannot use.
 //!
 //! MANUAL OVERRIDE: `IterPolicy` is plain data — `{ auto, manual_value }`. `manual(value)`
 //! is the VALIDATING constructor T7's numeric field calls: an out-of-range value comes back
 //! as `AutoIterError.MaxIterOutOfRange` (with `maxIterRangeMessage` for the wording) instead of
 //! being silently accepted. `effective()` additionally CLAMPS `manual_value`, so even a
-//! hand-built struct can never hand the engine a 1-iteration or 4-billion-iteration render.
+//! hand-built struct can never hand the engine a 1-iteration render.
+//!
+//! A pinned value is bounded SEPARATELY from the ramp, and far higher (`max_manual_iter` =
+//! 2^24): the ramp is calibrated to f64 zoom depth, but someone pinning the count by hand is
+//! doing something the ramp does not model — hunting boundary filaments that need many more
+//! iterations at a magnification f64 still resolves. That is their time to spend, so the only
+//! bound left is representational (the `f32` iteration buffer), not a policy judgement.
 //!
 //! Errors are returned UNLOGGED (this tier never imports `log`, see
 //! `src/fractal/context.md`): the edge logs them, using `maxIterRangeMessage` for a rejected
@@ -50,9 +55,17 @@ const SquareView = viewport.SquareView;
 /// the auto ramp (zooming out never renders coarser than M0 did).
 pub const base_max_iter: u32 = 512;
 
-/// Hard upper bound on `max_iter` for BOTH the auto ramp and a pinned manual value — the
-/// CPU-cost bound (see the file header). Raising it makes deep zooms slower, never wrong.
-pub const max_max_iter: u32 = 4096;
+/// Where the AUTO ramp stops — the count that matches the deepest zoom f64 supports (see the
+/// file header). It bounds the ramp ONLY: a manual value may go far past it.
+pub const auto_max_iter: u32 = 4096;
+
+/// Highest value the user may pin manually: 2^24, the largest integer an `f32` represents
+/// EXACTLY. The iteration buffer is `[]f32` smooth values, so past this bound consecutive
+/// iteration counts stop being distinguishable and both the coloring and the status-bar
+/// readout would quietly lie. Not a performance bound — a pinned count in the millions is a
+/// deliberate trade of time for filament detail, and the render is progressive, so the cost
+/// shows up as a slower progress bar rather than a frozen window.
+pub const max_manual_iter: u32 = 1 << 24;
 
 /// Lowest value the user may pin manually. Below this the set is an undifferentiated blob,
 /// so a smaller number is almost certainly a typo rather than a deliberate speed trade.
@@ -76,14 +89,14 @@ pub const AutoIterError = error{
     /// positive side, but an extreme one (a subnormal side) can still overflow its
     /// magnification to infinity — hence a typed error rather than an assert.
     InvalidMagnification,
-    /// A pinned value outside `[min_manual_iter, max_max_iter]`; report it with
+    /// A pinned value outside `[min_manual_iter, max_manual_iter]`; report it with
     /// `maxIterRangeMessage`.
     MaxIterOutOfRange,
 };
 
 /// The adaptive iteration count for a view at `magnification` — the formula in the file
 /// header. Monotonically NON-DECREASING in `magnification` and clamped to
-/// `[base_max_iter, max_max_iter]` at both ends.
+/// `[base_max_iter, auto_max_iter]` at both ends.
 ///
 /// The float result is ROUNDED to nearest (not truncated) so an exact power-of-two zoom
 /// lands on the exact documented value even if `log2` is a last-ULP off; rounding is
@@ -97,7 +110,7 @@ pub fn autoMaxIter(magnification: f64) AutoIterError!u32 {
     // Negated comparison so a NaN `raw` (unreachable today, but one refactor away) falls
     // back to the baseline instead of trapping in `@intFromFloat`.
     if (!(raw > @as(f64, @floatFromInt(base_max_iter)))) return base_max_iter;
-    if (raw >= @as(f64, @floatFromInt(max_max_iter))) return max_max_iter;
+    if (raw >= @as(f64, @floatFromInt(auto_max_iter))) return auto_max_iter;
     return @intFromFloat(@round(raw));
 }
 
@@ -105,7 +118,7 @@ pub fn autoMaxIter(magnification: f64) AutoIterError!u32 {
 /// built by hand (deserialized in M5, or a struct literal) still cannot request an absurd
 /// render; T7's field should call `IterPolicy.manual` instead and surface the error.
 pub fn clampManual(value: u32) u32 {
-    return std.math.clamp(value, min_manual_iter, max_max_iter);
+    return std.math.clamp(value, min_manual_iter, max_manual_iter);
 }
 
 /// How `max_iter` is chosen: plain data (plan A6's "auto toggle + numeric field"), so T7
@@ -117,10 +130,10 @@ pub const IterPolicy = struct {
     manual_value: u32 = base_max_iter,
 
     /// A policy that pins `value`, or `MaxIterOutOfRange` when it is outside
-    /// `[min_manual_iter, max_max_iter]` (both ends inclusive). This is the entry point for
+    /// `[min_manual_iter, max_manual_iter]` (both ends inclusive). This is the entry point for
     /// user input — it is the only place that says no.
     pub fn manual(value: u32) AutoIterError!IterPolicy {
-        if (value < min_manual_iter or value > max_max_iter) return AutoIterError.MaxIterOutOfRange;
+        if (value < min_manual_iter or value > max_manual_iter) return AutoIterError.MaxIterOutOfRange;
         return .{ .auto = false, .manual_value = value };
     }
 
@@ -139,7 +152,7 @@ const range_prefix = "rejected max_iter: ";
 const range_suffix = std.fmt.comptimePrint(
     " is outside the supported range {d}..{d}; enter a value in that range or switch " ++
         "max_iter back to auto",
-    .{ min_manual_iter, max_max_iter },
+    .{ min_manual_iter, max_manual_iter },
 );
 
 /// Digits in the widest `u32` — the rejected value is whatever the user typed, not a
@@ -162,10 +175,11 @@ const summary_prefix = "max_iter=";
 const auto_suffix: []const u8 = " (auto)";
 const manual_suffix: []const u8 = " (manual)";
 
-/// Digits in the largest value `effective` can return (`max_max_iter`).
-const max_effective_digits: usize = std.fmt.comptimePrint("{d}", .{max_max_iter}).len;
+/// Digits in the largest value `effective` can return (`max_manual_iter`, which is larger
+/// than `auto_max_iter`).
+const max_effective_digits: usize = std.fmt.comptimePrint("{d}", .{max_manual_iter}).len;
 
-/// Buffer size that fits ANY `policySummary` result (the longest is a 4-digit manual value).
+/// Buffer size that fits ANY `policySummary` result (the longest is a manual value at the cap).
 /// Exactly the worst case, pinned by a test. It is sized for `effective`'s RANGE — a second
 /// reason `policySummary` must print `effective`'s value and never a raw `manual_value`.
 pub const summary_buf_len: usize =
@@ -239,14 +253,14 @@ test "autoMaxIter clamps to the baseline at or below the default magnification" 
 }
 
 test "autoMaxIter clamps to the documented cap at extreme magnification" {
-    try std.testing.expectEqual(max_max_iter, try autoMaxIter(1.0e30));
-    try std.testing.expectEqual(max_max_iter, try autoMaxIter(std.math.floatMax(f64)));
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(1.0e30));
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(std.math.floatMax(f64)));
 }
 
 test "the ramp reaches the cap on the 45th doubling and not the 44th" {
     // 512 + 80·44 = 4032 < 4096; 512 + 80·45 = 4112, clamped to 4096.
     try std.testing.expectEqual(@as(u32, 4032), try autoMaxIter(std.math.ldexp(mag0, 44)));
-    try std.testing.expectEqual(max_max_iter, try autoMaxIter(std.math.ldexp(mag0, 45)));
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(std.math.ldexp(mag0, 45)));
 }
 
 test "autoMaxIter rejects a non-finite or non-positive magnification" {
@@ -259,11 +273,11 @@ test "autoMaxIter rejects a non-finite or non-positive magnification" {
 test "the ramp spans the whole f64-usable zoom range, capping at the precision floor" {
     const center = viewport.Complex{ .re = -0.75, .im = 0.0 };
     const floor_view = try SquareView.fromCenterSide(center, navigate.precision_floor_side);
-    try std.testing.expectEqual(max_max_iter, try autoMaxIter(floor_view.magnification()));
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(floor_view.magnification()));
     // Two decades shallower than the floor the ramp is still climbing, so the cap is
     // not reached long before f64 gives up.
     const usable = try SquareView.fromCenterSide(center, 1.0e-11);
-    try std.testing.expect(try autoMaxIter(usable.magnification()) < max_max_iter);
+    try std.testing.expect(try autoMaxIter(usable.magnification()) < auto_max_iter);
 }
 
 test "an auto policy delegates to the heuristic" {
@@ -285,8 +299,16 @@ test "effective clamps a hand-built manual value below the supported range" {
 }
 
 test "effective clamps a hand-built manual value above the supported range" {
-    const p = IterPolicy{ .auto = false, .manual_value = 1_000_000 };
-    try std.testing.expectEqual(max_max_iter, try p.effective(mag0));
+    const p = IterPolicy{ .auto = false, .manual_value = std.math.maxInt(u32) };
+    try std.testing.expectEqual(max_manual_iter, try p.effective(mag0));
+}
+
+test "a manual value in the millions is accepted, not clamped to the auto ramp's ceiling" {
+    // The whole point of the manual field: the auto ramp stops at `auto_max_iter` because f64
+    // zoom depth runs out there, but a pinned count is the user's own cost/detail trade.
+    const p = try IterPolicy.manual(2_000_000);
+    try std.testing.expectEqual(@as(u32, 2_000_000), try p.effective(mag0));
+    try std.testing.expect(p.manual_value > auto_max_iter);
 }
 
 test "the default policy is auto at the M0 baseline" {
@@ -301,13 +323,13 @@ test "manual rejects a value below the supported range" {
 }
 
 test "manual rejects a value above the supported range" {
-    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(max_max_iter + 1));
+    try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(max_manual_iter + 1));
     try std.testing.expectError(AutoIterError.MaxIterOutOfRange, IterPolicy.manual(std.math.maxInt(u32)));
 }
 
 test "manual accepts both ends of the supported range" {
     try std.testing.expectEqual(min_manual_iter, (try IterPolicy.manual(min_manual_iter)).manual_value);
-    try std.testing.expectEqual(max_max_iter, (try IterPolicy.manual(max_max_iter)).manual_value);
+    try std.testing.expectEqual(max_manual_iter, (try IterPolicy.manual(max_manual_iter)).manual_value);
 }
 
 test "a manual policy ignores a non-finite magnification instead of failing" {
@@ -324,7 +346,7 @@ test "maxIterRangeMessage names the offending value, the range and what to do" {
     var buf: [range_message_buf_len]u8 = undefined;
     const msg = try maxIterRangeMessage(&buf, 5);
     try std.testing.expectEqualStrings(
-        "rejected max_iter: 5 is outside the supported range 16..4096; " ++
+        "rejected max_iter: 5 is outside the supported range 16..16777216; " ++
             "enter a value in that range or switch max_iter back to auto",
         msg,
     );
@@ -354,12 +376,12 @@ test "policySummary reports a pinned manual value" {
 
 test "policySummary reports the clamped effective value, not a raw out-of-range manual one" {
     // Guards the one-source-of-truth premise: a summary formatted from `manual_value` directly
-    // would advertise 1000000 while the render used 4096.
+    // would advertise 99999999 while the render used 16777216.
     var buf: [summary_buf_len]u8 = undefined;
-    // 5000 is above the cap but has the SAME digit count as the clamped 4096, so the claim is
-    // about the value and cannot be satisfied by a buffer-length accident.
-    const p = IterPolicy{ .auto = false, .manual_value = 5000 };
-    try std.testing.expectEqualStrings("max_iter=4096 (manual)", try policySummary(&buf, p, mag0));
+    // 99999999 is above the cap but has the SAME digit count as the clamped 16777216, so the
+    // claim is about the value and cannot be satisfied by a buffer-length accident.
+    const p = IterPolicy{ .auto = false, .manual_value = 99_999_999 };
+    try std.testing.expectEqualStrings("max_iter=16777216 (manual)", try policySummary(&buf, p, mag0));
 }
 
 test "policySummary propagates an invalid magnification instead of summarising a fabricated count" {
@@ -377,13 +399,13 @@ test "policySummary propagates an invalid magnification instead of summarising a
 
 test "summary_buf_len is exactly the worst-case summary length" {
     var buf: [summary_buf_len]u8 = undefined;
-    const p = try IterPolicy.manual(max_max_iter);
+    const p = try IterPolicy.manual(max_manual_iter);
     const line = try policySummary(&buf, p, mag0);
     try std.testing.expectEqual(summary_buf_len, line.len);
 }
 
 test "policySummary reports NoSpaceLeft instead of truncating" {
     var buf: [summary_buf_len - 1]u8 = undefined;
-    const p = try IterPolicy.manual(max_max_iter);
+    const p = try IterPolicy.manual(max_manual_iter);
     try std.testing.expectError(error.NoSpaceLeft, policySummary(&buf, p, mag0));
 }

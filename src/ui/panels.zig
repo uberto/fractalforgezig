@@ -429,7 +429,7 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
             if (ve.parseIterPolicy()) |policy| {
                 req.policy = policy;
             } else {
-                ui_log.err("invalid max_iter — enter an integer between {d} and {d}", .{ autoiter.min_manual_iter, autoiter.max_max_iter });
+                ui_log.err("invalid max_iter — enter an integer between {d} and {d}", .{ autoiter.min_manual_iter, autoiter.max_manual_iter });
                 // Restore the buffer to the engine's current policy value.
                 ve.syncFromPolicy(engine.policy);
             }
