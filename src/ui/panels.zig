@@ -282,7 +282,9 @@ fn drawStatusBar(
             if (idx >= engine.iter.len) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             const smooth = engine.iter[idx];
             if (smooth < 0.0) {
-                break :blk std.fmt.bufPrint(&iter_info_buf, "  interior", .{}) catch &iter_info_buf;
+                // Interior means "never escaped within max_iter", so the bound is the useful
+                // number to show — it says how hard the point was tested.
+                break :blk std.fmt.bufPrint(&iter_info_buf, "  interior ({d})", .{engine.max_iter}) catch &iter_info_buf;
             } else {
                 const iters: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(engine.max_iter)), smooth));
                 break :blk std.fmt.bufPrint(&iter_info_buf, "  iter {d}", .{iters}) catch &iter_info_buf;
