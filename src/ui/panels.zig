@@ -17,6 +17,7 @@ const engine_mod = @import("../fractal/engine.zig");
 const texture_mod = @import("../gpu/texture.zig");
 const navigate = @import("../fractal/navigate.zig");
 const autoiter = @import("../fractal/autoiter.zig");
+const progressive = @import("../fractal/progressive.zig");
 
 const ui_log = std.log.scoped(.ui);
 
@@ -30,6 +31,13 @@ pub const region_spacing: f32 = 8.0;
 
 /// Flags for the single fixed window: a fixed, non-movable, non-resizable frame
 /// with a menu bar and no persisted state (so the layout is deterministic).
+///
+/// NO SCROLLBAR is load-bearing, not cosmetic. The host window fills the viewport and never
+/// needs to scroll, but ImGui would still add a vertical scrollbar whenever the content
+/// happened to overflow by a pixel — and that scrollbar takes its width out of
+/// `ffImguiContentAvail`, which sizes the fractal region, which sizes the content. The result
+/// is a two-frame oscillation (996 px ↔ 982 px here) that kept cancelling the full-resolution
+/// pass, so the image never sharpened. Keep the region's width independent of its content.
 const window_flags: ig.WindowFlags =
     ig.window_flags_no_title_bar |
     ig.window_flags_no_resize |
@@ -37,14 +45,25 @@ const window_flags: ig.WindowFlags =
     ig.window_flags_no_collapse |
     ig.window_flags_no_saved_settings |
     ig.window_flags_no_bring_to_front |
+    ig.window_flags_no_scrollbar |
+    ig.window_flags_no_scroll_with_mouse |
     ig.window_flags_menu_bar;
 
 /// Context-menu action returned from `draw` so `main.zig` can act without re-opening ImGui.
 pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 
-/// Result of one `draw` call: the context-menu action and the live image rect.
-/// The image rect is derived from the actual ImGui child dimensions this frame —
-/// main.zig must use this (not the OS window size) for coordinate mapping and resize.
+/// Result of one `draw` call: the context-menu action and the live geometry.
+///
+/// TWO rectangles come out of a frame and they are NOT the same thing:
+///   * `image_rect` — where the texture actually landed on screen: the aspect-preserving
+///     fit of the CURRENT texture inside the fractal region (`viewport.fitImageRect`). This
+///     is the coordinate-mapping rect (hover readout, box-select, scroll anchor).
+///   * `render_w` / `render_h` — the fractal REGION's pixel size, i.e. the resolution the
+///     engine should render at so the image fills the region without distortion. main.zig
+///     treats this as the full-resolution target for the next pass.
+/// They coincide once a pass at the region's size has finished; they differ at startup,
+/// mid-resize, and while the coarse navigation preview is on screen.
+///
 /// `needs_rerender` is set when an in-panel toggle (e.g. GPU/CPU) changed the iteration
 /// path — main.zig must call engine.iterate() + upload after the frame.
 /// `save_requested` / `open_requested` are set when File→Save… / File→Open… is clicked;
@@ -52,9 +71,23 @@ pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 pub const DrawResult = struct {
     ctx_action: CtxAction,
     image_rect: viewport.ImageRect,
+    render_w: u32 = 0,
+    render_h: u32 = 0,
     needs_rerender: bool = false,
     save_requested: bool = false,
     open_requested: bool = false,
+    /// A view / `max_iter` policy the coord panel wants installed (see `CoordRequest`).
+    coord: CoordRequest = .{},
+};
+
+/// What the coord panel asks the app to do this frame. The panel NEVER installs these
+/// itself: a view or policy change means a full re-iteration, and that must go through
+/// main.zig's progressive pass (coarse preview → chunked full-res pass with a progress bar).
+/// Applying it inside the ImGui frame is what used to freeze the window for the whole
+/// length of a full-resolution render, with no feedback at all.
+pub const CoordRequest = struct {
+    view: ?viewport.SquareView = null,
+    policy: ?autoiter.IterPolicy = null,
 };
 
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
@@ -64,6 +97,10 @@ pub const DrawResult = struct {
 /// `open_ctx_menu` / `right_click_pt` / `hover_pt` come from the navigation layer in
 /// `main.zig`; the popup and status bar are rendered here, inside the ImGui window,
 /// so they share the correct ID stack.
+///
+/// `rendering` freezes the edit panels (a value edited against a half-rendered image would be
+/// applied to the next pass anyway); `progress` is the in-flight pass's completion, which
+/// takes over the status bar as a progress bar. Both come from the engine's pass state.
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
@@ -76,14 +113,19 @@ pub fn draw(
     right_click_pt: viewport.Complex,
     hover_pt: ?viewport.Complex,
     rendering: bool,
+    progress: ?f32,
     quit_requested: *bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
     var needs_rerender = false;
     var save_requested = false;
     var open_requested = false;
+    var coord_request = CoordRequest{};
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
+    // The fractal region's size this frame — the resolution the engine should render at.
+    var region_w: u32 = 0;
+    var region_h: u32 = 0;
 
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
@@ -105,27 +147,33 @@ pub fn draw(
 
         const frac_w_u: u32 = if (fractal_w > 0) @intFromFloat(fractal_w) else 0;
         const frac_h_u: u32 = if (fractal_h > 0) @intFromFloat(fractal_h) else 0;
+        region_w = frac_w_u;
+        region_h = frac_h_u;
 
         // Group fractal image + status bar so SameLine aligns the data panel to the top.
         ig.igBeginGroup();
         const no_scroll: ig.WindowFlags = ig.window_flags_no_scrollbar | ig.window_flags_no_scroll_with_mouse;
         _ = ig.igBeginChild_Str("fractal_region", .{ .x = fractal_w, .y = fractal_h }, 1, no_scroll);
 
-        // Record the actual screen-space top-left for coord mapping.
-        const img_origin = ig.igGetCursorScreenPos();
-        live_rect = .{
-            .x = @intFromFloat(@max(0, img_origin.x)),
-            .y = @intFromFloat(@max(0, img_origin.y)),
-            .w = frac_w_u,
-            .h = frac_h_u,
-            .side = @min(frac_w_u, frac_h_u),
-        };
+        // Fit the texture into the region WITHOUT stretching it (see DrawResult): the
+        // texture and the region are the same shape only after a pass at the region's
+        // size, so the drawn rect is the aspect-preserving fit, and that same rect is
+        // what coordinate mapping must use.
+        const region_origin = ig.igGetCursorScreenPos();
+        live_rect = viewport.fitImageRect(
+            @intFromFloat(@max(0, region_origin.x)),
+            @intFromFloat(@max(0, region_origin.y)),
+            frac_w_u,
+            frac_h_u,
+            texture.width,
+            texture.height,
+        );
 
         drawFractal(texture.handle, live_rect);
         ig.igEndChild();
 
         // Status bar sits outside the fractal child, directly below it.
-        drawStatusBar(engine, live_rect, hover_pt);
+        drawStatusBar(engine, live_rect, hover_pt, progress);
         ig.igEndGroup();
 
         ig.igSameLine(0, region_spacing);
@@ -134,7 +182,7 @@ pub fn draw(
         ig.igBeginDisabled(rendering);
         if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
         ig.igSpacing();
-        drawCoordPanel(device, texture, engine, view_editor);
+        coord_request = drawCoordPanel(engine, view_editor);
         ig.igSpacing();
         if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
             drawPalettePanel(device, texture, engine, editor);
@@ -151,9 +199,12 @@ pub fn draw(
     return .{
         .ctx_action = ctx_action,
         .image_rect = live_rect,
+        .render_w = region_w,
+        .render_h = region_h,
         .needs_rerender = needs_rerender,
         .save_requested = save_requested,
         .open_requested = open_requested,
+        .coord = coord_request,
     };
 }
 
@@ -183,17 +234,34 @@ fn drawMenuBar(quit_requested: *bool) MenuResult {
     return result;
 }
 
-/// Draw the Mandelbrot texture at its natural `w × h` size.
+/// Draw the Mandelbrot texture into the pre-fitted `image_rect` (see `viewport.fitImageRect`):
+/// the cursor is moved to the rect's screen origin so the image is centered in its region,
+/// and the image is drawn at the rect's size — which carries the TEXTURE's aspect, so the
+/// fractal is never stretched. A degenerate rect (minimized window) draws nothing.
 fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void {
-    const w: f32 = @floatFromInt(image_rect.w);
-    const h: f32 = @floatFromInt(image_rect.h);
-    c.ffImguiImage(texture, w, h);
+    if (image_rect.w == 0 or image_rect.h == 0) return;
+    c.ffImguiSetCursorScreenPos(@floatFromInt(image_rect.x), @floatFromInt(image_rect.y));
+    c.ffImguiImage(texture, @floatFromInt(image_rect.w), @floatFromInt(image_rect.h));
 }
 
-/// One-line status bar at the bottom of the fractal region: coordinate + iteration value
-/// when the cursor is over the image; blank when over the bars.
-fn drawStatusBar(engine: *const engine_mod.Engine, rect: viewport.ImageRect, hover_pt: ?viewport.Complex) void {
+/// One-line status bar at the bottom of the fractal region. While a pass is in flight
+/// (`progress` non-null) it shows a PROGRESS BAR instead of the readout — the one place the
+/// user can see that the app is working rather than hung. Otherwise: coordinate + iteration
+/// value when the cursor is over the image, `---` when it is not.
+fn drawStatusBar(
+    engine: *const engine_mod.Engine,
+    rect: viewport.ImageRect,
+    hover_pt: ?viewport.Complex,
+    progress: ?f32,
+) void {
     ig.igSpacing();
+    if (progress) |f| {
+        var label_buf: [progressive.progress_label_buf_len]u8 = undefined;
+        const label: ?[*:0]const u8 = if (progressive.progressLabel(&label_buf, f)) |l| l.ptr else |_| null;
+        // Full region width; one text line high so the reserved status-bar strip still fits.
+        ig.igProgressBar(f, .{ .x = -1.0, .y = ig.igGetTextLineHeightWithSpacing() }, label);
+        return;
+    }
     if (hover_pt) |pt| {
         var coord_buf: [viewport.coord_buf_len]u8 = undefined;
         const mag = engine.view.magnification();
@@ -202,15 +270,15 @@ fn drawStatusBar(engine: *const engine_mod.Engine, rect: viewport.ImageRect, hov
             return;
         };
 
-        // Look up the iteration value for this pixel from the engine's iter buffer.
+        // Look up the iteration value for this pixel from the engine's iter buffer. The
+        // lookup goes through the engine's own RENDER viewport, not the on-screen rect: the
+        // buffer is `image_w × image_h` and only matches the screen rect once a pass at the
+        // region's size has finished (see `DrawResult`).
         var iter_info_buf: [32]u8 = undefined;
         const iter_str: []u8 = blk: {
             if (rect.side == 0) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
-            // Map the complex point back to a pixel index.
-            const px = engine.view.complexToPixel(pt, rect.side);
-            const col: u32 = @intFromFloat(@max(0.0, @min(@as(f64, @floatFromInt(rect.side - 1)), px.x)));
-            const row: u32 = @intFromFloat(@max(0.0, @min(@as(f64, @floatFromInt(rect.side - 1)), px.y)));
-            const idx = row * rect.side + col;
+            const idx = engine.renderViewport().pixelIndex(pt) orelse
+                break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             if (idx >= engine.iter.len) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             const smooth = engine.iter[idx];
             if (smooth < 0.0) {
@@ -287,51 +355,28 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
 /// sync), Reset to home button, and the auto/manual max_iter control. On commit (Enter on
 /// an input field, Reset clicked, or Auto toggled) the panel:
 ///   1. Parses and validates via the pure `ViewEditor` helpers.
-///   2. Calls the engine setter (`setViewport` or `setPolicy`).
-///   3. Re-uploads the RGBA buffer to the GPU texture.
-///   4. Syncs all text buffers from the engine's committed state.
-/// On failure, logs `std.log.err` (scope `.ui`) with actionable context and keeps the old
-/// state — never re-iterates on a parse failure.
-fn drawCoordPanel(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
-    engine: *engine_mod.Engine,
-    ve: *editor_mod.ViewEditor,
-) void {
-    var nav_changed = false;
-    var policy_changed = false;
+///   2. RETURNS the requested view / policy in a `CoordRequest` — it does NOT call the
+///      engine. main.zig installs it through the progressive pass, so the app shows a
+///      coarse preview and a progress bar instead of freezing (see `CoordRequest`).
+/// On failure, logs `std.log.err` (scope `.ui`) with actionable context and restores the
+/// text buffers from the engine's committed state — a parse failure changes nothing.
+///
+/// At most ONE view request and ONE policy request per frame: the fields are alternative
+/// spellings of the same view, so committing two in one frame would queue a stale one.
+fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) CoordRequest {
+    var req = CoordRequest{};
 
     ig.igSeparatorText("Coord");
 
     ig.igSeparatorText("Center / Mag");
-    // Center Re
-    if (ig.igInputText("re##cre", &ve.center_re_buf, ve.center_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (ve.parseAndApplyCenterMag()) |new_view| {
-            applyNavChange(device, texture, engine, ve, new_view);
-            nav_changed = true;
-        } else {
-            ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
-            ve.syncFromView(engine.view);
-        }
-    }
-    // Center Im
-    if (ig.igInputText("im##cim", &ve.center_im_buf, ve.center_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
+    // Center Re / Center Im / Magnification — three spellings of one center+mag commit.
+    const center_mag_ids = [_][*:0]const u8{ "re##cre", "im##cim", "mag##mag" };
+    const center_mag_bufs = [_]*[32]u8{ &ve.center_re_buf, &ve.center_im_buf, &ve.mag_buf };
+    for (center_mag_ids, center_mag_bufs) |label, buf| {
+        if (ig.igInputText(label, buf, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+            if (req.view != null) continue;
             if (ve.parseAndApplyCenterMag()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
-            } else {
-                ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
-                ve.syncFromView(engine.view);
-            }
-        }
-    }
-    // Magnification
-    if (ig.igInputText("mag##mag", &ve.mag_buf, ve.mag_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
-            if (ve.parseAndApplyCenterMag()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
+                req.view = new_view;
             } else {
                 ui_log.err("invalid center/mag — enter finite numbers and a positive magnification", .{});
                 ve.syncFromView(engine.view);
@@ -340,48 +385,18 @@ fn drawCoordPanel(
     }
 
     ig.igSeparatorText("Corners");
-    // Corner A Re
-    if (ig.igInputText("a.re##are", &ve.corner_a_re_buf, ve.corner_a_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
+    const corner_ids = [_][*:0]const u8{ "a.re##are", "a.im##aim", "b.re##bre", "b.im##bim" };
+    const corner_bufs = [_]*[32]u8{
+        &ve.corner_a_re_buf,
+        &ve.corner_a_im_buf,
+        &ve.corner_b_re_buf,
+        &ve.corner_b_im_buf,
+    };
+    for (corner_ids, corner_bufs) |label, buf| {
+        if (ig.igInputText(label, buf, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+            if (req.view != null) continue;
             if (ve.parseAndApplyCorners()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
-            } else {
-                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
-                ve.syncFromView(engine.view);
-            }
-        }
-    }
-    // Corner A Im
-    if (ig.igInputText("a.im##aim", &ve.corner_a_im_buf, ve.corner_a_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
-            if (ve.parseAndApplyCorners()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
-            } else {
-                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
-                ve.syncFromView(engine.view);
-            }
-        }
-    }
-    // Corner B Re
-    if (ig.igInputText("b.re##bre", &ve.corner_b_re_buf, ve.corner_b_re_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
-            if (ve.parseAndApplyCorners()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
-            } else {
-                ui_log.err("invalid corners — enter two distinct finite numbers", .{});
-                ve.syncFromView(engine.view);
-            }
-        }
-    }
-    // Corner B Im
-    if (ig.igInputText("b.im##bim", &ve.corner_b_im_buf, ve.corner_b_im_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!nav_changed) {
-            if (ve.parseAndApplyCorners()) |new_view| {
-                applyNavChange(device, texture, engine, ve, new_view);
-                nav_changed = true;
+                req.view = new_view;
             } else {
                 ui_log.err("invalid corners — enter two distinct finite numbers", .{});
                 ve.syncFromView(engine.view);
@@ -391,98 +406,36 @@ fn drawCoordPanel(
 
     // Reset to home
     if (ig.igButton("Reset", .{ .x = 0, .y = 0 })) {
-        if (!nav_changed) {
-            const home = navigate.reset();
-            applyNavChange(device, texture, engine, ve, home);
-            nav_changed = true;
-        }
+        if (req.view == null) req.view = navigate.reset();
     }
 
     // max_iter control: Auto checkbox + manual field
     ig.igSeparatorText("max_iter");
     if (ig.igCheckbox("Auto", &ve.auto_iter)) {
-        // Toggle: apply the policy change immediately.
-        applyPolicyChange(device, texture, engine, ve);
-        policy_changed = true;
+        req.policy = if (ve.auto_iter)
+            .{ .auto = true }
+        else
+            // Leaving auto: pin the field's value, falling back to the engine's when the
+            // text is blank or garbage.
+            ve.parseIterPolicy() orelse
+                autoiter.IterPolicy{ .auto = false, .manual_value = engine.policy.manual_value };
     }
     // Manual field is disabled when auto is on.
     ig.igBeginDisabled(ve.auto_iter);
     if (ig.igInputText("iter##iter", &ve.manual_iter_buf, ve.manual_iter_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
-        if (!policy_changed) {
+        if (req.policy == null) {
             if (ve.parseIterPolicy()) |policy| {
-                applyPolicyChangeWithPolicy(device, texture, engine, ve, policy);
+                req.policy = policy;
             } else {
                 ui_log.err("invalid max_iter — enter an integer between {d} and {d}", .{ autoiter.min_manual_iter, autoiter.max_max_iter });
                 // Restore the buffer to the engine's current policy value.
-                syncIterBuf(ve, engine.policy);
+                ve.syncFromPolicy(engine.policy);
             }
         }
     }
     ig.igEndDisabled();
-}
 
-/// Apply a new view to the engine and re-upload. On failure logs and keeps the old view.
-/// Syncs `ve` to the committed engine view on success.
-fn applyNavChange(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
-    engine: *engine_mod.Engine,
-    ve: *editor_mod.ViewEditor,
-    new_view: viewport.SquareView,
-) void {
-    engine.setViewport(new_view) catch |err| {
-        ui_log.err("navigation rejected ({s}); keeping previous view", .{@errorName(err)});
-        ve.syncFromView(engine.view);
-        return;
-    };
-    texture_mod.upload(device, texture, engine.output()) catch |err| {
-        ui_log.err("re-upload after coord edit failed ({s})", .{@errorName(err)});
-    };
-    ve.syncFromView(engine.view);
-}
-
-/// Build a policy from the editor's `auto_iter` toggle and `manual_iter_buf`, then apply.
-fn applyPolicyChange(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
-    engine: *engine_mod.Engine,
-    ve: *editor_mod.ViewEditor,
-) void {
-    if (ve.auto_iter) {
-        applyPolicyChangeWithPolicy(device, texture, engine, ve, .{ .auto = true });
-    } else {
-        const policy = ve.parseIterPolicy() orelse blk: {
-            // Fall back to current manual_value when the text is blank/garbage.
-            break :blk autoiter.IterPolicy{ .auto = false, .manual_value = engine.policy.manual_value };
-        };
-        applyPolicyChangeWithPolicy(device, texture, engine, ve, policy);
-    }
-}
-
-/// Apply a given `IterPolicy` to the engine and re-upload.
-fn applyPolicyChangeWithPolicy(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
-    engine: *engine_mod.Engine,
-    ve: *editor_mod.ViewEditor,
-    policy: autoiter.IterPolicy,
-) void {
-    engine.setPolicy(policy) catch |err| {
-        ui_log.err("policy change rejected ({s}); keeping previous policy", .{@errorName(err)});
-        syncIterBuf(ve, engine.policy);
-        return;
-    };
-    texture_mod.upload(device, texture, engine.output()) catch |err| {
-        ui_log.err("re-upload after policy change failed ({s})", .{@errorName(err)});
-    };
-    ve.auto_iter = engine.policy.auto;
-    syncIterBuf(ve, engine.policy);
-}
-
-/// Write the engine's manual_value into `ve.manual_iter_buf`.
-fn syncIterBuf(ve: *editor_mod.ViewEditor, policy: autoiter.IterPolicy) void {
-    const s = std.fmt.bufPrint(&ve.manual_iter_buf, "{d}", .{policy.manual_value}) catch return;
-    if (s.len < ve.manual_iter_buf.len) ve.manual_iter_buf[s.len] = 0;
+    return req;
 }
 
 /// The mapping-mode combo labels as null-terminated C pointers, derived at comptime from

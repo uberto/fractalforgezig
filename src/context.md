@@ -11,7 +11,10 @@ native macOS window with a Dear ImGui shell. This folder holds all first-party Z
 
 - `main.zig` — executable entry. Opens one window, creates the SDL_GPU device + ImGui,
   runs the event loop (render one ImGui window per frame), tears down cleanly. Keep it thin:
-  wire modules together, push logic into pure modules.
+  wire modules together, push logic into pure modules. The loop NEVER blocks on a full-res
+  render: an input change shows a blocky coarse preview, then `engine.stepPass()` refines it one
+  ~12 ms chunk per frame while the status bar shows a progress bar and the edit panels are
+  disabled. See `ui/context.md` for the helper set.
 - `root.zig` — library/test root. `zig build test` compiles this file. Its top-level
   `test { ... }` block aggregates PURE submodule tests via `_ = @import("...");` (never C
   edges). Also hosts small pure helpers (e.g. `startupLine`).
@@ -19,8 +22,8 @@ native macOS window with a Dear ImGui shell. This folder holds all first-party Z
   translated once. Only `gpu/`, `ui/`, `main.zig` import it.
 - `cimgui.zig` — thin hand-written `extern` header for the Dear ImGui core C API (cimgui.h
   is not `@cImport`-able due to bitfield structs). Grow as later tasks need more calls.
-- `fractal/` — pure fractal core (viewport mapping, Mandelbrot iteration, color, render).
-  No SDL/GPU imports. Seeded in T3.
+- `fractal/` — pure fractal core (viewport mapping, Mandelbrot iteration, color, render,
+  progressive chunk scheduling, JSON persistence). No SDL/GPU imports. Seeded in T3.
 - `gpu/` — SDL3 GPU device + RGBA→texture upload glue. Seeded in T2.
 - `ui/` — SDL3 window + cimgui/Dear ImGui shell (menu bar, fractal image, data panel).
   Seeded in T2.

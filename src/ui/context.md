@@ -5,83 +5,80 @@
 ## Purpose
 
 Own Dear ImGui: context lifecycle, SDL3 + SDL_GPU backends, per-frame
-new-frame/render/shutdown, and the single fixed window layout + palette editor. C-interop
-edge — keep ImGui/SDL types behind `../c.zig` / `../cimgui.zig`; never leak into the core.
+new-frame/render/shutdown, the fixed layout + palette editor. C-interop edge — keep ImGui/SDL
+types behind `../c.zig`/`../cimgui.zig`; never leak into the core.
 
-## Letterbox layout + resize flow (T5)
+## Aspect + resize (M5)
 
-Window is resizable. Fractal renders as centered square `S = min(w,h)` px; SDL clear color
-fills bars. `viewport.computeImageRect(w,h)` (pure, tested) → `ImageRect{x,y,side}`.
-`handleResize(device,texture*,image_rect*,engine*,w,h)`: skips `S==0`; on S change:
-`engine.resize(S)`, destroy+recreate texture, re-upload, log `"resize: WxH → SxS"`. Screen
-coords throughout (`SDL_GetWindowSize`/`event.window.data1,2`).
+The render target is the fractal REGION (rectangular) and only ImGui knows its size, so `draw`
+reports it as `render_w/render_h`; `main.zig` takes that as the full-res target, and a change
+cancels the pass + re-arms (so a resize DRAG defers to the settled size). No
+`handleResize`. Draw via `viewport.fitImageRect(region…,texture…)`: aspect-preserving, so a
+texture not yet matching the region is letterboxed, NEVER stretched — and that same rect is
+the coordinate-mapping rect. The host window MUST keep `no_scrollbar`: a scrollbar's width comes
+out of `ContentAvail`, which sizes the region, which sizes the content → a two-frame size
+oscillation that cancelled every full pass. Backstop: `region_thrash_limit` warns after 8 chased
+changes and lets the pass finish.
 
 ## Layout: single window, two fixed regions
 
-`panels.zig` — `draw(device,texture,max_iter,stats,engine,editor,view_editor,…)→DrawResult`.
-`DrawResult{ctx_action,image_rect,needs_rerender,save_requested,open_requested}`.
-Left: fractal image. Right: data+coord+palette panels. Menu: File→Save…/Open…/Quit, Help→About.
-Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period slider, interior.
-`applyEdits`→setter→re-upload; NEVER re-iterates. `editor.zig` (PURE): `Editor`+`toGradient`+`addStop`/`removeStop`.
-`stats.zig` (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`; `renderSummary`.
+`panels.zig` — `draw(device,texture,max_iter,stats,engine,editor,view_editor,open_ctx_menu,
+right_click_pt,hover_pt,rendering,progress:?f32,quit*)→DrawResult{ctx_action,image_rect,
+render_w,render_h,needs_rerender,save_requested,open_requested,coord}`: `image_rect`=fitted
+ON-SCREEN rect (mapping), `render_w/h`=REGION size (resolution target). `rendering` freezes
+the edit panels (`igBeginDisabled`); `progress` (=`engine.passFraction()`) replaces the
+status-bar readout with `igProgressBar` + `progressive.progressLabel`. Status-bar lookup uses
+`engine.renderViewport().pixelIndex(pt)` (rect stride), NOT the square map.
+Left: fractal image, right: data+coord+palette. Menu: File→Save…/Open…/Quit, Help→About.
+Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period, interior.
+`applyEdits`→setter→re-upload; NEVER re-iterates. `editor.zig` (PURE): `Editor`+`toGradient`+
+`addStop`/`removeStop`. `stats.zig` (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`,
+`renderSummary`.
 
-## Bridge helpers (vendor/bridge)
+## Stack, bridge, `Ui` (imgui.zig)
 
-`ffImguiFillMainViewport`, `ffImguiContentAvail`, `ffImguiBeginChild`/`ffImguiEndChild`,
-`ffImguiImage(texture, w, h)`, `ffImguiSetCursorScreenPos(x, y)` — wrap by-value `ImVec2`
-calls. `ffImguiImage` passes raw `SDL_GPUTexture*` as `ImTextureID` (1.92+).
+Vendored via `build.zig`: cimgui + Dear ImGui docking + SDL3/SDLGPU3 backends. `../cimgui.zig`
+holds `extern` decls, NOT `@cImport cimgui.h` (docking bitfields → `opaque{}`). Bridge
+(`vendor/bridge`) wraps by-value `ImVec2` calls: `ffImguiFillMainViewport`,
+`ffImguiContentAvail`, `ffImguiBeginChild`/`End`, `ffImguiImage(texture,w,h)` (raw
+`SDL_GPUTexture*` as `ImTextureID`), `ffImguiSetCursorScreenPos`. `Ui.init(window,device)`;
+per frame `newFrame()`→build→`endFrame()`→`prepareDrawData(cmd)` BEFORE the render pass→
+`renderDrawData(cmd,pass)`; `processEvent`; `shutdown()`.
+Order: `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
 
-## Stack + C-interop
+## Navigation + progressive render (main.zig)
 
-Vendored via `build.zig`: cimgui + Dear ImGui docking + SDL3/SDLGPU3 backends. Single
-non-docking window. `../c.zig` (`@cImport`) — SDL3, SDL_GPU, `imgui_bridge.h`. `../cimgui.zig`
-— `extern` decls for the ImGui C API (context, text, menus, palette widgets). NOT
-`@cImport cimgui.h` (docking bitfields → `opaque{}`).
+`NavState{drag_state,drag_start_px,right_click_pt,full_pass_done,rendering,pass_ns,region_thrash,
+idle_timer}`.
+Box-select (left-drag)→`navigate.boxSelect` on release, rubber-band `ImDrawList_AddRect`; pan
+(middle/Space+left)→`panByPixels`, reset delta after; scroll→`cursorCoord`+`zoomAbout`;
+right-click→`igOpenPopup_Str`→`drawContextMenu`→`zoomCentered`; hover→`formatCoord` tooltip.
+EVERY view/policy change goes through `applyViewCoarse`/`showViewCoarse`/`showPolicyCoarse`:
+`cancelPass`→`installView`/`installPolicy`→`renderCoarse` (one blocking
+`resizeRect(real_w/coarse_divisor,real_h/coarse_divisor)` — divides EACH axis, so the blocky
+preview keeps the aspect)→`syncFromView`→`armFullPass`. NOTHING iterates at full res
+synchronously. `refine.decidePass` then fires `beginFullPass`; `stepPassChunk` runs one
+`engine.stepPass()` per frame. While `engine.pass != null` the loop `SDL_PollEvent`s (never
+blocks); else `SDL_WaitEventTimeout(16)` when a pass is owed, `-1` when idle.
 
-## `Ui` (imgui.zig)
+## Coord panel + ViewEditor
 
-`Ui.init(window, device)` — `igCreateContext` + `ffImguiInitBackends`. Per frame:
-`newFrame()` → build UI → `endFrame()` → `prepareDrawData(cmd)` before render pass →
-`renderDrawData(cmd, pass)`. `processEvent(&event)` for SDL. `shutdown()` tears down
-backends then context. App order: `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
-
-## Navigation input + coarse→fine (T6, main.zig)
-
-All glue in `main.zig`. `NavState{drag_state,drag_start_px,right_click_pt,full_pass_done,
-idle_timer}`. `real_s` = full-res S. Box-select (left-drag): `handleNavInput`→
-`navigate.boxSelect`→`setViewport` on release; rubber-band via `ImDrawList_AddRect`. Pan
-(middle/Space+left): `panByPixels`→`setViewport`; reset delta after. Scroll
-(`SDL_EVENT_MOUSE_WHEEL`): `cursorCoord`→`zoomAbout`. Right-click: stash point,
-`igOpenPopup_Str`→`drawContextMenu`→`zoomCentered`. Hover: `cursorCoord`→`formatCoord`→
-tooltip. Coarse→fine: `applyViewCoarse` resizes to `max(real_s/4,1)`, `setViewport`, upload,
-`full_pass_done=false`. `runFullPass` restores `real_s`, upload, done. `refine.decidePass`
-(pure, tested) drives: `.full`→`runFullPass`.
-
-## Coord panel + ViewEditor (T7)
-
-`ViewEditor` in `editor.zig` (PURE, unit-tested): text buffers for center re/im/mag and
-corner a/b re/im (both forms synced), `auto_iter` bool, `manual_iter_buf`.
-`initFromView`/`syncFromView` populate all 7 buffers from a `SquareView` (`{d}` format,
-null-terminated). `parseAndApplyCenterMag`→`?SquareView` (re/im/mag as f64,
-`fromCenterMag`; null on failure). `parseAndApplyCorners`→`?SquareView` (four corners,
-`fromCorners`; null on failure). `parseIterPolicy`→`?IterPolicy` (`manual_iter_buf` as u32,
-`IterPolicy.manual`; null on failure).
-
-`drawCoordPanel` in `panels.zig`: "Coord" section below data panel. `igInputText` fields
-(EnterReturnsTrue) for center/mag and corners — on commit: parse → `setViewport` → upload
-→ `syncFromView`. `igButton("Reset")` → `navigate.reset()` → same flow. `igCheckbox("Auto")`
-+ manual `igInputText` (disabled when auto) → `parseIterPolicy` → `setPolicy` → upload.
-Errors log `.err`. `view_editor` created in `main.zig` after engine init; `syncFromView`
-called from `applyViewCoarse`, `runFullPass`, and after `handleResize`.
+`ViewEditor` (`editor.zig`, PURE, tested): buffers for center re/im/mag + corners a/b re/im
+(both forms synced), `auto_iter`, `manual_iter_buf`. `initFromView`/`syncFromView` fill all 7;
+`syncFromPolicy` inverts `parseIterPolicy`. `parseAndApplyCenterMag`/`parseAndApplyCorners`→
+`?SquareView`, `parseIterPolicy`→`?IterPolicy`; null on failure. `drawCoordPanel` REQUESTS,
+never applies: returns `CoordRequest{view,policy}` (first commit wins) for `main.zig` — an
+ImGui frame is no place for engine work. Parse failure logs `.err`, re-syncs from engine.
 
 ## File dialog (M5): dialog.zig
 
-`PendingDialog{kind:Kind,path_buf,path_len}` — stack-alloc in `runLoop`, lifetime outlives callbacks.
-`showSave(window,pending)` / `showOpen(window,pending)` — no-op if `kind != .none` (one dialog at a time).
-`takePending(pending) ?PendingResult` — returns `null` on cancel or no pending result, resets to `.none`.
-C callback (`callconv(.c)`) writes path into `path_buf`; never allocates. Filter `*.fractal`.
+`PendingDialog{kind,path_buf,path_len}` — stack-alloc in `runLoop`, outlives callbacks.
+`showSave`/`showOpen(window,pending)` no-op if `kind != .none` (one dialog only).
+`takePending`→`?PendingResult`, `null` on cancel/none, resets to `.none`. C callback
+(`callconv(.c)`) writes the path in, never allocates. Filter `*.fractal`.
 
 ## Testing
 
-Visual (window/layout/navigation/coord panel): manual smoke + log check. Pure (`stats.zig`,
-`editor.zig`, `fractal/refine.zig`) IS unit-tested. `dialog.zig` is glue; no unit tests.
+Visual (layout/navigation/coord/progress) = manual smoke + log check. Pure (`stats.zig`,
+`editor.zig`, `fractal/refine.zig`, `fractal/progressive.zig`) IS unit-tested; `dialog.zig` is
+glue, no unit tests.

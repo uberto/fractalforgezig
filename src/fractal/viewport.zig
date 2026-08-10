@@ -381,6 +381,33 @@ pub const Viewport = struct {
             .im = self.center_im - (py - h / 2.0) * self.scale,
         };
     }
+
+    /// Exact inverse of `pixelToComplex`: the (continuous) pixel a complex point samples.
+    /// Values outside `[0, width] × [0, height]` mean the point is off this image. Needed
+    /// because the render buffer is RECTANGULAR (`width × height`), so the square-view
+    /// `SquareView.complexToPixel` would index it on the wrong stride — the status bar's
+    /// iteration readout goes through here. Precondition: `scale != 0`.
+    pub fn complexToPixel(self: Viewport, point: Complex) Pixel {
+        const w: f64 = @floatFromInt(self.width);
+        const h: f64 = @floatFromInt(self.height);
+        return .{
+            .x = (point.re - self.center_re) / self.scale + w / 2.0,
+            .y = (self.center_im - point.im) / self.scale + h / 2.0,
+        };
+    }
+
+    /// Index into a `width * height` row-major per-pixel buffer for a complex point, or
+    /// null when the point falls outside the image. The clamp-free bounds check is what
+    /// keeps a hover just past the image edge from reading a neighbouring row.
+    pub fn pixelIndex(self: Viewport, point: Complex) ?usize {
+        if (self.width == 0 or self.height == 0) return null;
+        const p = self.complexToPixel(point);
+        if (p.x < 0.0 or p.y < 0.0) return null;
+        if (p.x >= @as(f64, @floatFromInt(self.width)) or p.y >= @as(f64, @floatFromInt(self.height))) return null;
+        const col: usize = @intFromFloat(p.x);
+        const row: usize = @intFromFloat(p.y);
+        return row * self.width + col;
+    }
 };
 
 test "fixedView centers on the midpoint of the fixed M0 bounds" {
@@ -440,6 +467,44 @@ test "pixelToComplex is deterministic for repeated identical input" {
     const b = vp.pixelToComplex(123.0, 456.0);
     try std.testing.expectEqual(a.re, b.re);
     try std.testing.expectEqual(a.im, b.im);
+}
+
+test "Viewport.complexToPixel inverts pixelToComplex on a non-square image" {
+    const vp = Viewport.fixedView(800, 600);
+    const p = vp.complexToPixel(vp.pixelToComplex(123.0, 456.0));
+    try std.testing.expectApproxEqAbs(@as(f64, 123.0), p.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 456.0), p.y, 1e-9);
+}
+
+test "Viewport.pixelIndex uses the image width as the row stride" {
+    const vp = Viewport.fixedView(800, 600);
+    // Pixel (10, 3) — its center, so truncation cannot land on a neighbour.
+    const idx = vp.pixelIndex(vp.pixelToComplex(10.5, 3.5)) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(usize, 3 * 800 + 10), idx);
+}
+
+test "Viewport.pixelIndex rejects a point past the right edge" {
+    const vp = Viewport.fixedView(800, 600);
+    try std.testing.expect(vp.pixelIndex(vp.pixelToComplex(800.5, 300.0)) == null);
+}
+
+test "Viewport.pixelIndex rejects a point above the top edge" {
+    const vp = Viewport.fixedView(800, 600);
+    try std.testing.expect(vp.pixelIndex(vp.pixelToComplex(400.0, -0.5)) == null);
+}
+
+test "Viewport.pixelIndex stays inside a full-image buffer for every pixel center" {
+    const vp = Viewport.fixedView(37, 11); // odd, non-square, small
+    const len: usize = 37 * 11;
+    var y: u32 = 0;
+    while (y < 11) : (y += 1) {
+        var x: u32 = 0;
+        while (x < 37) : (x += 1) {
+            const pt = vp.pixelToComplex(@as(f64, @floatFromInt(x)) + 0.5, @as(f64, @floatFromInt(y)) + 0.5);
+            const idx = vp.pixelIndex(pt) orelse return error.TestUnexpectedNull;
+            try std.testing.expect(idx < len);
+        }
+    }
 }
 
 // ─── Tests: M3 SquareView model ──────────────────────────────────────────────
@@ -828,6 +893,106 @@ pub fn computeImageRect(window_w: u32, window_h: u32) ImageRect {
         .h = window_h,
         .side = @min(window_w, window_h),
     };
+}
+
+/// Fit a `tex_w × tex_h` render into the `region_w × region_h` screen region at
+/// `(region_x, region_y)` WITHOUT distorting it: scale by `min(region_w/tex_w, region_h/tex_h)`
+/// and center the result, leaving equal bars on the two spare sides.
+///
+/// Why the UI needs this: the render buffer and the region it is drawn into are only the same
+/// shape once a pass at the region's exact dimensions has finished. In between — at startup,
+/// while a window resize is still being dragged, and during the coarse navigation preview —
+/// they differ, and drawing the texture across the whole region would STRETCH the fractal
+/// (M5 bug: the first frame was a square render splashed across a wide region). Fitting makes
+/// that structurally impossible: a mismatch shows as brief bars, never as a wrong aspect.
+///
+/// The returned rect is also the coordinate-mapping rect: it has the texture's aspect, so
+/// `cursorCoord`'s `rectViewport(w, h)` maps it onto exactly the complex region the render
+/// covers. Pure: no SDL/GPU/ImGui. Degenerate (any zero) input yields a zero-side rect, which
+/// the callers treat as "nothing to map".
+pub fn fitImageRect(
+    region_x: i32,
+    region_y: i32,
+    region_w: u32,
+    region_h: u32,
+    tex_w: u32,
+    tex_h: u32,
+) ImageRect {
+    if (region_w == 0 or region_h == 0 or tex_w == 0 or tex_h == 0) {
+        return .{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
+    }
+    const rw: f64 = @floatFromInt(region_w);
+    const rh: f64 = @floatFromInt(region_h);
+    const tw: f64 = @floatFromInt(tex_w);
+    const th: f64 = @floatFromInt(tex_h);
+    const scale = @min(rw / tw, rh / th);
+    // Round to whole pixels, but never past the region and never to zero.
+    const fit_w: u32 = @max(1, @min(region_w, @as(u32, @intFromFloat(@round(tw * scale)))));
+    const fit_h: u32 = @max(1, @min(region_h, @as(u32, @intFromFloat(@round(th * scale)))));
+    return .{
+        .x = region_x + @as(i32, @intCast((region_w - fit_w) / 2)),
+        .y = region_y + @as(i32, @intCast((region_h - fit_h) / 2)),
+        .w = fit_w,
+        .h = fit_h,
+        .side = @min(fit_w, fit_h),
+    };
+}
+
+test "fitImageRect fills the region exactly when the aspects already match" {
+    const r = fitImageRect(10, 20, 800, 600, 400, 300);
+    try std.testing.expectEqual(@as(u32, 800), r.w);
+}
+
+test "fitImageRect leaves the region height untouched when the aspects match" {
+    const r = fitImageRect(10, 20, 800, 600, 400, 300);
+    try std.testing.expectEqual(@as(u32, 600), r.h);
+}
+
+test "fitImageRect keeps a square render square inside a wide region (the M5 aspect bug)" {
+    // A 720×720 startup render in a 1012×666 region must stay square, not stretch to 1012.
+    const r = fitImageRect(0, 0, 1012, 666, 720, 720);
+    try std.testing.expectEqual(r.h, r.w);
+}
+
+test "fitImageRect centers the fitted image horizontally in a wide region" {
+    const r = fitImageRect(0, 0, 1000, 500, 500, 500); // fits to 500×500 ⇒ 250 px bars
+    try std.testing.expectEqual(@as(i32, 250), r.x);
+}
+
+test "fitImageRect centers the fitted image vertically in a tall region" {
+    const r = fitImageRect(0, 0, 400, 1000, 200, 200); // fits to 400×400 ⇒ 300 px bars
+    try std.testing.expectEqual(@as(i32, 300), r.y);
+}
+
+test "fitImageRect offsets by the region origin" {
+    const r = fitImageRect(37, 11, 600, 300, 200, 100);
+    try std.testing.expectEqual(@as(i32, 37), r.x);
+}
+
+test "fitImageRect scales a coarse preview up to the whole region (same aspect)" {
+    // The navigation preview renders at a quarter of each axis; it must still fill the region.
+    const r = fitImageRect(0, 0, 1012, 666, 1012 / 4, 666 / 4);
+    try std.testing.expectEqual(@as(u32, 1012), r.w);
+}
+
+test "fitImageRect never exceeds the region width when rounding up" {
+    const r = fitImageRect(0, 0, 101, 101, 100, 100);
+    try std.testing.expect(r.w <= 101);
+}
+
+test "fitImageRect reports side as min(w, h) for the navigation geometry" {
+    const r = fitImageRect(0, 0, 1000, 500, 500, 500);
+    try std.testing.expectEqual(@as(u32, 500), r.side);
+}
+
+test "fitImageRect returns a degenerate rect for a zero-size region" {
+    const r = fitImageRect(0, 0, 0, 600, 400, 300);
+    try std.testing.expectEqual(@as(u32, 0), r.side);
+}
+
+test "fitImageRect returns a degenerate rect for a zero-size texture" {
+    const r = fitImageRect(0, 0, 800, 600, 0, 300);
+    try std.testing.expectEqual(@as(u32, 0), r.side);
 }
 
 test "imageViewport is a square M0 viewport of side S pixels" {

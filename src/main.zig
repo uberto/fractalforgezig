@@ -13,6 +13,7 @@ const gpu = @import("gpu/device.zig");
 const ui_mod = @import("ui/imgui.zig");
 const viewport = @import("fractal/viewport.zig");
 const navigate = @import("fractal/navigate.zig");
+const autoiter = @import("fractal/autoiter.zig");
 const engine_mod = @import("fractal/engine.zig");
 const texture_mod = @import("gpu/texture.zig");
 const compute_mod = @import("gpu/compute.zig");
@@ -43,6 +44,19 @@ fn gpuIterFn(
 const window_title = "fractalforge";
 const initial_window_w = 1280;
 const initial_window_h = 720;
+
+/// Divisor for the COARSE preview resolution, applied to EACH axis (`w/4 × h/4`), so the
+/// preview keeps the region's aspect ratio and costs ~1/16 of a full pass. Dividing a single
+/// square "navigation side" instead is what used to make the preview square — and therefore
+/// letterboxed differently from the full-res image it was replaced by.
+const coarse_divisor: u32 = 4;
+
+/// How many region-size changes may restart the full-resolution pass before the loop stops
+/// chasing the size (see `NavState.region_thrash`). A UI layout whose size depends on its own
+/// content can oscillate between two values every frame; without this, each frame would cancel
+/// the pass and the image would stay blocky forever. Finishing at a slightly stale size is
+/// strictly better: `viewport.fitImageRect` letterboxes the difference instead of stretching.
+const region_thrash_limit: u8 = 8;
 
 pub fn main() !void {
     var buf: [128]u8 = undefined;
@@ -76,25 +90,32 @@ pub fn main() !void {
     const ui = try ui_mod.Ui.init(window, device);
     defer ui.shutdown();
 
-    // T5: read initial window size and compute the letterboxed image rect.
-    // Use the approximate fractal region width (full width minus data panel + spacing).
+    // Read the initial window size and ESTIMATE the fractal region: the exact region size
+    // is only known once ImGui has laid the frame out, and `runLoop` picks it up from
+    // `DrawResult.render_w/render_h` on the first frame. The estimate only has to be close
+    // enough to pick a sane startup resolution.
     var win_w: c_int = 0;
     var win_h: c_int = 0;
     _ = c.SDL_GetWindowSize(window, &win_w, &win_h);
     const panel_taken: u32 = @as(u32, @intFromFloat(panels.data_panel_w + panels.region_spacing));
-    const fractal_w_init: u32 = if (@as(u32, @intCast(win_w)) > panel_taken) @as(u32, @intCast(win_w)) - panel_taken else 1;
-    var image_rect = viewport.computeImageRect(fractal_w_init, @intCast(win_h));
-    const initial_S = image_rect.side;
+    const est_w: u32 = if (@as(u32, @intCast(win_w)) > panel_taken) @as(u32, @intCast(win_w)) - panel_taken else 1;
+    const est_h: u32 = if (win_h > 0) @intCast(win_h) else 1;
 
-    if (initial_S == 0) {
+    if (@min(est_w, est_h) == 0) {
         app_log.err("startup window has zero side (S=0); cannot initialise the engine", .{});
         return error.DegenerateWindowSize;
     }
 
     // Engine: holds the view, w×h, policy, iteration buffer, RGBA output.
+    //
+    // Startup renders COARSE (region/`coarse_divisor` on each axis), exactly like a
+    // navigation preview: the window comes up in milliseconds, and the loop's idle check
+    // promotes it to a full-resolution PROGRESSIVE pass at the region's real, rectangular
+    // size. Starting at full resolution here is what used to block the first frame — and,
+    // because the region's aspect was unknown, what produced the stretched first image.
     const view = viewport.SquareView.defaultView();
-    const init_w = image_rect.side; // start square; first resize will go rectangular
-    const init_h = image_rect.side;
+    const init_w = @max(est_w / coarse_divisor, 1);
+    const init_h = @max(est_h / coarse_divisor, 1);
     var engine = engine_mod.Engine.initRect(std.heap.page_allocator, view, init_w, init_h, .{}) catch |err| {
         app_log.err("color engine init failed ({s}); aborting startup", .{@errorName(err)});
         return err;
@@ -111,6 +132,10 @@ pub fn main() !void {
         return err;
     };
     const iterate_ns = if (iterate_timer) |*t| t.read() else 0;
+
+    // Where the coarse image lands on screen until the first frame reports the real region:
+    // aspect-preserving, so even this placeholder is never stretched.
+    var image_rect = viewport.fitImageRect(0, 0, est_w, est_h, engine.image_w, engine.image_h);
 
     var texture = try texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h);
     defer texture.destroy();
@@ -153,17 +178,34 @@ const NavState = struct {
     /// Whether to open the right-click popup this frame.
     open_ctx_menu: bool = false,
 
-    /// Whether the full-res pass has been run for the current view.
-    /// `true` at startup (the initial iterate counts as a full pass).
-    full_pass_done: bool = true,
-    /// True while a coarse pass is shown and the full-res pass hasn't run yet.
-    /// Passed to panels.draw so the UI can visually indicate rendering in progress.
-    rendering: bool = false,
+    /// Whether the full-res pass has been run for the current view. False from startup on:
+    /// the first image is a coarse preview (see `main`), promoted by the idle check.
+    full_pass_done: bool = false,
+    /// True from the moment a coarse preview goes up until the full-resolution pass finishes.
+    /// Passed to `panels.draw`, which FREEZES the edit panels while it is set: a value edited
+    /// against a half-rendered image would only apply to the next pass anyway.
+    rendering: bool = true,
     /// Set when engine output changed and needs to be uploaded to the GPU texture.
     /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
     needs_upload: bool = false,
+    /// Set for the ONE frame after an upload: the pixels went to the texture *after* the frame
+    /// that was presented, so what the user sees is one frame stale. The loop must draw once
+    /// more before it is allowed to block on events — otherwise a render that finishes in a
+    /// single chunk (GPU mode) stays invisible until an unrelated event, e.g. a mouse move,
+    /// happens to wake the loop up.
+    needs_present: bool = false,
     /// Nanoseconds taken by the most recent iteration pass (for render_ms display).
     last_render_ns: u64 = 0,
+    /// Wall-clock nanoseconds accumulated by the chunks of the in-flight progressive pass.
+    /// Reset by `beginFullPass`, reported as render_ms / gpu_render_ms on completion — so the
+    /// stat still measures the whole iteration even though it is spread over many frames.
+    pass_ns: u64 = 0,
+    /// How many times a region-size change has restarted the full-resolution pass since one
+    /// last completed. A layout that oscillates between two sizes would otherwise cancel the
+    /// pass every frame and never produce a sharp image; past `region_thrash_limit` the loop
+    /// stops chasing the size and lets the in-flight pass finish (see the region check in
+    /// `runLoop`). Cleared by `stepPassChunk` on completion.
+    region_thrash: u8 = 0,
 
     /// Timer measuring idle time since the last navigation action.
     idle_timer: ?std.time.Timer = null,
@@ -194,6 +236,8 @@ fn historyPush(nav: *NavState, old_view: viewport.SquareView) void {
 fn historyUndo(
     engine: *engine_mod.Engine,
     nav: *NavState,
+    real_w: u32,
+    real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     if (nav.undo_len == 0) return;
@@ -203,20 +247,15 @@ fn historyUndo(
         nav.redo_buf[nav.redo_len] = engine.view;
         nav.redo_len += 1;
     }
-    engine.setViewport(prev) catch |err| {
-        app_log.err("undo rejected ({s})", .{@errorName(err)});
-        return;
-    };
-    nav.needs_upload = true;
-    nav.full_pass_done = false;
-    nav.idle_timer = std.time.Timer.start() catch null;
-    view_editor.syncFromView(engine.view);
+    showViewCoarse(engine, nav, prev, real_w, real_h, view_editor);
 }
 
 /// Redo: restore the most recent undone view.
 fn historyRedo(
     engine: *engine_mod.Engine,
     nav: *NavState,
+    real_w: u32,
+    real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     if (nav.redo_len == 0) return;
@@ -226,14 +265,7 @@ fn historyRedo(
         nav.undo_buf[nav.undo_len] = engine.view;
         nav.undo_len += 1;
     }
-    engine.setViewport(next) catch |err| {
-        app_log.err("redo rejected ({s})", .{@errorName(err)});
-        return;
-    };
-    nav.needs_upload = true;
-    nav.full_pass_done = false;
-    nav.idle_timer = std.time.Timer.start() catch null;
-    view_editor.syncFromView(engine.view);
+    showViewCoarse(engine, nav, next, real_w, real_h, view_editor);
 }
 
 // ─── View-change helpers ───────────────────────────────────────────────────────
@@ -248,34 +280,40 @@ fn syncTexture(device: gpu.Device, texture: *texture_mod.Texture, engine: *engin
     };
 }
 
-/// Apply a new view with an immediate coarse (S/4) pass and upload.
-/// `real_w/real_h` are the full-resolution dimensions to restore for the full pass.
+/// Apply a new view: push the old one on the undo stack, then show it (see `showViewCoarse`).
+/// Every USER navigation (gesture, context menu, coord panel) comes through here; undo/redo
+/// and file-load skip the history push and call `showViewCoarse` directly.
 fn applyViewCoarse(
     engine: *engine_mod.Engine,
     nav: *NavState,
     new_view: viewport.SquareView,
-    real_s: u32,
+    real_w: u32,
+    real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     historyPush(nav, engine.view);
-    var t = std.time.Timer.start() catch null;
+    showViewCoarse(engine, nav, new_view, real_w, real_h, view_editor);
+}
 
-    // Coarse: real_s/4 (square navigation side / 4) for both dimensions.
-    // Using the navigation square side keeps the coarse pass square for simplicity.
-    const coarse_s = @max(real_s / 4, 1);
-    const coarse_w = coarse_s;
-    const coarse_h = coarse_s;
-
-    // Resize to coarse if dimensions changed.
-    if (engine.image_w != coarse_w or engine.image_h != coarse_h) {
-        engine.resizeRect(coarse_w, coarse_h) catch |err| {
-            app_log.err("coarse resize to {d}×{d} failed ({s})", .{ coarse_w, coarse_h, @errorName(err) });
-        };
-    }
-
-    // Install the new view (re-iterates at current size).
-    engine.setViewport(new_view) catch |err| {
+/// Install `new_view` and render it COARSE right away, then arm the full-resolution pass.
+///
+/// This is the ONE path every view change takes, and the reason none of them can freeze the
+/// window: `installView` does not render, the coarse pass costs ~1/16 of a full one, and the
+/// full-resolution render that follows is the chunked progressive pass (`beginFullPass` /
+/// `stepPassChunk`) with a progress bar. A rejected view leaves the previous image up.
+fn showViewCoarse(
+    engine: *engine_mod.Engine,
+    nav: *NavState,
+    new_view: viewport.SquareView,
+    real_w: u32,
+    real_h: u32,
+    view_editor: *editor_mod.ViewEditor,
+) void {
+    // Any in-flight pass belongs to the OLD view; its remaining rows must not land.
+    engine.cancelPass();
+    engine.installView(new_view) catch |err| {
         app_log.err("navigation rejected ({s}); keeping previous view", .{@errorName(err)});
+        view_editor.syncFromView(engine.view);
         return;
     };
 
@@ -287,37 +325,107 @@ fn applyViewCoarse(
         } else |_| {}
     }
 
-    if (t) |*timer| nav.last_render_ns = timer.read();
-    nav.needs_upload = true;
-    nav.rendering = true;
+    renderCoarse(engine, nav, real_w, real_h);
     view_editor.syncFromView(engine.view);
-    nav.full_pass_done = false;
-    nav.idle_timer = std.time.Timer.start() catch null;
+    armFullPass(nav);
 }
 
-/// Restore full-resolution dimensions, re-iterate, sync texture, re-upload.
-fn runFullPass(
+/// Install a new `max_iter` policy the same way: coarse now, full-res progressively after.
+/// `max_iter` feeds the iteration itself, so this is a re-render, not a recolor.
+fn showPolicyCoarse(
     engine: *engine_mod.Engine,
     nav: *NavState,
+    policy: autoiter.IterPolicy,
     real_w: u32,
     real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
-    var t = std.time.Timer.start() catch null;
-    if (engine.image_w != real_w or engine.image_h != real_h) {
-        engine.resizeRect(real_w, real_h) catch |err| {
-            app_log.err("full-res resize to {d}×{d} failed ({s}); display stays coarse", .{ real_w, real_h, @errorName(err) });
-            nav.full_pass_done = true;
-            return;
-        };
-    }
-    if (t) |*timer| nav.last_render_ns = timer.read();
+    engine.cancelPass();
+    engine.installPolicy(policy) catch |err| {
+        app_log.err("max_iter policy rejected ({s}); keeping the previous one", .{@errorName(err)});
+        view_editor.syncFromPolicy(engine.policy);
+        return;
+    };
+    renderCoarse(engine, nav, real_w, real_h);
+    view_editor.syncFromPolicy(engine.policy);
+    armFullPass(nav);
+}
 
+/// One blocking iterate at the COARSE resolution — `real_w/coarse_divisor` ×
+/// `real_h/coarse_divisor`, i.e. per-axis, so the preview carries the region's aspect ratio.
+/// Cheap by construction (~1/16 of the pixels), which is what makes a blocking call here
+/// acceptable while the full-resolution render is chunked.
+fn renderCoarse(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h: u32) void {
+    var t = std.time.Timer.start() catch null;
+    const coarse_w = @max(real_w / coarse_divisor, 1);
+    const coarse_h = @max(real_h / coarse_divisor, 1);
+    engine.resizeRect(coarse_w, coarse_h) catch |err| {
+        app_log.err(
+            "coarse pass at {d}×{d} failed ({s}); display keeps the previous image",
+            .{ coarse_w, coarse_h, @errorName(err) },
+        );
+        return;
+    };
+    if (t) |*timer| nav.last_render_ns = timer.read();
     nav.needs_upload = true;
-    nav.rendering = false;
-    view_editor.syncFromView(engine.view);
+}
+
+/// Arm the coarse→fine promotion: the loop's idle check (`refine.decidePass`) starts the
+/// full-resolution progressive pass once the user has held still past the idle threshold.
+fn armFullPass(nav: *NavState) void {
+    nav.rendering = true;
+    nav.full_pass_done = false;
+    nav.idle_timer = std.time.Timer.start() catch null;
+}
+
+/// Start the full-resolution progressive pass for the current view at the fractal region's
+/// real, rectangular size. `beginPass` reallocates the buffers and seeds them with a
+/// nearest-neighbour upsample of the coarse image, so the very first frame already shows the
+/// right framing as a BLOCKY preview that then sharpens band by band.
+fn beginFullPass(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h: u32) void {
+    nav.pass_ns = 0;
+    engine.beginPass(real_w, real_h) catch |err| {
+        app_log.err(
+            "full-res pass at {d}×{d} could not start ({s}); display stays coarse",
+            .{ real_w, real_h, @errorName(err) },
+        );
+        nav.full_pass_done = true;
+        nav.rendering = false;
+        return;
+    };
+    nav.needs_upload = true;
+}
+
+/// Run ONE time-budgeted chunk of the in-flight pass — once per frame, which is exactly what
+/// keeps the window drawing (and the status-bar progress bar moving) during a full-resolution
+/// render. On completion, reports the pass's accumulated cost as render_ms / gpu_render_ms.
+fn stepPassChunk(engine: *engine_mod.Engine, nav: *NavState, app_stats: *stats_mod.Stats) void {
+    var t = std.time.Timer.start() catch null;
+    const finished = engine.stepPass() catch |err| {
+        app_log.err("progressive pass aborted ({s}); keeping the partly refined image", .{@errorName(err)});
+        engine.cancelPass();
+        nav.full_pass_done = true;
+        nav.rendering = false;
+        return;
+    };
+    if (t) |*timer| nav.pass_ns += timer.read();
+    nav.needs_upload = true;
+    if (!finished) return;
+
     nav.full_pass_done = true;
-    app_log.info("full-res pass complete: {d}×{d}", .{ engine.image_w, engine.image_h });
+    nav.rendering = false;
+    nav.region_thrash = 0;
+    // The full pass's own timing supersedes the coarse preview's.
+    nav.last_render_ns = 0;
+    const ms = stats_mod.nsToMs(nav.pass_ns);
+    if (engine.use_gpu) {
+        app_stats.gpu_render_ms = ms;
+        app_stats.render_ms = 0.0;
+    } else {
+        app_stats.render_ms = ms;
+        app_stats.gpu_render_ms = 0.0;
+    }
+    app_log.info("full-res pass complete: {d}×{d} in {d:.1} ms", .{ engine.image_w, engine.image_h, ms });
 }
 
 // ─── Main event / render loop ─────────────────────────────────────────────────
@@ -341,13 +449,16 @@ fn runLoop(
         break :blk null;
     };
 
-    var nav = NavState{};
+    // Startup is a coarse preview (see `main`), so the loop opens "rendering": the first
+    // frame reports the region size and the idle check promotes it to a full-res pass.
+    var nav = NavState{ .idle_timer = std.time.Timer.start() catch null };
     var pending_dialog = dialog.PendingDialog{};
-    // Track the full-resolution dimensions independently of engine.image_w/h (which may
-    // be at coarse size during a drag).
+    // The FULL-RESOLUTION target: the fractal region's live pixel size, reported by
+    // `panels.draw` each frame. Tracked separately from `engine.image_w/h`, which is at the
+    // coarse preview size while a navigation is in flight.
     var real_w: u32 = engine.image_w;
     var real_h: u32 = engine.image_h;
-    // Keeping real_s for the few remaining callers that still need a nav-square side.
+    // The navigation square side that goes with it (pan/zoom geometry is square).
     var real_s: u32 = engine.image_side;
 
     var running = true;
@@ -355,12 +466,25 @@ fn runLoop(
         if (frame_timer) |*t| t.reset();
 
         // ── SDL event pump — wait for the first event then drain the queue.
-        // WaitEvent blocks until at least one event arrives, keeping CPU idle.
-        // When a dialog is pending we use a short timeout so the Cocoa runloop
-        // keeps pumping and can deliver the file-dialog completion callback.
+        // How long we may block depends on whether the app owes the user work:
+        //   * a progressive pass in flight → DON'T block at all; every frame runs one more
+        //     chunk, and blocking here would stall the render and the progress bar;
+        //   * an upload not yet on screen (`needs_present`) → DON'T block either; the pixels
+        //     were uploaded after the last frame was presented, so one more frame is owed
+        //     before we may sleep, or the finished image never shows up;
+        //   * a coarse preview waiting for its full pass, or a pending file dialog → a short
+        //     timeout, so the idle threshold can elapse (and the Cocoa runloop keeps
+        //     pumping, which is how the dialog's completion callback gets delivered);
+        //   * otherwise the image is final AND on screen → block until something happens,
+        //     keeping the CPU idle instead of spinning.
         var event: c.SDL_Event = undefined;
-        const wait_ms: i32 = if (pending_dialog.kind != dialog.Kind.none) 16 else -1;
-        if (c.SDL_WaitEventTimeout(&event, wait_ms)) {
+        const owes_full_pass = !nav.full_pass_done or pending_dialog.kind != dialog.Kind.none;
+        const wait_ms: i32 = if (owes_full_pass) 16 else -1;
+        const got_event = if (engine.pass != null or nav.needs_present)
+            c.SDL_PollEvent(&event)
+        else
+            c.SDL_WaitEventTimeout(&event, wait_ms);
+        if (got_event) {
             while (true) {
                 _ = ui.processEvent(&event);
                 switch (event.type) {
@@ -368,16 +492,10 @@ fn runLoop(
                     c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                         if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
                     },
-                    // T5: resize recomputes S, engine buffers, and GPU texture.
-                    // After a resize, real_s follows the new S (it is already full-res).
-                    c.SDL_EVENT_WINDOW_RESIZED => {
-                        handleResize(device, texture, image_rect, engine, @intCast(event.window.data1), @intCast(event.window.data2));
-                        real_w = engine.image_w;
-                        real_h = engine.image_h;
-                        real_s = engine.image_side;
-                        nav.full_pass_done = true;
-                        view_editor.syncFromView(engine.view);
-                    },
+                    // A resize needs no handler: the region-size check below sees the new
+                    // `render_w/render_h` next frame, cancels any in-flight pass and re-arms
+                    // the full pass — which, because the size keeps changing while the mouse
+                    // drags the window edge, only runs once the resize SETTLES.
                     // Scroll-zoom: zoom toward the cursor point (plan A4).
                     c.SDL_EVENT_MOUSE_WHEEL => {
                         if (event.wheel.y != 0.0) {
@@ -392,7 +510,7 @@ fn runLoop(
                                     navigate.zoom_step_out;
                                 const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
                                 if (new_view) |v|
-                                    applyViewCoarse(engine, &nav, v, real_s, view_editor);
+                                    applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
                             }
                         }
                     },
@@ -412,9 +530,9 @@ fn runLoop(
                         const ctrl = (mods & c.SDL_KMOD_CTRL) != 0;
                         if (ctrl) {
                             if (event.key.scancode == c.SDL_SCANCODE_Z) {
-                                historyUndo(engine, &nav, view_editor);
+                                historyUndo(engine, &nav, real_w, real_h, view_editor);
                             } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
-                                historyRedo(engine, &nav, view_editor);
+                                historyRedo(engine, &nav, real_w, real_h, view_editor);
                             }
                         }
                     },
@@ -447,32 +565,49 @@ fn runLoop(
             nav.right_click_pt,
             hover_pt,
             nav.rendering,
+            engine.passFraction(),
             &quit_requested,
         );
         // Update image_rect from the live ImGui geometry every frame so coordinate
-        // mapping and resize use the actual fractal region (not the OS window size).
+        // mapping uses the actual on-screen image (not the OS window size).
         if (draw_result.image_rect.side > 0) image_rect.* = draw_result.image_rect;
         nav.open_ctx_menu = false;
         if (quit_requested) running = false;
 
-        // GPU/CPU toggle: re-iterate on the new path, upload will happen in the deferred block.
-        if (draw_result.needs_rerender) {
-            var t = std.time.Timer.start() catch null;
-            engine.iterate() catch |err| {
-                app_log.err("GPU toggle re-iterate failed ({s}); reverting", .{@errorName(err)});
-                engine.use_gpu = !engine.use_gpu;
-            };
-            if (t) |*timer| {
-                const ns = timer.read();
-                if (engine.use_gpu) {
-                    app_stats.gpu_render_ms = stats_mod.nsToMs(ns);
-                    app_stats.render_ms = 0.0;
-                } else {
-                    app_stats.render_ms = stats_mod.nsToMs(ns);
-                    app_stats.gpu_render_ms = 0.0;
-                }
+        // ── Follow the fractal region's live size ─────────────────────────────
+        // The region — not the OS window — is the full-resolution target, and only ImGui
+        // knows it (menu bar, status bar, padding and the data panel all take a slice). A
+        // change means a window resize or a layout change: the in-flight pass is for the old
+        // size, so drop it and re-arm. Re-arming restarts the idle timer, so a drag that
+        // resizes the window every frame defers the full pass until it settles.
+        //
+        // Bounded by `region_thrash_limit`: a layout that oscillates would otherwise cancel the
+        // pass every frame and never sharpen. Past the limit, keep the current target and let
+        // the pass finish — a stale size is letterboxed by `fitImageRect`, never stretched.
+        if (draw_result.render_w > 0 and draw_result.render_h > 0 and
+            (draw_result.render_w != real_w or draw_result.render_h != real_h))
+        {
+            if (nav.region_thrash < region_thrash_limit) {
+                nav.region_thrash += 1;
+                real_w = draw_result.render_w;
+                real_h = draw_result.render_h;
+                real_s = @min(real_w, real_h);
+                engine.cancelPass();
+                armFullPass(&nav);
+            } else if (nav.region_thrash == region_thrash_limit) {
+                nav.region_thrash += 1; // warn once per stalled pass
+                app_log.warn(
+                    "fractal region size keeps changing ({d}×{d} vs {d}×{d}); finishing the pass at {d}×{d}",
+                    .{ draw_result.render_w, draw_result.render_h, real_w, real_h, real_w, real_h },
+                );
             }
-            nav.needs_upload = true;
+        }
+
+        // GPU/CPU toggle: re-render on the new path — coarse now, full-res progressively.
+        if (draw_result.needs_rerender) {
+            engine.cancelPass();
+            renderCoarse(engine, &nav, real_w, real_h);
+            armFullPass(&nav);
         }
 
         // Open file dialogs when menu items were clicked (after the ImGui frame).
@@ -488,22 +623,35 @@ fn runLoop(
                 .center_here => viewport.SquareView.fromCenterSide(pt, engine.view.side) catch null,
                 .none => null,
             };
-            if (new_view) |v| applyViewCoarse(engine, &nav, v, real_s, view_editor);
+            if (new_view) |v| applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
         }
 
+        // Coord-panel commits. The panel only PARSES and asks (see `panels.CoordRequest`);
+        // installing a view or policy is a re-render, and it goes through the same coarse →
+        // progressive path as a gesture so the window keeps drawing.
+        if (draw_result.coord.view) |v| applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+        if (draw_result.coord.policy) |p| showPolicyCoarse(engine, &nav, p, real_w, real_h, view_editor);
+
         // Navigation ImGui input: box-select and pan.
-        handleNavInput(engine, &nav, image_rect.*, real_s, view_editor);
+        handleNavInput(engine, &nav, image_rect.*, real_w, real_h, real_s, view_editor);
 
         ui.endFrame();
 
-        // ── Coarse→fine pass decision ─────────────────────────────────────────
-        const interacting = (nav.drag_state == .active) or
-            ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
-            (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
-        const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
-        switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
-            .full => runFullPass(engine, &nav, real_w, real_h, view_editor),
-            .coarse, .none => {},
+        // ── Coarse→fine pass dispatch ─────────────────────────────────────────
+        // A pass already in flight advances by one chunk per frame; otherwise the pure
+        // `refine.decidePass` decides whether the user has been still long enough to promote
+        // the coarse preview to a full-resolution pass.
+        if (engine.pass != null) {
+            stepPassChunk(engine, &nav, app_stats);
+        } else {
+            const interacting = (nav.drag_state == .active) or
+                ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
+                (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
+            const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
+            switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
+                .full => beginFullPass(engine, &nav, real_w, real_h),
+                .coarse, .none => {},
+            }
         }
 
         renderFrame(window, device, ui);
@@ -520,10 +668,13 @@ fn runLoop(
             };
             nav.needs_upload = false;
         }
+        // An upload lands after this frame was presented, so the new pixels are owed one more
+        // frame. Cleared automatically on that frame, which uploads nothing.
+        nav.needs_present = did_upload;
 
         // ── File dialog result processing ─────────────────────────────────────
         if (dialog.takePending(&pending_dialog)) |result| {
-            handleDialogResult(result, device, texture, engine, &nav, view_editor);
+            handleDialogResult(result, device, texture, engine, &nav, real_w, real_h, view_editor);
         }
 
         // Only update frame_ms when the fractal actually re-rendered; skip mouse-move frames.
@@ -544,6 +695,8 @@ fn handleDialogResult(
     texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
+    real_w: u32,
+    real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     const alloc = std.heap.page_allocator;
@@ -595,6 +748,12 @@ fn handleDialogResult(
             };
             defer persist.freeState(state, alloc);
 
+            // Drop to the coarse size FIRST: `applyToEngine` installs the loaded view with
+            // `setViewport`, which re-iterates at the engine's current resolution — at full
+            // res that is the blocking render the progressive path exists to avoid.
+            engine.cancelPass();
+            renderCoarse(engine, nav, real_w, real_h);
+
             persist.applyToEngine(state, engine) catch |err| {
                 app_log.err("open: applyToEngine failed for '{s}' ({s})", .{ path, @errorName(err) });
                 return;
@@ -602,9 +761,9 @@ fn handleDialogResult(
 
             syncTexture(device, texture, engine);
             view_editor.syncFromView(engine.view);
+            view_editor.syncFromPolicy(engine.policy);
             nav.needs_upload = true;
-            nav.full_pass_done = false;
-            nav.idle_timer = std.time.Timer.start() catch null;
+            armFullPass(nav);
             app_log.info("state loaded from '{s}'", .{path});
         },
         .none => {},
@@ -621,6 +780,8 @@ fn handleNavInput(
     engine: *engine_mod.Engine,
     nav: *NavState,
     rect: viewport.ImageRect,
+    real_w: u32,
+    real_h: u32,
     real_s: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
@@ -644,7 +805,7 @@ fn handleNavInput(
                 break :blk null;
             };
             if (new_view) |v| {
-                applyViewCoarse(engine, nav, v, real_s, view_editor);
+                applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
                 ig.igResetMouseDragDelta(btn);
             }
         }
@@ -714,7 +875,7 @@ fn handleNavInput(
                 app_log.warn("box-select rejected ({s})", .{@errorName(err)});
                 break :blk null;
             };
-            if (new_view) |v| applyViewCoarse(engine, nav, v, real_s, view_editor);
+            if (new_view) |v| applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
         }
@@ -725,49 +886,6 @@ fn handleNavInput(
             ig.igResetMouseDragDelta(ig.mouse_button_left);
         }
     }
-}
-
-// ─── Resize handler ───────────────────────────────────────────────────────────
-
-/// Handle a window resize: recompute image rect; when S changes, resize engine,
-/// recreate texture, re-upload. Zero S (minimized) is a no-op.
-fn handleResize(
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
-    image_rect: *viewport.ImageRect,
-    engine: *engine_mod.Engine,
-    new_w: u32,
-    new_h: u32,
-) void {
-    // Approximate the fractal region width (data panel + spacing taken from the right).
-    // The exact rect is updated each frame from ImGui geometry; this gives the correct
-    // engine size so the first post-resize render uses the right resolution.
-    // Approximate the fractal region dimensions (data panel taken from the right).
-    const panel_taken: u32 = @as(u32, @intFromFloat(panels.data_panel_w + panels.region_spacing));
-    const frac_w = if (new_w > panel_taken) new_w - panel_taken else 1;
-    const frac_h = if (new_h > 0) new_h else 1;
-
-    if (frac_w == 0 or frac_h == 0) return;
-    if (frac_w == engine.image_w and frac_h == engine.image_h) return;
-
-    engine.resizeRect(frac_w, frac_h) catch |err| {
-        app_log.err("engine resize to {d}×{d} failed ({s}); keeping previous render", .{ frac_w, frac_h, @errorName(err) });
-        return;
-    };
-
-    texture.destroy();
-    texture.* = texture_mod.createRgbaTexture(device.handle, frac_w, frac_h) catch |err| {
-        app_log.err("texture recreation at {d}×{d} failed ({s}); display may be stale", .{ frac_w, frac_h, @errorName(err) });
-        return;
-    };
-
-    texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-        app_log.err("texture re-upload after resize failed ({s})", .{@errorName(err)});
-        return;
-    };
-
-    _ = image_rect; // updated each frame from ImGui geometry
-    app_log.info("resize: window {d}x{d} → fractal {d}×{d}", .{ new_w, new_h, frac_w, frac_h });
 }
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────

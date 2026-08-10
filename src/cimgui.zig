@@ -186,6 +186,11 @@ pub extern fn igEndChild() void;
 pub const window_flags_no_scrollbar: WindowFlags = 1 << 3;
 pub const window_flags_no_scroll_with_mouse: WindowFlags = 1 << 4;
 
+/// Progress bar (M5: the status-bar rendering indicator). `fraction` is clamped by ImGui to
+/// `[0, 1]`; a negative `size_arg.x` means "the available width plus that value", so
+/// `{ .x = -1.0 }` spans the region. `overlay` is drawn centered on the bar (null = "42%").
+pub extern fn igProgressBar(fraction: f32, size_arg: ImVec2, overlay: ?[*:0]const u8) void;
+
 // Collapsible header. Returns true when the section is open/expanded.
 pub const TreeNodeFlags = c_int;
 pub extern fn igCollapsingHeader_TreeNodeFlags(label: [*:0]const u8, flags: TreeNodeFlags) bool;

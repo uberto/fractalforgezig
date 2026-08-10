@@ -25,7 +25,7 @@ const msl_source: [*:0]const u8 = @embedFile("shaders/mandelbrot.metal");
 pub const MandelbrotUniforms = extern struct {
     center_re: f32,
     center_im: f32,
-    scale: f32,   // complex units per pixel (based on min(w,h))
+    scale: f32, // complex units per pixel (based on min(w,h))
     width: u32,
     height: u32,
     max_iter: u32,

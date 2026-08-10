@@ -38,6 +38,10 @@ pub const IterError = error{
     /// logging/reporting to the edge (the engine/app wiring), matching the
     /// milestone's "pure fractal core has no SDL/GPU/log infra" testability rule.
     BufferSizeMismatch,
+    /// `iterateRowsInto` was asked for a band (`y0 + rows`) that runs past the image's
+    /// last row. Returned rather than clamped so a scheduler that loses track of its
+    /// row cursor fails loudly instead of silently re-iterating the bottom row.
+    RowRangeOutOfBounds,
 };
 
 /// Result of the timing wrapper: the freshly allocated smooth-value buffer plus the
@@ -57,12 +61,32 @@ pub fn iterationBufferLen(vp: Viewport) usize {
 /// PURE and deterministic: no allocation, no clock, no global state. `buf.len` MUST
 /// equal `iterationBufferLen(vp)`; a mismatch returns `IterError.BufferSizeMismatch`
 /// rather than writing out of bounds. Interior pixels keep the `-1.0` sentinel.
+///
+/// Delegates to `iterateRowsInto` for every row, so the whole-image path and the
+/// row-band path used by the progressive renderer share ONE per-pixel implementation
+/// (and therefore produce scalar-identical values — pinned by a test below).
 pub fn iterateInto(buf: []f32, vp: Viewport, max_iter: u32) IterError!void {
+    return iterateRowsInto(buf, vp, max_iter, 0, vp.height);
+}
+
+/// Iterate ONLY image rows `y0 .. y0 + rows` of `vp` into `buf`, leaving every other row
+/// untouched. `buf` is the FULL `width * height` buffer (not the band), so a band write
+/// lands at the same indices the whole-image pass would use — that is what lets M5's
+/// progressive renderer fill an image in per-frame chunks while the rest of the buffer
+/// still shows the upsampled preview (`progressive.upsampleInto`).
+///
+/// PURE and deterministic. `buf.len` MUST equal `iterationBufferLen(vp)`; a band that
+/// would run past the last row is rejected with `IterError.RowRangeOutOfBounds` rather
+/// than clamped, so a scheduler bug fails loudly and testably. `rows == 0` is a legal
+/// no-op (the scheduler can call it on a finished pass).
+pub fn iterateRowsInto(buf: []f32, vp: Viewport, max_iter: u32, y0: u32, rows: u32) IterError!void {
     const expected = iterationBufferLen(vp);
     if (buf.len != expected) return IterError.BufferSizeMismatch;
+    const end = @as(u64, y0) + @as(u64, rows);
+    if (end > @as(u64, vp.height)) return IterError.RowRangeOutOfBounds;
 
-    var y: u32 = 0;
-    while (y < vp.height) : (y += 1) {
+    var y: u32 = y0;
+    while (y < y0 + rows) : (y += 1) {
         var x: u32 = 0;
         while (x < vp.width) : (x += 1) {
             // Sample the pixel CENTER (see the file header on the +0.5 convention).
@@ -187,6 +211,57 @@ test "iterateInto: the fixed centered view is symmetric about the real axis (top
             );
         }
     }
+}
+
+test "iterateRowsInto writes exactly the requested band and leaves the rest untouched" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var buf: [golden_w * golden_h]f32 = undefined;
+    const sentinel: f32 = 12345.0;
+    @memset(&buf, sentinel);
+    try iterateRowsInto(&buf, vp, golden_iter, 10, 3);
+
+    // Rows 10..12 are filled (no longer the sentinel); every other row still is.
+    var y: usize = 0;
+    while (y < golden_h) : (y += 1) {
+        const in_band = (y >= 10 and y < 13);
+        var x: usize = 0;
+        while (x < golden_w) : (x += 1) {
+            const touched = valueAt(&buf, golden_w, x, y) != sentinel;
+            try std.testing.expectEqual(in_band, touched);
+        }
+    }
+}
+
+test "iterateRowsInto in bands reproduces the whole-image pass exactly" {
+    // The guarantee the progressive renderer rests on: chunking changes nothing.
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var whole: [golden_w * golden_h]f32 = undefined;
+    try iterateInto(&whole, vp, golden_iter);
+
+    var banded: [golden_w * golden_h]f32 = undefined;
+    var y0: u32 = 0;
+    const band: u32 = 7; // does not divide golden_h evenly — the last band is short
+    while (y0 < golden_h) : (y0 += band) {
+        try iterateRowsInto(&banded, vp, golden_iter, y0, @min(band, golden_h - y0));
+    }
+    try std.testing.expectEqualSlices(f32, &whole, &banded);
+}
+
+test "iterateRowsInto rejects a band that runs past the last row" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var buf: [golden_w * golden_h]f32 = undefined;
+    try std.testing.expectError(
+        IterError.RowRangeOutOfBounds,
+        iterateRowsInto(&buf, vp, golden_iter, golden_h - 2, 3),
+    );
+}
+
+test "iterateRowsInto with zero rows is a no-op" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var buf: [golden_w * golden_h]f32 = undefined;
+    @memset(&buf, 0.0);
+    try iterateRowsInto(&buf, vp, golden_iter, 5, 0);
+    try std.testing.expectEqual(@as(f32, 0.0), valueAt(&buf, golden_w, 0, 5));
 }
 
 test "iterate wrapper allocates the buffer and populates a non-zero elapsed_ns" {

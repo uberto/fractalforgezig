@@ -6,9 +6,11 @@
 //! THE GUARANTEE (plan constraint, re-pinned for M3): editing the palette or mapping reruns
 //! ONLY the cheap color pass — it NEVER re-runs the expensive Mandelbrot iteration. Two
 //! counters make that observable and testable:
-//!   * `iteration_passes` — bumped ONLY by `iterate` (refills the `[]f32` smooth buffer).
-//!     The paths that reach it are `iterate`, `setViewport`, `setPolicy` and `resize`, i.e.
-//!     exactly the inputs the iteration depends on.
+//!   * `iteration_passes` — bumped ONLY by a completed iteration of the smooth buffer: by
+//!     `iterate` (the one-shot path, reached through `setViewport`, `setPolicy` and `resize`)
+//!     or by the final chunk of a progressive pass (`beginPass` → `stepPass`, M5), which is
+//!     the SAME iteration split across frames and so counts exactly once. Both are refills
+//!     of the `[]f32` buffer, i.e. exactly the inputs the iteration depends on.
 //!   * `color_passes`     — bumped by every recolor: each of the above (they recolor too)
 //!     and each of `setGradient` / `setMapping` / `setInterior`.
 //! A palette/mapping edit therefore bumps `color_passes` while `iteration_passes` stays put,
@@ -57,6 +59,7 @@ const mapping = @import("mapping.zig");
 const colorpass = @import("colorpass.zig");
 const color = @import("color.zig");
 const autoiter = @import("autoiter.zig");
+const progressive = @import("progressive.zig");
 
 const Viewport = viewport.Viewport;
 const SquareView = viewport.SquareView;
@@ -89,8 +92,10 @@ pub const EngineError = error{
 
 /// Everything an iteration path (`iterate`, `setViewport`, `setPolicy`) can return: this
 /// module's own failures, T1's degenerate-view rejection and T3's `max_iter` rejections.
-/// `iterbuf.IterError` / `colorpass.ColorError` fold in as `BufferSizeMismatch`.
-pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoIterError;
+/// `colorpass.ColorError` folds in as `BufferSizeMismatch`; `iterbuf.IterError` folds in
+/// whole, so M5's row-band path can surface `RowRangeOutOfBounds` under its own name rather
+/// than being flattened into a size mismatch it is not.
+pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoIterError || iterbuf.IterError;
 
 /// `IterateError` plus allocation failure — what the paths that (re)allocate the buffers
 /// (`init`, `resize`) can return.
@@ -156,6 +161,11 @@ pub const Engine = struct {
     /// Optional GPU iteration function set by `main.zig` after pipeline creation.
     /// Null until wired; `iterate` falls back to CPU when null.
     gpu_iter_fn: ?IterFn,
+    /// The in-flight progressive pass (M5), or null when the image is final. Non-null means
+    /// rows `pass.rows_done ..` still show the seeded preview, so the UI must report
+    /// "rendering" and freeze the edit panels. Owned by `beginPass`/`stepPass`; read it
+    /// through `passFraction`.
+    pass: ?progressive.Pass,
 
     /// Allocate the smooth-value + RGBA8 buffers for a square image of side `image_side`,
     /// derive `max_iter` from `policy` at `view`'s magnification, install the default
@@ -221,6 +231,7 @@ pub const Engine = struct {
             .color_passes = 0,
             .use_gpu = false,
             .gpu_iter_fn = null,
+            .pass = null,
         };
         gradient.bakeLut(g, &engine.lut);
         return engine;
@@ -238,6 +249,8 @@ pub const Engine = struct {
     /// and log the one-line pass summary. Bumps `iteration_passes` AND `color_passes`.
     /// This is the ONLY path that touches `iteration_passes`.
     pub fn iterate(self: *Engine) IterateError!void {
+        // A one-shot pass supersedes any in-flight progressive pass for the old inputs.
+        self.pass = null;
         try validateGeometry(self.view, self.image_side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
         const vp = self.renderViewport();
@@ -267,6 +280,29 @@ pub const Engine = struct {
         errdefer self.view = previous;
         self.view = view;
         try self.iterate();
+    }
+
+    /// Install a new view WITHOUT rendering it: refreshes `max_iter` for the new view and
+    /// leaves the buffers showing the PREVIOUS view's image until the caller runs the next
+    /// pass (`iterate`, `resizeRect`, or `beginPass` + `stepPass`). Bumps neither counter —
+    /// nothing was rendered. A degenerate view is rejected and leaves the engine untouched.
+    ///
+    /// This is the seam the progressive path needs: `setViewport` re-iterates at the CURRENT
+    /// resolution, and at full resolution that is exactly the blocking render M5 exists to
+    /// avoid. The edge installs the view, then renders it coarse (cheap) or progressively.
+    pub fn installView(self: *Engine, view: SquareView) IterateError!void {
+        try validateGeometry(view, self.image_side);
+        self.max_iter = try effectiveMaxIter(view, self.policy);
+        self.view = view;
+    }
+
+    /// Install a new `max_iter` policy WITHOUT rendering it — the `setPolicy` counterpart of
+    /// `installView`, with the same contract: `max_iter` is refreshed, the image is stale
+    /// until the next pass, neither counter moves, and a policy the current magnification
+    /// cannot satisfy is rejected with the previous one left in place.
+    pub fn installPolicy(self: *Engine, policy: IterPolicy) IterateError!void {
+        self.max_iter = try effectiveMaxIter(self.view, policy);
+        self.policy = policy;
     }
 
     /// Install a new `max_iter` policy (T7's auto/manual control) and re-iterate: unlike the
@@ -321,6 +357,139 @@ pub const Engine = struct {
         try self.iterate();
     }
 
+    // ─── M5: the progressive (chunked) pass ──────────────────────────────────
+    //
+    // `iterate` refills the whole buffer in one call, which at full resolution blocks the
+    // frame long enough to freeze the window. `beginPass` + repeated `stepPass` run that
+    // SAME iteration in per-frame chunks, so the edge keeps drawing (and can show a
+    // progress bar) while it runs. The finished buffer is scalar-identical to `iterate`'s
+    // (pinned by a test below) and the counters move exactly once, at completion.
+
+    /// Start a progressive pass at `w × h`, seeding the display with a BLOCKY PREVIEW.
+    ///
+    /// Refreshes `max_iter` from the policy, and when the dimensions changed, reallocates the
+    /// buffers and fills the new smooth buffer with a nearest-neighbour upsample of the old
+    /// one (`progressive.upsampleInto`) so the first frame of the pass shows a blocky version
+    /// of the same view instead of black; the seeded image is coloured immediately. Then the
+    /// caller drives `stepPass` once per frame until it returns true.
+    ///
+    /// Bumps NEITHER counter — the pass counts once, when its last chunk lands. Failure-atomic
+    /// like `resizeRect`: a rejected geometry or a failed allocation leaves the engine on its
+    /// previous buffers, dimensions and (cleared) pass state, still renderable.
+    pub fn beginPass(self: *Engine, w: u32, h: u32) ResizeError!void {
+        self.pass = null;
+        const side = @min(w, h);
+        try validateGeometry(self.view, side);
+        self.max_iter = try effectiveMaxIter(self.view, self.policy);
+        const sizes = try bufferSizesRect(w, h);
+
+        if (w != self.image_w or h != self.image_h) {
+            const iter = self.alloc.alloc(f32, sizes.pixels) catch |err| {
+                logResizeFailure(side);
+                return err;
+            };
+            const rgba = self.alloc.alloc(u8, sizes.bytes) catch |err| {
+                self.alloc.free(iter);
+                logResizeFailure(side);
+                return err;
+            };
+            // Seed the preview. A failed upsample is not fatal — a black start still
+            // renders correctly once the chunks land — so it degrades to a zero fill.
+            progressive.upsampleInto(iter, w, h, self.iter, self.image_w, self.image_h) catch |err| {
+                log.warn("preview upsample to {d}×{d} skipped ({s}); starting from black", .{ w, h, @errorName(err) });
+                @memset(iter, 0.0);
+            };
+            @memset(rgba, 0);
+            self.alloc.free(self.iter);
+            self.alloc.free(self.rgba);
+            self.iter = iter;
+            self.rgba = rgba;
+            self.image_w = w;
+            self.image_h = h;
+            self.image_side = side;
+        }
+
+        self.pass = .{ .rows_total = h };
+        // Colour the seeded buffer so the preview is visible from the pass's first frame.
+        // Not a counted color pass: the pass counts once, at completion.
+        try self.recolorRows(0, h);
+    }
+
+    /// Run ONE time-budgeted chunk of the in-flight pass and return whether the pass is now
+    /// complete (`true` also when no pass is in flight, i.e. the image is already final).
+    /// Measures the chunk's wall-clock cost and re-times the next one through
+    /// `progressive.Pass.advance`, so a chunk costs ~`progressive.target_chunk_ns` whatever
+    /// the view, `max_iter` or machine. The clock affects only the CHUNK SIZE, never the
+    /// values — `stepPassRows` is the deterministic path the tests drive.
+    pub fn stepPass(self: *Engine) IterateError!bool {
+        const p = self.pass orelse return true;
+        const rows = p.nextChunk();
+        var timer = std.time.Timer.start() catch null;
+        const finished = try self.stepPassRows(rows);
+        const elapsed: u64 = if (timer) |*t| t.read() else progressive.target_chunk_ns;
+        if (self.pass) |*live| live.chunk_rows = progressive.adaptChunkRows(rows, elapsed, progressive.target_chunk_ns);
+        return finished;
+    }
+
+    /// Iterate exactly `rows` more rows of the in-flight pass and colour them. Returns
+    /// whether the pass completed; on completion bumps `iteration_passes` AND `color_passes`
+    /// by one each, clears `pass`, and logs the same one-line summary as `iterate`.
+    /// Deterministic (no clock): `stepPass` is the timed wrapper.
+    ///
+    /// GPU mode is whole-image by nature (one compute dispatch cannot be split by row here),
+    /// so when `use_gpu` is set and a `gpu_iter_fn` is wired the first chunk runs the ENTIRE
+    /// image and completes the pass — GPU passes are fast enough not to need chunking.
+    pub fn stepPassRows(self: *Engine, rows: u32) IterateError!bool {
+        var p = self.pass orelse return true;
+        try validateGeometry(self.view, self.image_side);
+        const vp = self.renderViewport();
+
+        if (self.use_gpu) {
+            if (self.gpu_iter_fn) |iter_fn| {
+                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, self.iter) catch |err| {
+                    log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
+                    try iterbuf.iterateInto(self.iter, vp, self.max_iter);
+                };
+                try self.recolorRows(0, self.image_h);
+                p.rows_done = p.rows_total;
+                self.pass = p;
+                return self.finishPass();
+            }
+        }
+
+        const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
+        try iterbuf.iterateRowsInto(self.iter, vp, self.max_iter, p.rows_done, chunk);
+        try self.recolorRows(p.rows_done, chunk);
+        p.rows_done += chunk;
+        self.pass = p;
+        return self.finishPass();
+    }
+
+    /// Complete the pass if every row is in: count it once and clear the state.
+    fn finishPass(self: *Engine) IterateError!bool {
+        const p = self.pass orelse return true;
+        if (!p.done()) return false;
+        self.pass = null;
+        self.iteration_passes += 1;
+        self.color_passes += 1;
+        self.logIteratePass();
+        return true;
+    }
+
+    /// Abandon any in-flight progressive pass, leaving the partly refined image on display.
+    /// The edge calls this when the user navigates again mid-pass: the new view starts its
+    /// own pass, and the stale one must not write rows for the old inputs.
+    pub fn cancelPass(self: *Engine) void {
+        self.pass = null;
+    }
+
+    /// Completion of the in-flight pass in `[0, 1]` for the status bar, or null when the
+    /// displayed image is final (nothing to report).
+    pub fn passFraction(self: *const Engine) ?f32 {
+        const p = self.pass orelse return null;
+        return p.fraction();
+    }
+
     /// Install a new palette, re-bake its LUT, and rerun ONLY the color pass. Bumps
     /// `color_passes`; leaves `iteration_passes` untouched (THE guarantee). Returns
     /// `EngineError.EmptyGradient` (before mutating any state) if `g` has no stops.
@@ -350,6 +519,28 @@ pub const Engine = struct {
     fn recolor(self: *Engine) EngineError!void {
         try colorpass.colorInto(self.rgba, self.iter, &self.lut, self.max_iter, self.params, self.interior);
         self.color_passes += 1;
+    }
+
+    /// Colour image rows `y0 .. y0 + rows` only, by handing `colorpass.colorInto` the matching
+    /// slices of the row-major buffers. Does NOT bump `color_passes`: this is a fragment of a
+    /// pass, and a progressive pass counts once when its last chunk lands (see `finishPass`).
+    /// A band that runs past the last row is a caller bug and surfaces as `BufferSizeMismatch`
+    /// rather than an out-of-bounds write.
+    fn recolorRows(self: *Engine, y0: u32, rows: u32) EngineError!void {
+        const stride: usize = self.image_w;
+        const start = @as(usize, y0) * stride;
+        const count = @as(usize, rows) * stride;
+        if (start + count > self.iter.len or (start + count) * 4 > self.rgba.len) {
+            return EngineError.BufferSizeMismatch;
+        }
+        try colorpass.colorInto(
+            self.rgba[start * 4 .. (start + count) * 4],
+            self.iter[start .. start + count],
+            &self.lut,
+            self.max_iter,
+            self.params,
+            self.interior,
+        );
     }
 
     /// Square image viewport (navigation geometry). Precondition: `image_side > 0`.
@@ -1120,6 +1311,220 @@ test "resize keeps the palette state, so the next color pass uses the edited gra
         const texel: Rgba8 = .{ e.rgba[i], e.rgba[i + 1], e.rgba[i + 2], e.rgba[i + 3] };
         try testing.expect(std.meta.eql(texel, solid) or std.meta.eql(texel, e.interior));
     }
+}
+
+// ─── M5: the progressive (chunked) pass ──────────────────────────────────────
+
+/// Drive an in-flight pass to completion in fixed-size chunks (deterministic: no clock).
+fn drainPass(e: *Engine, chunk: u32) !void {
+    while (!(try e.stepPassRows(chunk))) {}
+}
+
+test "beginPass bumps neither counter: the pass counts only when it completes" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.beginPass(golden_side, golden_side);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "beginPass opens a pass covering every image row" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    try testing.expectEqual(@as(u32, golden_side), e.pass.?.rows_total);
+}
+
+test "a progressive pass in chunks produces the same buffer as the one-shot iterate" {
+    // THE guarantee the whole feature rests on: chunking is invisible in the output.
+    var chunked = try testEngine();
+    defer chunked.deinit();
+    try chunked.beginPass(golden_side, golden_side);
+    try drainPass(&chunked, 7); // 7 does not divide 64 — the last chunk is short
+
+    var one_shot = try testEngine();
+    defer one_shot.deinit();
+    try one_shot.iterate();
+
+    try testing.expectEqualSlices(f32, one_shot.iter, chunked.iter);
+}
+
+test "a completed progressive pass recolors every pixel the one-shot pass would" {
+    var chunked = try testEngine();
+    defer chunked.deinit();
+    try chunked.beginPass(golden_side, golden_side);
+    try drainPass(&chunked, 5);
+
+    var one_shot = try testEngine();
+    defer one_shot.deinit();
+    try one_shot.iterate();
+
+    try testing.expectEqual(@as(usize, 0), diffCount(one_shot.rgba, chunked.rgba));
+}
+
+test "a completed progressive pass bumps iteration_passes by exactly one" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    try drainPass(&e, 9);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "a completed progressive pass bumps color_passes by exactly one" {
+    // Every chunk recolors its own band, but the pass is ONE color pass.
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    try drainPass(&e, 9);
+    try testing.expectEqual(@as(u32, 1), e.color_passes);
+}
+
+test "a completed progressive pass clears the pass state" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    try drainPass(&e, 64);
+    try testing.expectEqual(@as(?f32, null), e.passFraction());
+}
+
+test "passFraction reports the completed row ratio mid-pass" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    _ = try e.stepPassRows(golden_side / 4);
+    try testing.expectEqual(@as(?f32, 0.25), e.passFraction());
+}
+
+test "beginPass seeds the new buffer with a blocky preview of the previous image" {
+    var e = try Engine.initRect(testing.allocator, testView(), 2, 2, .{});
+    defer e.deinit();
+    try e.iterate();
+    const top_left = e.iter[0];
+    try e.beginPass(4, 4);
+    // Before any chunk runs, source pixel (0,0) already fills the destination's 2×2 block,
+    // so dst (1,1) — index 5 — holds it.
+    try testing.expectEqual(top_left, e.iter[5]);
+}
+
+test "beginPass resizes the buffers to the new dimensions" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side * 2, golden_side);
+    try testing.expectEqual(@as(usize, golden_side * 2 * golden_side), e.iter.len);
+}
+
+test "a progressive pass at a new size matches an independent iterate at that size" {
+    var chunked = try testEngine();
+    defer chunked.deinit();
+    try chunked.iterate();
+    try chunked.beginPass(golden_side, golden_side / 2);
+    try drainPass(&chunked, 3);
+
+    var direct = try Engine.initRect(testing.allocator, testView(), golden_side, golden_side / 2, .{});
+    defer direct.deinit();
+    try direct.iterate();
+
+    try testing.expectEqualSlices(f32, direct.iter, chunked.iter);
+}
+
+test "cancelPass abandons the pass, leaving the partly refined image on display" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    _ = try e.stepPassRows(4);
+    e.cancelPass();
+    try testing.expectEqual(@as(?f32, null), e.passFraction());
+}
+
+test "a one-shot iterate supersedes an in-flight progressive pass" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    _ = try e.stepPassRows(4);
+    try e.iterate();
+    try testing.expectEqual(@as(?f32, null), e.passFraction());
+}
+
+test "beginPass(0, 0) returns DegenerateImageSide and leaves the engine renderable" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectError(EngineError.DegenerateImageSide, e.beginPass(0, 0));
+    try testing.expectEqual(golden_pixels, e.iter.len);
+}
+
+test "installView moves neither counter: nothing is rendered" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.installView(try zoomedView());
+    try testing.expectEqual([2]u32{ 1, 1 }, [2]u32{ e.iteration_passes, e.color_passes });
+}
+
+test "installView leaves the previous view's pixels on display until the next pass" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const before = try testing.allocator.dupe(f32, e.iter);
+    defer testing.allocator.free(before);
+    try e.installView(try zoomedView());
+    try testing.expectEqualSlices(f32, before, e.iter);
+}
+
+test "installView refreshes max_iter for the new view's magnification" {
+    var e = try testEngine();
+    defer e.deinit();
+    const before = e.max_iter;
+    try e.installView(try zoomedView());
+    try testing.expect(e.max_iter != before);
+}
+
+test "installView then iterate matches setViewport exactly" {
+    var a = try testEngine();
+    defer a.deinit();
+    var b = try testEngine();
+    defer b.deinit();
+    try a.setViewport(try zoomedView());
+    try b.installView(try zoomedView());
+    try b.iterate();
+    try testing.expectEqualSlices(f32, a.iter, b.iter);
+}
+
+test "installView rejects a degenerate view and keeps the previous one" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    const zero_side = SquareView{ .center_re = -0.75, .center_im = 0.0, .side = 0.0 };
+    try testing.expectError(viewport.ViewportError.DegenerateRegion, e.installView(zero_side));
+    try testing.expectEqual(testView(), e.view);
+}
+
+test "installPolicy moves neither counter and refreshes max_iter" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try e.installPolicy(try IterPolicy.manual(77));
+    try testing.expectEqual(@as(u32, 77), e.max_iter);
+    try testing.expectEqual([2]u32{ 1, 1 }, [2]u32{ e.iteration_passes, e.color_passes });
+}
+
+test "installPolicy rejects a policy the current magnification cannot satisfy" {
+    const subnormal = try SquareView.fromCenterSide(testView().center(), std.math.floatTrueMin(f64));
+    const pinned = try IterPolicy.manual(32);
+    var e = try Engine.init(testing.allocator, subnormal, golden_side, pinned);
+    defer e.deinit();
+    try testing.expectError(autoiter.AutoIterError.InvalidMagnification, e.installPolicy(.{}));
+    try testing.expectEqual(pinned, e.policy);
+}
+
+test "THE GUARANTEE mid-pass: a palette edit during a pass recolors without re-iterating" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.beginPass(golden_side, golden_side);
+    _ = try e.stepPassRows(8);
+    const before = e.iteration_passes;
+    try e.setGradient(solidGradient(.{ 9, 9, 9, 255 }));
+    try testing.expectEqual(before, e.iteration_passes);
 }
 
 // ─── M3: the pure summary + message builders ─────────────────────────────────

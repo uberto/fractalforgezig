@@ -177,6 +177,19 @@ pub const ViewEditor = struct {
         return viewport.SquareView.fromCorners(a, b) catch null;
     }
 
+    /// Write `policy` into the max_iter widgets: `auto_iter` mirrors `policy.auto` and
+    /// `manual_iter_buf` gets its `manual_value`. The inverse of `parseIterPolicy`; called
+    /// after a policy commit (or a rejected one) so the panel shows the engine's truth.
+    pub fn syncFromPolicy(ve: *ViewEditor, policy: autoiter.IterPolicy) void {
+        ve.auto_iter = policy.auto;
+        const s = std.fmt.bufPrint(&ve.manual_iter_buf, "{d}", .{policy.manual_value}) catch {
+            ve.manual_iter_buf[0] = '0';
+            ve.manual_iter_buf[1] = 0;
+            return;
+        };
+        if (s.len < ve.manual_iter_buf.len) ve.manual_iter_buf[s.len] = 0;
+    }
+
     /// Parse `manual_iter_buf` as a `u32` and return a manual `IterPolicy`. Returns null if
     /// the text is not a valid number or is out of range.
     pub fn parseIterPolicy(ve: ViewEditor) ?autoiter.IterPolicy {
@@ -399,4 +412,26 @@ test "ViewEditor.parseIterPolicy returns null on invalid text" {
     @memcpy(ve.manual_iter_buf[0..3], "abc");
     ve.manual_iter_buf[3] = 0;
     try testing.expect(ve.parseIterPolicy() == null);
+}
+
+test "ViewEditor.syncFromPolicy round-trips a manual policy through parseIterPolicy" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(512));
+    const parsed = ve.parseIterPolicy() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u32, 512), parsed.manual_value);
+}
+
+test "ViewEditor.syncFromPolicy mirrors the auto flag" {
+    var ve = ViewEditor{ .auto_iter = false };
+    ve.syncFromPolicy(.{ .auto = true });
+    try testing.expect(ve.auto_iter);
+}
+
+test "ViewEditor.syncFromPolicy overwrites garbage text with the policy value" {
+    var ve = ViewEditor{};
+    @memcpy(ve.manual_iter_buf[0..3], "abc");
+    ve.manual_iter_buf[3] = 0;
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(64));
+    const parsed = ve.parseIterPolicy() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u32, 64), parsed.manual_value);
 }
