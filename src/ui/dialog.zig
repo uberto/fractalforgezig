@@ -41,9 +41,14 @@ pub const PendingResult = struct {
 
 // ─── File filter ─────────────────────────────────────────────────────────────
 
+/// `pattern` is a semicolon-separated list of BARE EXTENSIONS — `"fractal"`, NOT `"*.fractal"`.
+/// SDL3 validates this and only accepts `[a-zA-Z0-9_.-]`, or a lone `"*"` for "all files"
+/// (`SDL_dialog.h`, `SDL_DialogFileFilter`). A glob like `"*.fractal"` fails validation
+/// ("Invalid character '*' in pattern"), and the failure arrives as a callback with a NULL
+/// filelist — so the dialog silently never appears. That was the M5 save/open bug.
 const fractal_filter = c.SDL_DialogFileFilter{
-    .name = "Fractal files (*.fractal)",
-    .pattern = "*.fractal",
+    .name = "Fractal files (*.fractal)", // free-form label; the glob is fine HERE
+    .pattern = "fractal",
 };
 
 // ─── C callback ──────────────────────────────────────────────────────────────
@@ -56,13 +61,21 @@ fn dialogCallback(
     _ = filter;
     const pending: *PendingDialog = @ptrCast(@alignCast(userdata orelse return));
 
-    // filelist is null or filelist[0] is null on cancel — still mark as fired.
+    // SDL3 encodes THREE outcomes here, and conflating the first two is how a dialog that
+    // never opened used to look exactly like a dialog the user dismissed:
+    //   * `filelist == null`        → SDL FAILED; the reason is in `SDL_GetError()`.
+    //   * `filelist[0] == null`     → the user cancelled or chose nothing.
+    //   * otherwise                 → a path was chosen.
+    // Every branch must set `callback_fired`, or `takePending` never clears `kind` and every
+    // later dialog is silently swallowed by the one-at-a-time guard.
     if (filelist == null) {
         pending.callback_fired = true;
+        log.err("file dialog failed to open: {s}", .{std.mem.span(c.SDL_GetError())});
         return;
     }
     const first = filelist[0] orelse {
         pending.callback_fired = true;
+        log.info("dialog cancelled", .{});
         return;
     };
 
