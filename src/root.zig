@@ -19,6 +19,7 @@ test {
     _ = @import("fractal/navigate.zig");
     _ = @import("fractal/autoiter.zig");
     _ = @import("fractal/mandelbrot.zig");
+    _ = @import("fractal/perturb.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/gradient.zig");
     _ = @import("fractal/mapping.zig");

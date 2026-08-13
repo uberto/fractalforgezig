@@ -44,8 +44,26 @@ pub const interior_sentinel: f32 = -1.0;
 /// the result is `f32` to match M1's `R32Float` iteration buffer. Pure and
 /// deterministic: no allocation, no global state, no I/O.
 pub fn iterate(c_re: f64, c_im: f64, max_iter: u32) f32 {
-    var z_re: f64 = 0.0;
-    var z_im: f64 = 0.0;
+    return iterateIn(f64, c_re, c_im, max_iter);
+}
+
+/// The SAME algorithm as `iterate`, carried out in `f128` (~34 significant decimals).
+///
+/// **This is the GROUND TRUTH for tests, not a render path.** `f128` is software-emulated
+/// (~100× slower than `f64`), so calling this per pixel would make a render unusable — never
+/// wire it to a renderer or a GPU path. Its job is to say what the right answer *is*, so
+/// `perturb.zig`'s deep path can be measured against it (M6/T3). The deep render path is
+/// `perturb.iterateDelta`, which is `f64` throughout.
+pub fn iterateExact(c_re: f128, c_im: f128, max_iter: u32) f32 {
+    return iterateIn(f128, c_re, c_im, max_iter);
+}
+
+/// `iterate`'s body, parameterized on the float type so `iterateExact` is the same
+/// algorithm BY CONSTRUCTION rather than by a comment that could drift. `F` is `f64` for
+/// the render path and `f128` for the test ground truth.
+fn iterateIn(comptime F: type, c_re: F, c_im: F, max_iter: u32) f32 {
+    var z_re: F = 0.0;
+    var z_im: F = 0.0;
 
     // Main escape loop. `n` counts completed `z = z² + c` steps. We test the bail
     // radius AFTER stepping so `n` is the count at the moment of crossing.
@@ -57,7 +75,7 @@ pub fn iterate(c_re: f64, c_im: f64, max_iter: u32) f32 {
         z_re = next_re;
         z_im = next_im;
         n += 1;
-        if (z_re * z_re + z_im * z_im > bail_radius_squared) {
+        if (z_re * z_re + z_im * z_im > @as(F, bail_radius_squared)) {
             escaped = true;
             break;
         }
@@ -66,23 +84,40 @@ pub fn iterate(c_re: f64, c_im: f64, max_iter: u32) f32 {
     // Survived to max_iter without escaping ⇒ interior point.
     if (!escaped) return interior_sentinel;
 
-    // `n` at the crossing — a finite, ≥ 1 fallback if the smooth term degenerates.
-    const escape_n = n;
+    return smoothEscapeValue(F, z_re, z_im, c_re, c_im, n);
+}
+
+/// The smooth-value TAIL, from the moment the escape test first passed: run
+/// `extra_iterations` further `z = z² + c` steps and evaluate
+/// `n + 1 − log₂(log₂(|z|))`, falling back to `escape_n` if that degenerates.
+///
+/// Split out of `iterate` (M6/T3) with its behavior unchanged so the perturbation path
+/// (`perturb.iterateDelta`) can produce values COMPARABLE to `iterate`'s by calling the
+/// very same code. The two paths meet at `perturb.threshold_side`, and any difference in
+/// this convention would show as a visible seam even with perfect iteration counts — so
+/// there is exactly one definition of it, here.
+///
+/// `z_re`/`z_im` are `z` at the crossing, `c_re`/`c_im` the point being iterated, and
+/// `escape_n` the completed-step count at the crossing (also the fallback value).
+pub fn smoothEscapeValue(comptime F: type, z_re: F, z_im: F, c_re: F, c_im: F, escape_n: u32) f32 {
+    var w_re = z_re;
+    var w_im = z_im;
+    var n = escape_n;
 
     // Extra iterations grow `|z|` well past the bail radius so the double-log is
     // accurate; advance `n` in lockstep so the smooth formula stays consistent.
     var extra: u32 = 0;
     while (extra < extra_iterations) : (extra += 1) {
-        const next_re = z_re * z_re - z_im * z_im + c_re;
-        const next_im = 2.0 * z_re * z_im + c_im;
-        z_re = next_re;
-        z_im = next_im;
+        const next_re = w_re * w_re - w_im * w_im + c_re;
+        const next_im = 2.0 * w_re * w_im + c_im;
+        w_re = next_re;
+        w_im = next_im;
         n += 1;
     }
 
-    const mag_squared = z_re * z_re + z_im * z_im;
+    const mag_squared = w_re * w_re + w_im * w_im;
     const magnitude = @sqrt(mag_squared);
-    const smooth = @as(f64, @floatFromInt(n)) + 1.0 - std.math.log2(std.math.log2(magnitude));
+    const smooth = @as(F, @floatFromInt(n)) + 1.0 - std.math.log2(std.math.log2(magnitude));
 
     // Guard: a wildly fast escape (huge `|c|`) can overflow `|z|` to Inf during the
     // extra steps, or produce a NaN from Inf−Inf, making the double-log non-finite.
@@ -138,4 +173,56 @@ test "fast-escaping points never return NaN or Inf" {
 
 test "iterate is deterministic for repeated identical input" {
     try std.testing.expectEqual(iterate(0.3, 0.0, 512), iterate(0.3, 0.0, 512));
+}
+
+// ─── iterateExact (M6 ground truth) ──────────────────────────────────────────
+
+test "iterateExact reproduces iterate's smooth values wherever f64 is trustworthy" {
+    // Shallow points, spread over interior / exterior / near-boundary: the two functions
+    // run the SAME algorithm, so at a depth where f64 is exact enough they must agree to
+    // far better than a coloring step. This is what licenses `iterateExact` as the ground
+    // truth for the deep-path tests.
+    const points = [_][2]f64{
+        .{ 0.3, 0.0 },    .{ 1.0, 0.0 },     .{ -0.5, 0.5 }, .{ 0.25, 0.5 },
+        .{ -1.75, 0.02 }, .{ 0.35, 0.35 },   .{ -0.1, 0.9 }, .{ 0.4, -0.2 },
+        .{ -1.26, 0.0 },  .{ -0.16, 1.035 },
+    };
+    for (points) |p| {
+        const lo = iterate(p[0], p[1], 512);
+        const hi = iterateExact(p[0], p[1], 512);
+        try std.testing.expectApproxEqAbs(lo, hi, 1.0e-3);
+    }
+}
+
+test "iterateExact returns the interior sentinel for a point inside the set" {
+    try std.testing.expectEqual(interior_sentinel, iterateExact(0.0, 0.0, 512));
+}
+
+test "iterateExact classifies the milestone's reference center as interior" {
+    // The seahorse-valley boundary point every deep-zoom test is centered on: it must not
+    // escape, or the reference orbit those tests build would be a few entries long.
+    try std.testing.expectEqual(interior_sentinel, iterateExact(
+        -0.743643887037158704752191506114774,
+        0.131825904205311970493132056385139,
+        2048,
+    ));
+}
+
+test "iterateExact separates two c values an f64 cannot tell apart" {
+    // The whole reason this function exists. Both arguments below collapse to the SAME f64
+    // (|c| ≈ 0.74, so one ulp is ~1.1e-16 and the 1e-20 nudge vanishes), yet 1e-14 from the
+    // reference center the escape count is sensitive enough that the f128 path resolves
+    // them: measured 3103.7732 vs 3103.7766.
+    const base_re: f128 = -0.743643887037158704752191506114774 + 1.0e-14;
+    const nudged_re: f128 = base_re + 1.0e-20;
+    const c_im: f128 = 0.131825904205311970493132056385139;
+    try std.testing.expectEqual(@as(f64, @floatCast(base_re)), @as(f64, @floatCast(nudged_re)));
+    try std.testing.expect(
+        iterateExact(base_re, c_im, 4096) != iterateExact(nudged_re, c_im, 4096),
+    );
+}
+
+test "iterateExact never returns NaN or Inf for a fast-escaping point" {
+    const v = iterateExact(1.0e6, 1.0e6, 512);
+    try std.testing.expect(std.math.isFinite(v) or v == interior_sentinel);
 }
