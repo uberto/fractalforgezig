@@ -34,18 +34,29 @@ The system SHALL save, in one file, everything that determines the image — the
 policy, and the complete palette including every stop, the mapping mode, its period and the interior
 colour — and SHALL restore all of it together.
 
-#### Scenario: Every setting survives the round trip
+#### Scenario: The iteration policy, the mapping and the stop count survive the round trip
 
 - **WHEN** the current state is written to a file and read back
-- **THEN** the iteration policy, every gradient stop, the mapping mode, its period and the interior
-  colour are all the values that were saved
+- **THEN** the iteration policy, the mapping mode, its period, the number of gradient stops and the
+  interior colour's red channel are all the values that were saved
 - **Test**: `src/fractal/persist.zig::round-trip: fromEngine → toJson → fromJson fields match`
+
+#### Scenario: The stops themselves and the whole interior colour survive too
+
+- **WHEN** the current state is written to a file and read back
+- **THEN** each gradient stop's position and colour, and all four channels of the interior colour,
+  are the values that were saved
+- **Test**: _not pinned by a test_ — the round-trip test compares the palette only by stop *count*
+  and the interior colour only by its red channel, so the stop contents and the remaining channels
+  are shipped but unpinned
 
 #### Scenario: The reopened app looks like the one that saved
 
 - **WHEN** a saved file is applied to a running app
 - **THEN** the app's palette, mapping and iteration settings match the ones the file was saved from
-- **Test**: `src/fractal/persist.zig::applyToEngine: loaded state matches original engine`
+- **Test**: _not pinned by a test_ — only the *view* half of the apply is pinned, by
+  `src/fractal/persist.zig::applyToEngine: loaded state matches original engine`, which asserts the
+  restored centre and side and nothing about the palette, mapping or iteration policy
 
 ### Requirement: A damaged file is refused with a named reason
 
