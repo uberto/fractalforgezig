@@ -110,8 +110,8 @@ pub fn draw(
     editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
     open_ctx_menu: bool,
-    right_click_pt: viewport.Complex,
-    hover_pt: ?viewport.Complex,
+    right_click_pt: viewport.ComplexHi,
+    hover_pt: ?viewport.ComplexHi,
     rendering: bool,
     progress: ?f32,
     quit_requested: *bool,
@@ -251,7 +251,7 @@ fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void 
 fn drawStatusBar(
     engine: *const engine_mod.Engine,
     rect: viewport.ImageRect,
-    hover_pt: ?viewport.Complex,
+    hover_pt: ?viewport.ComplexHi,
     progress: ?f32,
 ) void {
     ig.igSpacing();
@@ -277,7 +277,9 @@ fn drawStatusBar(
         var iter_info_buf: [32]u8 = undefined;
         const iter_str: []u8 = blk: {
             if (rect.side == 0) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
-            const idx = engine.renderViewport().pixelIndex(pt) orelse
+            // `lo()`: the render buffer is f64 all the way down, and this only asks WHICH
+            // pixel the cursor is over.
+            const idx = engine.renderViewport().pixelIndex(pt.lo()) orelse
                 break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             if (idx >= engine.iter.len) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             const smooth = engine.iter[idx];
@@ -304,7 +306,7 @@ fn drawStatusBar(
 }
 
 /// Right-click navigation context menu. Must be called inside the ImGui window Begin/End.
-fn drawNavContextMenu(right_click_pt: viewport.Complex) CtxAction {
+fn drawNavContextMenu(right_click_pt: viewport.ComplexHi) CtxAction {
     _ = right_click_pt; // used by the caller to act on the returned action
     var action = CtxAction.none;
     if (ig.igBeginPopup("##nav_ctx", 0)) {
@@ -373,9 +375,11 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
     ig.igSeparatorText("Center / Mag");
     // Center Re / Center Im / Magnification — three spellings of one center+mag commit.
     const center_mag_ids = [_][*:0]const u8{ "re##cre", "im##cim", "mag##mag" };
-    const center_mag_bufs = [_]*[32]u8{ &ve.center_re_buf, &ve.center_im_buf, &ve.mag_buf };
+    // SLICES, not `*[32]u8`: M6 sized the coordinate buffers from
+    // `viewport.coord_text_buf_len` while the magnification kept its own smaller one.
+    const center_mag_bufs = [_][]u8{ &ve.center_re_buf, &ve.center_im_buf, &ve.mag_buf };
     for (center_mag_ids, center_mag_bufs) |label, buf| {
-        if (ig.igInputText(label, buf, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (ig.igInputText(label, buf.ptr, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
             if (req.view != null) continue;
             if (ve.parseAndApplyCenterMag()) |new_view| {
                 req.view = new_view;
@@ -388,14 +392,14 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
 
     ig.igSeparatorText("Corners");
     const corner_ids = [_][*:0]const u8{ "a.re##are", "a.im##aim", "b.re##bre", "b.im##bim" };
-    const corner_bufs = [_]*[32]u8{
+    const corner_bufs = [_][]u8{
         &ve.corner_a_re_buf,
         &ve.corner_a_im_buf,
         &ve.corner_b_re_buf,
         &ve.corner_b_im_buf,
     };
     for (corner_ids, corner_bufs) |label, buf| {
-        if (ig.igInputText(label, buf, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+        if (ig.igInputText(label, buf.ptr, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
             if (req.view != null) continue;
             if (ve.parseAndApplyCorners()) |new_view| {
                 req.view = new_view;

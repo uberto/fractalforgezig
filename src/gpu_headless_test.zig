@@ -76,8 +76,11 @@ test "compute: gpuIterate interior pixels match CPU (deep interior, no precision
 
     // CPU reference for center pixel.
     const scale: f64 = exterior_view.side / @as(f64, @floatFromInt(S));
-    const c_re = exterior_view.center_re + 0.5 * scale - exterior_view.side * 0.5;
-    const c_im = exterior_view.center_im + exterior_view.side * 0.5 - 0.5 * scale;
+    // `centerLo`: the CPU reference iterates in f64, like the GPU path (M6 keeps the extended
+    // precision at the VIEW level only).
+    const ctr = exterior_view.centerLo();
+    const c_re = ctr.re + 0.5 * scale - exterior_view.side * 0.5;
+    const c_im = ctr.im + exterior_view.side * 0.5 - 0.5 * scale;
     const cpu_val = mandelbrot.iterate(c_re, c_im, max_iter);
     const gpu_val = exterior_iter[0];
 

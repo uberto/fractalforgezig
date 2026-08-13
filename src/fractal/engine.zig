@@ -765,9 +765,12 @@ pub fn degenerateViewMessage(buf: []u8, view: SquareView) ![]u8 {
 /// Which number to name when T1 rejects a view. Only the MESSAGE depends on this: the
 /// accept/reject decision is always `SquareView.fromCenterSide`'s, so the two cannot
 /// disagree about whether a view is renderable.
+/// The center is narrowed to `f64` for the message only: `degenerateRegionMessage` renders an
+/// f64 with `{e}`, and the values that reach here are non-finite (they narrow exactly), so no
+/// digit that matters is lost.
 fn degenerateField(view: SquareView) struct { what: []const u8, value: f64 } {
-    if (!std.math.isFinite(view.center_re)) return .{ .what = "center re", .value = view.center_re };
-    if (!std.math.isFinite(view.center_im)) return .{ .what = "center im", .value = view.center_im };
+    if (!std.math.isFinite(view.center_re)) return .{ .what = "center re", .value = @floatCast(view.center_re) };
+    if (!std.math.isFinite(view.center_im)) return .{ .what = "center im", .value = @floatCast(view.center_im) };
     return .{ .what = "side", .value = view.side };
 }
 
@@ -1777,4 +1780,35 @@ test "THE GUARANTEE holds with GPU path: setGradient after GPU iterate does not 
     const iters_before = e.iteration_passes;
     try e.setGradient(solidGradient(.{ 255, 0, 0, 255 }));
     try testing.expectEqual(iters_before, e.iteration_passes); // NEVER re-iterated
+}
+
+// ─── M6: the shallow render path is untouched by the precision split ──────────
+
+/// A 16x16 render of `defaultView()` at max_iter 512, captured from commit `d04e96c` (the
+/// commit before the `f128` view center landed) and asserted here BIT-exactly. The samples
+/// span the image: first pixel, second row, an interior sentinel, the last pixel.
+///
+/// This is the regression guard for M6's core promise: widening the view center to `f128`
+/// must not perturb the f64 per-pixel path by one bit. `rectViewport` narrows the center
+/// once with `@floatCast`, so at a shallow view (whose center IS an exact f64) every
+/// downstream value is the value it was before.
+const shallow_golden = [_]struct { i: usize, v: f32 }{
+    .{ .i = 0, .v = 1.5789121 },
+    .{ .i = 17, .v = 1.7890291 },
+    .{ .i = 40, .v = 3.209162 },
+    .{ .i = 100, .v = 4.6606684 },
+    .{ .i = 136, .v = -1.0 }, // interior sentinel
+    .{ .i = 200, .v = 3.9255261 },
+    .{ .i = 239, .v = 2.0438528 },
+    .{ .i = 255, .v = 1.8785442 },
+};
+
+test "the shallow render path is bit-identical at the home view after the f128 widening" {
+    const S: u32 = 16;
+    var buf: [S * S]f32 = undefined;
+    try iterbuf.iterateInto(&buf, testView().rectViewport(S, S), 512);
+
+    for (shallow_golden) |g| {
+        try testing.expectEqual(g.v, buf[g.i]);
+    }
 }

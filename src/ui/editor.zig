@@ -119,14 +119,23 @@ fn lessByPos(_: void, a: gradient.Stop, b: gradient.Stop) bool {
 ///   * **Center + magnification** (`center_re_buf`, `center_im_buf`, `mag_buf`)
 ///   * **Two opposite corners** (`corner_a_re_buf` … `corner_b_im_buf`)
 /// Both are text so they can be bound directly to `igInputText`.
+///
+/// M6/T2: every COORDINATE buffer is `viewport.coord_text_buf_len` bytes — the one shared
+/// definition of "text long enough for a full-precision center" (a 34-significant-decimal
+/// signed number plus its terminator). Never hand-write a size here; a short buffer would
+/// truncate a deep coordinate on the way to the screen. The magnification is a plain `f64`
+/// and keeps its own smaller buffer. Parsing/formatting still goes through `f64` — widening
+/// that is T7's job, and it must reuse `viewport.max_coord_digits`.
+pub const coord_buf_bytes = viewport.coord_text_buf_len;
+
 pub const ViewEditor = struct {
-    center_re_buf: [32]u8 = std.mem.zeroes([32]u8),
-    center_im_buf: [32]u8 = std.mem.zeroes([32]u8),
+    center_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
+    center_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     mag_buf: [32]u8 = std.mem.zeroes([32]u8),
-    corner_a_re_buf: [32]u8 = std.mem.zeroes([32]u8),
-    corner_a_im_buf: [32]u8 = std.mem.zeroes([32]u8),
-    corner_b_re_buf: [32]u8 = std.mem.zeroes([32]u8),
-    corner_b_im_buf: [32]u8 = std.mem.zeroes([32]u8),
+    corner_a_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
+    corner_a_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
+    corner_b_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
+    corner_b_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     auto_iter: bool = true,
     manual_iter_buf: [16]u8 = std.mem.zeroes([16]u8),
 
@@ -143,13 +152,15 @@ pub const ViewEditor = struct {
     pub fn syncFromView(ve: *ViewEditor, view: viewport.SquareView) void {
         const cm = view.centerMag();
         const crs = view.corners();
-        writeF64(&ve.center_re_buf, cm.center.re);
-        writeF64(&ve.center_im_buf, cm.center.im);
+        // `@floatCast`: the panel still shows and parses `f64` (T7 widens it). The buffers are
+        // already sized for the full-precision text so T7 changes only the number path.
+        writeF64(&ve.center_re_buf, @floatCast(cm.center.re));
+        writeF64(&ve.center_im_buf, @floatCast(cm.center.im));
         writeF64(&ve.mag_buf, cm.magnification);
-        writeF64(&ve.corner_a_re_buf, crs.min.re);
-        writeF64(&ve.corner_a_im_buf, crs.min.im);
-        writeF64(&ve.corner_b_re_buf, crs.max.re);
-        writeF64(&ve.corner_b_im_buf, crs.max.im);
+        writeF64(&ve.corner_a_re_buf, @floatCast(crs.min.re));
+        writeF64(&ve.corner_a_im_buf, @floatCast(crs.min.im));
+        writeF64(&ve.corner_b_re_buf, @floatCast(crs.max.re));
+        writeF64(&ve.corner_b_im_buf, @floatCast(crs.max.im));
     }
 
     /// Parse center + magnification buffers and build a `SquareView`. Returns null on any
@@ -172,8 +183,8 @@ pub const ViewEditor = struct {
         const a_im = parseF64(&ve.corner_a_im_buf) orelse return null;
         const b_re = parseF64(&ve.corner_b_re_buf) orelse return null;
         const b_im = parseF64(&ve.corner_b_im_buf) orelse return null;
-        const a = viewport.Complex{ .re = a_re, .im = a_im };
-        const b = viewport.Complex{ .re = b_re, .im = b_im };
+        const a = viewport.ComplexHi{ .re = a_re, .im = a_im };
+        const b = viewport.ComplexHi{ .re = b_re, .im = b_im };
         return viewport.SquareView.fromCorners(a, b) catch null;
     }
 
@@ -199,8 +210,9 @@ pub const ViewEditor = struct {
     }
 };
 
-/// Write an f64 value into a null-terminated text buffer using `"{d}"` format.
-fn writeF64(buf: *[32]u8, value: f64) void {
+/// Write an f64 value into a null-terminated text buffer using `"{d}"` format. Takes a SLICE
+/// so the coordinate buffers and the (shorter) magnification buffer share one writer.
+fn writeF64(buf: []u8, value: f64) void {
     const s = std.fmt.bufPrint(buf, "{d}", .{value}) catch {
         // If the value somehow doesn't fit (shouldn't happen for f64), write "0".
         buf[0] = '0';
@@ -212,7 +224,7 @@ fn writeF64(buf: *[32]u8, value: f64) void {
 }
 
 /// Parse an f64 from a null-terminated buffer. Returns null on failure.
-fn parseF64(buf: *const [32]u8) ?f64 {
+fn parseF64(buf: []const u8) ?f64 {
     const s = sliceUntilNull(buf);
     return std.fmt.parseFloat(f64, s) catch null;
 }
@@ -396,6 +408,30 @@ test "ViewEditor.syncFromView updates buffers to the new view" {
     try testing.expectApproxEqAbs(@as(f64, 0.25), parsed.center_re, 1e-10);
     try testing.expectApproxEqAbs(@as(f64, -0.5), parsed.center_im, 1e-10);
     try testing.expectApproxEqAbs(@as(f64, 0.5), parsed.side, 1e-10);
+}
+
+test "every ViewEditor coordinate buffer is sized from viewport's shared constant" {
+    const ve = ViewEditor{};
+    inline for (.{
+        ve.center_re_buf,
+        ve.center_im_buf,
+        ve.corner_a_re_buf,
+        ve.corner_a_im_buf,
+        ve.corner_b_re_buf,
+        ve.corner_b_im_buf,
+    }) |buf| {
+        try testing.expectEqual(viewport.coord_text_buf_len, buf.len);
+    }
+}
+
+test "a ViewEditor coordinate buffer holds a full-precision center plus a terminator" {
+    // The 34-significant-decimal center M6 must be able to show: 36 characters of text.
+    const typed = "-0.743643887037158704752191506114774";
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    ve.center_re_buf = std.mem.zeroes(@TypeOf(ve.center_re_buf));
+    @memcpy(ve.center_re_buf[0..typed.len], typed);
+    try testing.expect(typed.len < ve.center_re_buf.len);
+    try testing.expectEqualStrings(typed, sliceUntilNull(&ve.center_re_buf));
 }
 
 test "ViewEditor.parseIterPolicy parses valid number" {

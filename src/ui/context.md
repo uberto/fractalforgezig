@@ -4,8 +4,8 @@
 
 ## Purpose
 
-Own Dear ImGui: context lifecycle, SDL3 + SDL_GPU backends, per-frame
-new-frame/render/shutdown, the fixed layout + palette editor. C-interop edge — keep ImGui/SDL
+Own Dear ImGui: context lifecycle, SDL3+SDL_GPU backends, per-frame
+new-frame/render/shutdown, the fixed layout+palette editor. C-interop edge — keep ImGui/SDL
 types behind `../c.zig`/`../cimgui.zig`; never leak into the core.
 
 ## Aspect + resize (M5)
@@ -28,7 +28,7 @@ render_w,render_h,needs_rerender,save_requested,open_requested,coord}`: `image_r
 ON-SCREEN rect (mapping), `render_w/h`=REGION size (resolution target). `rendering` freezes
 the edit panels (`igBeginDisabled`); `progress` (=`engine.passFraction()`) replaces the
 status-bar readout with `igProgressBar` + `progressive.progressLabel`. Status-bar lookup uses
-`engine.renderViewport().pixelIndex(pt)` (rect stride), NOT the square map.
+`engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map.
 Left: fractal image, right: data+coord+palette. Menu: File→Save…/Open…/Quit, Help→About.
 Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period, interior.
 `applyEdits`→setter→re-upload; NEVER re-iterates. `editor.zig` (PURE): `Editor`+`toGradient`+
@@ -37,7 +37,7 @@ Palette: `igColorEdit4`+`igSliderFloat`+Remove; Add-stop, mode combo, period, in
 
 ## Stack, bridge, `Ui` (imgui.zig)
 
-Vendored via `build.zig`: cimgui + Dear ImGui docking + SDL3/SDLGPU3 backends. `../cimgui.zig`
+Vendored via `build.zig`: cimgui+Dear ImGui docking+SDL3/SDLGPU3 backends. `../cimgui.zig`
 holds `extern` decls, NOT `@cImport cimgui.h` (docking bitfields → `opaque{}`). Bridge
 (`vendor/bridge`) wraps by-value `ImVec2` calls: `ffImguiFillMainViewport`,
 `ffImguiContentAvail`, `ffImguiBeginChild`/`End`, `ffImguiImage(texture,w,h)` (raw
@@ -63,8 +63,8 @@ blocks); else `SDL_WaitEventTimeout(16)` when a pass is owed, `-1` when idle.
 
 ## Coord panel + ViewEditor
 
-`ViewEditor` (`editor.zig`, PURE, tested): buffers for center re/im/mag + corners a/b re/im
-(both forms synced), `auto_iter`, `manual_iter_buf`. `initFromView`/`syncFromView` fill all 7;
+`ViewEditor` (`editor.zig`, PURE, tested): `coord_buf_bytes`-wide buffers for center re/im/mag +
+corners a/b re/im (both forms synced), `auto_iter`, `manual_iter_buf`; parse/format still f64. `initFromView`/`syncFromView` fill all 7;
 `syncFromPolicy` inverts `parseIterPolicy`. `parseAndApplyCenterMag`/`parseAndApplyCorners`→
 `?SquareView`, `parseIterPolicy`→`?IterPolicy`; null on failure. `drawCoordPanel` REQUESTS,
 never applies: returns `CoordRequest{view,policy}` (first commit wins) for `main.zig` — an

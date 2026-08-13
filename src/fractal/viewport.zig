@@ -9,17 +9,43 @@
 //!   * Complex space: `re` grows right, `im` grows UP. So pixel-y and complex-im
 //!     point in OPPOSITE directions — the mapping negates the y term.
 //!
-//! M7 seam: `center_re`/`center_im` are `f64` today (a deliberate defer — see the
-//! milestone plan). Arbitrary precision is only needed near ~1e-15 magnification.
-//! The type is isolated here so M7 can widen the center without touching callers;
-//! do NOT let callers read the raw `f64` center for precision-sensitive math.
+//! PRECISION SPLIT (M6, and the rule the whole deep-zoom milestone rests on):
+//!   * `ComplexHi` (`f128`, ~34 significant decimals) says WHERE THE VIEW IS —
+//!     `SquareView.center_re/center_im`, the gesture anchors, the readout, the save file.
+//!   * `Complex` / `Viewport` (`f64`) say where a PIXEL IS RELATIVE TO the view — the
+//!     per-pixel rect mapping `iterbuf` iterates over.
+//! `f128` is SOFTWARE-EMULATED on arm64 (~100× slower than `f64`), so it must never enter
+//! a per-pixel loop: a handful of `f128` operations per frame is free, one per pixel is
+//! catastrophic. Every `*Hi` mapping here therefore computes the pixel's OFFSET in `f64`
+//! and does the single widening ADDITION onto the `f128` center. `side` stays `f64` — at
+//! 1e-30 a side still carries ~16 significant digits, only the center needs more.
 const std = @import("std");
 
-/// A point on the complex plane. Plain data, no methods — the fractal core reads
-/// `re`/`im` directly.
+/// A point on the complex plane in `f64` — the PER-PIXEL type. Plain data, no methods: the
+/// fractal core reads `re`/`im` directly. Use this for anything inside (or one step away
+/// from) an iteration loop; use `ComplexHi` for a view-level position.
 pub const Complex = struct {
     re: f64,
     im: f64,
+};
+
+/// A point on the complex plane in `f128` — the VIEW-LEVEL type (~34 significant decimals,
+/// enough to distinguish neighbouring pixels down to side 1e-30). Same shape as `Complex`,
+/// so an anonymous `.{ .re = …, .im = … }` literal builds either.
+///
+/// Costs: `f128` arithmetic is emulated in software here, so keep it to a handful of
+/// operations per frame (a view center, a gesture anchor, a readout) and NEVER put it in a
+/// per-pixel loop. `lo()` is the one-way door back to the fast `f64` world.
+pub const ComplexHi = struct {
+    re: f128,
+    im: f128,
+
+    /// This point rounded to the `f64` `Complex` the per-pixel paths use. Lossy by
+    /// construction — call it only where the extra digits genuinely cannot matter (a
+    /// GPU uniform, a hit-test against an already-`f64` render buffer).
+    pub fn lo(self: ComplexHi) Complex {
+        return .{ .re = @floatCast(self.re), .im = @floatCast(self.im) };
+    }
 };
 
 /// The fixed M0 target region on the complex plane (M0 non-goal: no navigation). M3 keeps
@@ -55,13 +81,15 @@ pub const ViewportError = error{
 /// Pixels come in only as a square image side `S` (px): the view carries no resolution
 /// (plan A2 — `S = min(window_w, window_h)`, chosen by T5). See `pixelToComplex`.
 ///
-/// M7 seam: `center_re`/`center_im` are `f64` (see the file header). Keep precision-
-/// sensitive math inside this struct so widening the center stays a local change.
+/// M6: `center_re`/`center_im` are `f128` and `side` stays `f64` (see the file header's
+/// precision split). Keep precision-sensitive math inside this struct; callers that need an
+/// `f64` center ask for `centerLo()` and thereby say, in writing, that they accept the loss.
 pub const SquareView = struct {
-    center_re: f64,
-    center_im: f64,
+    center_re: f128,
+    center_im: f128,
     /// Side length of the square region in complex-plane units. Always finite and > 0
-    /// for a view built through the constructors below.
+    /// for a view built through the constructors below. `f64`: a side of 1e-30 still has
+    /// ~16 significant digits, so widening it would buy nothing.
     side: f64,
 
     /// The default (home) view: the smallest square CONTAINING the M0 fixed region,
@@ -77,16 +105,25 @@ pub const SquareView = struct {
     }
 
     /// The validating constructor every other one funnels into: rejects a non-finite
-    /// center and a side that is not finite and positive.
-    pub fn fromCenterSide(center_point: Complex, side: f64) ViewportError!SquareView {
-        if (!isFiniteComplex(center_point)) return ViewportError.DegenerateRegion;
+    /// center and a side that is not finite and positive. Takes the center at FULL
+    /// precision — a 34-decimal center given here comes back out of `center()` unchanged.
+    pub fn fromCenterSide(center_point: ComplexHi, side: f64) ViewportError!SquareView {
+        if (!isFiniteComplexHi(center_point)) return ViewportError.DegenerateRegion;
         if (!std.math.isFinite(side) or side <= 0.0) return ViewportError.DegenerateRegion;
         return .{ .center_re = center_point.re, .center_im = center_point.im, .side = side };
     }
 
-    /// The view's center on the complex plane.
-    pub fn center(self: SquareView) Complex {
+    /// The view's center on the complex plane, at full precision. This is what the readout,
+    /// the save file and the gesture anchors must carry.
+    pub fn center(self: SquareView) ComplexHi {
         return .{ .re = self.center_re, .im = self.center_im };
+    }
+
+    /// The view's center rounded to `f64`, for the few consumers that genuinely cannot use
+    /// more: the GPU uniform conversion and the `Viewport` bridges below (the per-pixel rect
+    /// mapping). Everything else wants `center()`.
+    pub fn centerLo(self: SquareView) Complex {
+        return self.center().lo();
     }
 
     /// Unitless zoom scalar, `1 / |diagonal| = 1 / (side · √2)` (plan A3). T3's adaptive
@@ -111,7 +148,7 @@ pub const SquareView = struct {
     /// This view as its two opposite corners: `min` = bottom-left (min re, min im),
     /// `max` = top-right (max re, max im).
     pub fn corners(self: SquareView) Corners {
-        const h = self.side / 2.0;
+        const h: f128 = @as(f128, self.side) / 2.0;
         return .{
             .min = .{ .re = self.center_re - h, .im = self.center_im - h },
             .max = .{ .re = self.center_re + h, .im = self.center_im + h },
@@ -122,10 +159,13 @@ pub const SquareView = struct {
     /// `side = max(|Δre|, |Δim|)` centered on the midpoint of `a` and `b` (plan A1). The
     /// result therefore always contains the input rectangle, expanded on the shorter axis
     /// only. Identical corners (zero extent) are a `DegenerateRegion`.
-    pub fn fromCorners(a: Complex, b: Complex) ViewportError!SquareView {
-        if (!isFiniteComplex(a) or !isFiniteComplex(b)) return ViewportError.DegenerateRegion;
-        const side = @max(@abs(b.re - a.re), @abs(b.im - a.im));
-        const mid = Complex{ .re = (a.re + b.re) / 2.0, .im = (a.im + b.im) / 2.0 };
+    /// Both corners and the midpoint are carried at full precision, so a selection dragged
+    /// inside a deep view keeps the digits that distinguish its two corners; only the SIDE
+    /// (which needs no more than `f64`) is narrowed, after the differencing.
+    pub fn fromCorners(a: ComplexHi, b: ComplexHi) ViewportError!SquareView {
+        if (!isFiniteComplexHi(a) or !isFiniteComplexHi(b)) return ViewportError.DegenerateRegion;
+        const side: f64 = @floatCast(@max(@abs(b.re - a.re), @abs(b.im - a.im)));
+        const mid = ComplexHi{ .re = (a.re + b.re) / 2.0, .im = (a.im + b.im) / 2.0 };
         return fromCenterSide(mid, side);
     }
 
@@ -135,24 +175,67 @@ pub const SquareView = struct {
     /// is the center of pixel `(i, j)`. `py` is negated: pixel-y grows DOWN while `im`
     /// grows UP (see the file header). Precondition: `image_side > 0` — callers that may
     /// see a minimized window (T5/T6) go through `cursorCoord`, which is null-safe.
+    /// `f64` throughout (the center is rounded FIRST, so the arithmetic is exactly what it
+    /// was before the center widened): below ~1e-13 neighbouring pixels collapse onto the
+    /// same value here. That is the whole reason `pixelToComplexHi` exists — use this one
+    /// only for shallow work.
     pub fn pixelToComplex(self: SquareView, px: f64, py: f64, image_side: u32) Complex {
         std.debug.assert(image_side > 0);
         const s: f64 = @floatFromInt(image_side);
+        const c = self.centerLo();
         return .{
-            .re = self.center_re + (px / s - 0.5) * self.side,
-            .im = self.center_im - (py / s - 0.5) * self.side,
+            .re = c.re + (px / s - 0.5) * self.side,
+            .im = c.im - (py / s - 0.5) * self.side,
+        };
+    }
+
+    /// The FULL-PRECISION complex point a pixel of a square `image_side` image samples —
+    /// the deep-zoom counterpart of `pixelToComplex`, and the gesture-anchor source at
+    /// depth (`navigate.zoomAbout` / `zoomCentered`). Same geometry, same conventions.
+    ///
+    /// Cost: the pixel's OFFSET from the center is computed in `f64` (it is tiny and needs
+    /// no more digits) and only the final addition onto the `f128` center is extended
+    /// precision — two `f128` adds per call. Fine per gesture; NEVER call it per pixel.
+    /// Precondition: `image_side > 0`.
+    pub fn pixelToComplexHi(self: SquareView, px: f64, py: f64, image_side: u32) ComplexHi {
+        std.debug.assert(image_side > 0);
+        const s: f64 = @floatFromInt(image_side);
+        const off_re = (px / s - 0.5) * self.side;
+        const off_im = (py / s - 0.5) * self.side;
+        return .{
+            .re = self.center_re + @as(f128, off_re),
+            .im = self.center_im - @as(f128, off_im),
+        };
+    }
+
+    /// `pixelToComplexHi` through the RECTANGULAR mapping (`rectViewport`'s geometry: one
+    /// shared `scale = side / min(w, h)`, so a non-square image shows more of the plane on
+    /// its longer axis) — the full-precision anchor for anything that starts from a
+    /// `w × h` on-screen image, i.e. `cursorCoord` and `navigate.boxSelect`. Same
+    /// offset-in-`f64`, add-in-`f128` structure. Precondition: `w > 0` and `h > 0`.
+    pub fn rectPixelToComplexHi(self: SquareView, px: f64, py: f64, w: u32, h: u32) ComplexHi {
+        std.debug.assert(w > 0 and h > 0);
+        const vp = self.rectViewport(w, h);
+        const off_re = (px - @as(f64, @floatFromInt(w)) / 2.0) * vp.scale;
+        const off_im = (py - @as(f64, @floatFromInt(h)) / 2.0) * vp.scale;
+        return .{
+            .re = self.center_re + @as(f128, off_re),
+            .im = self.center_im - @as(f128, off_im),
         };
     }
 
     /// Inverse of `pixelToComplex` at the same `image_side`: the (continuous) image-space
     /// pixel a complex point lands on. Values outside `[0, image_side]` mean the point is
     /// outside the view. Precondition: `image_side > 0`.
+    /// Stays `f64` (the center is rounded first): it answers "which pixel", and a pixel
+    /// index never needs more than `f64`.
     pub fn complexToPixel(self: SquareView, c: Complex, image_side: u32) Pixel {
         std.debug.assert(image_side > 0);
         const s: f64 = @floatFromInt(image_side);
+        const ctr = self.centerLo();
         return .{
-            .x = ((c.re - self.center_re) / self.side + 0.5) * s,
-            .y = ((self.center_im - c.im) / self.side + 0.5) * s,
+            .x = ((c.re - ctr.re) / self.side + 0.5) * s,
+            .y = ((ctr.im - c.im) / self.side + 0.5) * s,
         };
     }
 
@@ -161,20 +244,27 @@ pub const SquareView = struct {
     /// degenerate, e.g. a minimized window). This is the hover-readout and gesture-anchor
     /// entry point: T6 feeds it raw mouse coordinates plus T5's image rect.
     /// Uses the full w×h rectangle for correct re-axis mapping on non-square images.
-    pub fn cursorCoord(self: SquareView, window_x: f64, window_y: f64, rect: ImageRect) ?Complex {
+    ///
+    /// Returns a `ComplexHi`: this is the gesture-anchor source, so at depth an `f64` return
+    /// would round the anchor onto the view center and every scroll-zoom would silently snap
+    /// the center back to double precision (see `navigate.zoomAbout`). Narrow with `lo()` for
+    /// an `f64`-only consumer such as `Viewport.pixelIndex`.
+    pub fn cursorCoord(self: SquareView, window_x: f64, window_y: f64, rect: ImageRect) ?ComplexHi {
         if (rect.w == 0 or rect.h == 0) return null;
         const p = rect.toImagePixel(window_x, window_y) orelse return null;
-        const vp = self.rectViewport(rect.w, rect.h);
-        return vp.pixelToComplex(p.x, p.y);
+        return self.rectPixelToComplexHi(p.x, p.y, rect.w, rect.h);
     }
 
-    /// Bridge to the M0/M2 `Viewport` for a square image. Precondition: `image_side > 0`.
+    /// Bridge to the M0/M2 `Viewport` for a square image. The center is NARROWED to `f64`
+    /// here — `Viewport` is the per-pixel mapping and must stay `f64` (see the file header).
+    /// Precondition: `image_side > 0`.
     pub fn imageViewport(self: SquareView, image_side: u32) Viewport {
         std.debug.assert(image_side > 0);
         const s: f64 = @floatFromInt(image_side);
+        const c = self.centerLo();
         return .{
-            .center_re = self.center_re,
-            .center_im = self.center_im,
+            .center_re = c.re,
+            .center_im = c.im,
             .scale = self.side / s,
             .width = image_side,
             .height = image_side,
@@ -185,12 +275,17 @@ pub const SquareView = struct {
     /// region. Scale is chosen so the shorter axis exactly fits `self.side` complex units
     /// and the longer axis shows more of the plane (no letterboxing, no distortion).
     /// Precondition: `w > 0` and `h > 0`.
+    ///
+    /// The center is NARROWED to `f64`, which is correct for the SHALLOW render path this
+    /// feeds (identical output to before the center widened) and is exactly why it cannot
+    /// serve a deep render: T4 gives the deep path an offset-based mapping instead.
     pub fn rectViewport(self: SquareView, w: u32, h: u32) Viewport {
         std.debug.assert(w > 0 and h > 0);
         const scale = self.side / @as(f64, @floatFromInt(@min(w, h)));
+        const c = self.centerLo();
         return .{
-            .center_re = self.center_re,
-            .center_im = self.center_im,
+            .center_re = c.re,
+            .center_im = c.im,
             .scale = scale,
             .width = w,
             .height = h,
@@ -202,21 +297,23 @@ pub const SquareView = struct {
 /// magnification formula. Computed at comptime.
 const sqrt2: f64 = @sqrt(2.0);
 
-fn isFiniteComplex(c: Complex) bool {
+fn isFiniteComplexHi(c: ComplexHi) bool {
     return std.math.isFinite(c.re) and std.math.isFinite(c.im);
 }
 
-/// The center + magnification form of a `SquareView` (see `SquareView.centerMag`).
+/// The center + magnification form of a `SquareView` (see `SquareView.centerMag`). The
+/// center is full precision; the magnification is `f64` because the side is.
 pub const CenterMag = struct {
-    center: Complex,
+    center: ComplexHi,
     magnification: f64,
 };
 
 /// The two-opposite-corners form of a `SquareView`: `min` is bottom-left, `max` is
-/// top-right (see `SquareView.corners`).
+/// top-right (see `SquareView.corners`). Full precision: at depth the two corners differ
+/// only in digits `f64` does not have.
 pub const Corners = struct {
-    min: Complex,
-    max: Complex,
+    min: ComplexHi,
+    max: ComplexHi,
 };
 
 /// A continuous pixel coordinate (image or window space, whichever the API says).
@@ -250,14 +347,37 @@ pub const ImageRect = struct {
 
 /// Decimals the coordinate readout shows at the shallowest zoom.
 pub const min_coord_digits: usize = 4;
-/// Decimal cap: f64 holds ~17 decimals for the |re|, |im| ≲ 3 of the Mandelbrot region,
-/// so more digits would be noise.
-pub const max_coord_digits: usize = 17;
 
-/// Buffer size that fits any `formatCoord` result for a view inside the Mandelbrot region
-/// (two signed numbers at `max_coord_digits` decimals, `" + "` and the trailing `i`). An
-/// absurd center (|re| ≥ 1e9) needs more and returns `error.NoSpaceLeft` instead.
-pub const coord_buf_len: usize = 64;
+/// Decimal cap, and THE shared "how many digits does a center need" constant: `f128` carries
+/// 113 mantissa bits ≈ 34 significant decimals, which is also exactly what a lossless decimal
+/// round trip of an `f128` takes (`{d:.34}` → `parseFloat(f128, …)` is exact). Past this the
+/// digits would be noise, and at side 1e-30 near |re| ≈ 1 they are all needed.
+///
+/// The readout (T7) and the save format (T8) MUST both format the center through this one
+/// definition, or a saved location would not match the one on screen.
+pub const max_coord_digits: usize = 34;
+
+/// Integer digits the readout must fit: the Mandelbrot region lives well inside
+/// |re|, |im| < 10. An absurd center needs more and returns `error.NoSpaceLeft`.
+const max_coord_int_digits: usize = 1;
+
+/// One signed coordinate at `max_coord_digits` decimals: sign, integer digits, the decimal
+/// point, the decimals.
+const coord_part_len: usize = 1 + max_coord_int_digits + 1 + max_coord_digits;
+
+/// Buffer size that fits any `formatCoord` result for a view inside the Mandelbrot region,
+/// pinned by a test: the signed real part, the `" + "` / `" - "` separator that CARRIES the
+/// imaginary sign (so the imaginary part itself is unsigned, one byte shorter), and the
+/// trailing `i`. An absurd center (|re| ≥ 10) needs more and returns `error.NoSpaceLeft`.
+pub const coord_buf_len: usize =
+    coord_part_len + " + ".len + (coord_part_len - 1) + "i".len;
+
+/// Buffer size for ONE coordinate as EDITABLE, NULL-TERMINATED text: `coord_part_len` bytes
+/// of digits plus the terminator, rounded up to 64 so an exponent form or a pasted extra
+/// digit still fits. This is what the coordinate panel's text buffers (`ui/editor.zig`'s
+/// `ViewEditor`) and any other full-precision center text must be sized from — never a
+/// hand-written 32 or 40.
+pub const coord_text_buf_len: usize = 64;
 
 /// Decimals `formatCoord` uses at a given magnification. RULE:
 /// `digits = clamp(min_coord_digits + ceil(log10(magnification)), min, max)`.
@@ -282,7 +402,13 @@ pub fn coordDigits(magnification: f64) usize {
 /// Pure (writes only into `buf`) so the exact string is unit-tested; `buf` should be
 /// `coord_buf_len` bytes — a short buffer returns `error.NoSpaceLeft` rather than
 /// truncating.
-pub fn formatCoord(buf: []u8, c: Complex, magnification: f64) ![]u8 {
+///
+/// Takes the center at FULL precision (`ComplexHi`) so the extra decimals `coordDigits`
+/// asks for at depth are real digits rather than zeros: an `f64` argument would already
+/// have thrown them away. Specified for views inside the Mandelbrot region — a magnitude
+/// so absurd that `std.fmt` cannot render it in fixed notation prints its `(float)`
+/// placeholder instead of erroring.
+pub fn formatCoord(buf: []u8, c: ComplexHi, magnification: f64) ![]u8 {
     const digits = coordDigits(magnification);
     // signbit, NOT `< 0.0`: `-0.0 < 0.0` is false, which would print `+ -0.0000i`.
     const negative = std.math.signbit(c.im);
@@ -329,6 +455,53 @@ pub fn degenerateRegionMessage(buf: []u8, what: []const u8, value: f64) ![]u8 {
         degenerate_prefix ++ "{s}={e}" ++ degenerate_suffix,
         .{ what, value },
     );
+}
+
+// ─── Precision floor ─────────────────────────────────────────────────────────
+//
+// MOVED HERE (M6/T2) from `navigate.zig`, unchanged in value and behavior: the floor is a
+// property of what a VIEW can represent, which is this module's subject, and both this
+// module and `navigate.zig` now need it. `navigate.zig` re-exports all four names, so its
+// callers (and its own tests) keep using them unqualified.
+
+/// Side below which coordinate arithmetic visibly quantizes: a view around |re| ≈ 1 has
+/// ~1e-16 absolute resolution in f64, so a side of 1e-13 leaves only ~3 significant digits
+/// across the image — the documented warning threshold, not a hard stop. (M6/T5 moves this
+/// value to the deep-zoom floor; T2 only moved the constant's HOME.)
+pub const precision_floor_side: f64 = 1.0e-13;
+
+/// Whether `v` is zoomed past `precision_floor_side` and will therefore render blocky. The
+/// comparison is strict, so the floor value itself still counts as usable. Callers warn with
+/// `precisionFloorMessage` and keep going — this is deliberately NOT an error, so a deep zoom
+/// is never silently refused. Precondition: a view from the constructors above, i.e. a finite
+/// positive side (they reject anything else).
+pub fn atPrecisionFloor(v: SquareView) bool {
+    return v.side < precision_floor_side;
+}
+
+const floor_prefix = "precision floor reached: side=";
+/// The limit is rendered from `precision_floor_side` at comptime, so the wording can never
+/// disagree with the predicate.
+const floor_suffix = std.fmt.comptimePrint(
+    " is below the f64 limit {e}; the image quantizes into blocks from here, " ++
+        "so zoom out or reset the view",
+    .{precision_floor_side},
+);
+
+/// Buffer size that fits ANY `precisionFloorMessage` result: the fixed wording plus the
+/// widest `{e}` rendering of an f64 (`max_float_chars`). Exactly the worst case, pinned by a
+/// test; a shorter buffer returns `error.NoSpaceLeft`.
+pub const floor_message_buf_len: usize =
+    floor_prefix.len + max_float_chars + floor_suffix.len;
+
+/// The human-actionable warning for a view at the precision floor: names the offending side,
+/// the limit it crossed, what the user will see and what to do about it. `{e}` bounds the
+/// number the same way `degenerateRegionMessage` does (a `{d}` subnormal would run to
+/// hundreds of digits). Pure so the wording is unit-tested once and reused by every edge that
+/// logs it (`std.log.warn` in `main.zig`); pass a `[floor_message_buf_len]u8`. The error set
+/// is spelled out rather than inferred so callers can switch on it exhaustively.
+pub fn precisionFloorMessage(buf: []u8, side: f64) error{NoSpaceLeft}![]u8 {
+    return std.fmt.bufPrint(buf, floor_prefix ++ "{e}" ++ floor_suffix, .{side});
 }
 
 /// The IMAGE viewport `iterbuf`/`engine` iterate over: a region plus its pixel
@@ -527,7 +700,7 @@ const default_magnification: f64 = 1.0 / (3.5 * @sqrt(2.0));
 /// LARGEST magnitude involved, so a deep zoom near `re = -0.74` can only be recovered to a
 /// few ULPs of `0.74` — the documented f64 floor (M7 widens the center, not M3).
 fn roundTripTolerance(v: SquareView) f64 {
-    const magnitude = @max(@abs(v.center_re), @abs(v.center_im));
+    const magnitude: f64 = @floatCast(@max(@abs(v.center_re), @abs(v.center_im)));
     return 4.0 * std.math.floatEps(f64) * @max(magnitude, v.side);
 }
 
@@ -607,8 +780,8 @@ test "fromCorners snaps a wide rectangle to a square sized by the larger axis" {
 
 test "the square snapped from a tall rectangle contains it, expanded only on the short axis" {
     // |Δre| = 0.2, |Δim| = 3 ⇒ side 3: re grows, im is untouched.
-    const a = Complex{ .re = 0.1, .im = -1.5 };
-    const b = Complex{ .re = 0.3, .im = 1.5 };
+    const a = ComplexHi{ .re = 0.1, .im = -1.5 };
+    const b = ComplexHi{ .re = 0.3, .im = 1.5 };
     const v = try SquareView.fromCorners(a, b);
     const c = v.corners();
     try std.testing.expectApproxEqRel(@as(f64, 3.0), v.side, 1e-15);
@@ -618,8 +791,8 @@ test "the square snapped from a tall rectangle contains it, expanded only on the
 }
 
 test "fromCorners ignores the order of the two given corners" {
-    const a = Complex{ .re = -1.25, .im = 0.5 };
-    const b = Complex{ .re = 0.75, .im = -0.25 };
+    const a = ComplexHi{ .re = -1.25, .im = 0.5 };
+    const b = ComplexHi{ .re = 0.75, .im = -0.25 };
     try std.testing.expectEqual(
         try SquareView.fromCorners(a, b),
         try SquareView.fromCorners(b, a),
@@ -627,31 +800,31 @@ test "fromCorners ignores the order of the two given corners" {
 }
 
 test "fromCorners rejects a zero-extent rectangle" {
-    const p = Complex{ .re = -0.75, .im = 0.1 };
+    const p = ComplexHi{ .re = -0.75, .im = 0.1 };
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(p, p));
 }
 
 test "fromCorners rejects non-finite corners" {
-    const ok = Complex{ .re = 0.0, .im = 0.0 };
-    const nan = Complex{ .re = std.math.nan(f64), .im = 0.0 };
-    const inf = Complex{ .re = 0.0, .im = std.math.inf(f64) };
+    const ok = ComplexHi{ .re = 0.0, .im = 0.0 };
+    const nan = ComplexHi{ .re = std.math.nan(f128), .im = 0.0 };
+    const inf = ComplexHi{ .re = 0.0, .im = std.math.inf(f128) };
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(ok, nan));
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCorners(inf, ok));
 }
 
 test "fromCenterMag rejects a non-positive or non-finite magnification" {
-    const c = Complex{ .re = 0.0, .im = 0.0 };
+    const c = ComplexHi{ .re = 0.0, .im = 0.0 };
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = 0.0 }));
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = -1.0 }));
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterMag(.{ .center = c, .magnification = std.math.nan(f64) }));
 }
 
 test "fromCenterSide rejects a non-positive side and a non-finite center" {
-    const c = Complex{ .re = 0.0, .im = 0.0 };
+    const c = ComplexHi{ .re = 0.0, .im = 0.0 };
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, 0.0));
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, -3.5));
     try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(c, std.math.inf(f64)));
-    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(.{ .re = std.math.nan(f64), .im = 0.0 }, 1.0));
+    try std.testing.expectError(ViewportError.DegenerateRegion, SquareView.fromCenterSide(.{ .re = std.math.nan(f128), .im = 0.0 }, 1.0));
 }
 
 test "the image corner pixels map to the view corners" {
@@ -668,8 +841,11 @@ test "the image corner pixels map to the view corners" {
 test "the image center pixel maps to the view center" {
     const v = round_trip_views[1];
     const c = v.pixelToComplex(256.0, 256.0, 512);
-    try std.testing.expectApproxEqAbs(v.center_re, c.re, v.side * 1e-12);
-    try std.testing.expectApproxEqAbs(v.center_im, c.im, v.side * 1e-12);
+    // Against `centerLo`, not `center()`: this is the f64 mapping, so the center it works
+    // from is the f64-rounded one (`pixelToComplexHi` is what reproduces the f128 center).
+    const ctr = v.centerLo();
+    try std.testing.expectApproxEqAbs(ctr.re, c.re, v.side * 1e-12);
+    try std.testing.expectApproxEqAbs(ctr.im, c.im, v.side * 1e-12);
 }
 
 const pixel_centers = [_]Pixel{
@@ -1069,4 +1245,206 @@ test "computeImageRect fills full window: w=w, h=h, side=min(w,h), origin at (0,
     try std.testing.expectEqual(@as(u32, 1080), r.side);
     try std.testing.expectEqual(@as(i32, 0), r.x);
     try std.testing.expectEqual(@as(i32, 0), r.y);
+}
+
+// ─── Tests: precision floor (MOVED from navigate.zig by M6/T2) ────────────────
+
+/// The widest `{e}` rendering an f64 can produce (24 chars) — the worst case for the
+/// warning message's buffer. Same value brute-forced for `degenerateRegionMessage`.
+const widest_float: f64 = -1.3508404415422605e-270;
+
+test "atPrecisionFloor flags a side below the f64 precision floor" {
+    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-14);
+    try std.testing.expect(atPrecisionFloor(v));
+}
+
+test "atPrecisionFloor does not flag the default view" {
+    try std.testing.expect(!atPrecisionFloor(SquareView.defaultView()));
+}
+
+test "atPrecisionFloor does not flag a side just above the floor" {
+    const shallow = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-12);
+    try std.testing.expect(!atPrecisionFloor(shallow));
+}
+
+test "atPrecisionFloor puts the boundary one ULP below the floor value" {
+    const center_pt = ComplexHi{ .re = -0.75, .im = 0.0 };
+    const at_floor = try SquareView.fromCenterSide(center_pt, precision_floor_side);
+    try std.testing.expect(!atPrecisionFloor(at_floor));
+    const one_ulp_below: f64 = @bitCast(@as(u64, @bitCast(precision_floor_side)) - 1);
+    const below = try SquareView.fromCenterSide(center_pt, one_ulp_below);
+    try std.testing.expect(atPrecisionFloor(below));
+}
+
+test "precisionFloorMessage names the offending side, the limit and what to do" {
+    var buf: [floor_message_buf_len]u8 = undefined;
+    const msg = try precisionFloorMessage(&buf, 9.9e-14);
+    try std.testing.expectEqualStrings(
+        "precision floor reached: side=9.9e-14 is below the f64 limit 1e-13; " ++
+            "the image quantizes into blocks from here, so zoom out or reset the view",
+        msg,
+    );
+}
+
+test "floor_message_buf_len is exactly the worst-case message length" {
+    var buf: [floor_message_buf_len]u8 = undefined;
+    const msg = try precisionFloorMessage(&buf, widest_float);
+    try std.testing.expectEqual(floor_message_buf_len, msg.len);
+}
+
+test "precisionFloorMessage reports NoSpaceLeft instead of truncating" {
+    var buf: [floor_message_buf_len - 1]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, precisionFloorMessage(&buf, widest_float));
+}
+
+// ─── Tests: M6 extended-precision center ─────────────────────────────────────
+//
+// The reference deep-zoom center, given to 33 significant decimals — more than `f64` can
+// hold, so any test below that passes with an `f64` center would be vacuous. The literals
+// are written out (not parsed) where a comptime value is wanted; Zig comptime float
+// literals are arbitrary precision, so both spellings agree exactly.
+const deep_center_re_text = "-0.743643887037158704752191506114774";
+const deep_center_im_text = "0.131825904205311970493132056385139";
+const deep_center_hi = ComplexHi{
+    .re = -0.743643887037158704752191506114774,
+    .im = 0.131825904205311970493132056385139,
+};
+/// A depth `f64` cannot navigate: one pixel of a 1000 px image is ~1e-28 wide here, far
+/// below the ~1e-16 relative resolution of an `f64` near |re| ≈ 0.74.
+const deep_hi_side: f64 = 1.0e-25;
+
+test "a 34-decimal center survives fromCenterSide and center() unchanged" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    try std.testing.expectEqual(deep_center_hi.re, v.center().re);
+    try std.testing.expectEqual(deep_center_hi.im, v.center().im);
+}
+
+test "the stored center keeps digits an f64 center would have thrown away" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const narrowed: f128 = @as(f64, @floatCast(deep_center_hi.re));
+    try std.testing.expect(v.center().re != narrowed);
+}
+
+test "a 34-decimal center survives the centerMag round trip unchanged" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const back = try SquareView.fromCenterMag(v.centerMag());
+    try std.testing.expectEqual(deep_center_hi.re, back.center_re);
+    try std.testing.expectEqual(deep_center_hi.im, back.center_im);
+}
+
+test "centerLo narrows the stored center to the f64 the per-pixel paths use" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    try std.testing.expectEqual(@as(f64, @floatCast(deep_center_hi.re)), v.centerLo().re);
+    try std.testing.expectEqual(@as(f64, @floatCast(deep_center_hi.im)), v.centerLo().im);
+}
+
+test "pixelToComplexHi separates two adjacent pixels at side 1e-25" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const left = v.pixelToComplexHi(500.0, 500.0, 1000);
+    const right = v.pixelToComplexHi(501.0, 500.0, 1000);
+    try std.testing.expect(right.re > left.re);
+}
+
+test "pixelToComplex collapses those same two pixels, which is why the Hi form exists" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const left = v.pixelToComplex(500.0, 500.0, 1000);
+    const right = v.pixelToComplex(501.0, 500.0, 1000);
+    try std.testing.expectEqual(left.re, right.re);
+}
+
+test "pixelToComplexHi maps the image center pixel to the full-precision center" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const c = v.pixelToComplexHi(500.0, 500.0, 1000);
+    try std.testing.expectEqual(deep_center_hi.re, c.re);
+    try std.testing.expectEqual(deep_center_hi.im, c.im);
+}
+
+test "pixelToComplexHi agrees with pixelToComplex on a shallow view" {
+    const v = SquareView.defaultView();
+    const hi = v.pixelToComplexHi(123.5, 456.5, 512);
+    const lo = v.pixelToComplex(123.5, 456.5, 512);
+    try std.testing.expectApproxEqAbs(lo.re, hi.re, 1e-15);
+    try std.testing.expectApproxEqAbs(lo.im, hi.im, 1e-15);
+}
+
+test "pixelToComplexHi negates pixel-y like every other mapping here" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const upper = v.pixelToComplexHi(500.0, 499.0, 1000);
+    const lower = v.pixelToComplexHi(500.0, 501.0, 1000);
+    try std.testing.expect(upper.im > lower.im);
+}
+
+test "rectPixelToComplexHi separates two adjacent pixels of a deep non-square image" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const left = v.rectPixelToComplexHi(400.0, 200.0, 800, 400);
+    const right = v.rectPixelToComplexHi(401.0, 200.0, 800, 400);
+    try std.testing.expect(right.re > left.re);
+}
+
+test "cursorCoord keeps full precision so a deep gesture anchor is not rounded" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const rect = ImageRect{ .x = 0, .y = 0, .w = 1000, .h = 1000, .side = 1000 };
+    const center_hit = v.cursorCoord(500.0, 500.0, rect) orelse return error.TestUnexpectedResult;
+    const one_right = v.cursorCoord(501.0, 500.0, rect) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(one_right.re > center_hit.re);
+}
+
+test "fromCorners keeps a deep selection's center at full precision" {
+    const v = try SquareView.fromCenterSide(deep_center_hi, deep_hi_side);
+    const c = v.corners();
+    const back = try SquareView.fromCorners(c.min, c.max);
+    try std.testing.expectEqual(v.center_re, back.center_re);
+}
+
+test "Viewport carries no f128 field, so the per-pixel mapping stays fast" {
+    inline for (@typeInfo(Viewport).@"struct".fields) |field| {
+        try std.testing.expect(field.type != f128);
+    }
+}
+
+test "coordDigits climbs past the old 17-digit ceiling to f128's 34" {
+    // The readout's depth ceiling IS the representation's: M6 raised the cap from 17 (f64) to
+    // 34 (f128), so a magnification the old cap flattened now keeps growing.
+    try std.testing.expectEqual(@as(usize, 25), coordDigits(1.0e21));
+    try std.testing.expectEqual(@as(usize, 34), coordDigits(1.0e40));
+}
+
+test "formatCoord emits every one of the 34 digits at maximum magnification" {
+    var buf: [coord_buf_len]u8 = undefined;
+    const line = try formatCoord(&buf, .{ .re = -0.75, .im = 0.25 }, std.math.floatMax(f64));
+    try std.testing.expectEqualStrings(
+        "-0.7500000000000000000000000000000000 + 0.2500000000000000000000000000000000i",
+        line,
+    );
+}
+
+test "coord_buf_len is exactly the worst case for a coordinate in the Mandelbrot region" {
+    var buf: [coord_buf_len]u8 = undefined;
+    // Both parts negative and one integer digit wide: the longest string `formatCoord`
+    // produces for a view of the set, at the deepest digit count.
+    const line = try formatCoord(&buf, .{ .re = -1.5, .im = -1.5 }, 1.0e40);
+    try std.testing.expectEqual(coord_buf_len, line.len);
+}
+
+test "max_coord_digits round-trips an f128 coordinate through decimal text exactly" {
+    // The claim `coord_text_buf_len` and T7/T8's shared formatting rest on: a center
+    // printed at `max_coord_digits` decimals parses back bit-identically.
+    const want = try std.fmt.parseFloat(f128, deep_center_re_text);
+    var buf: [coord_text_buf_len]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{[v]d:.[p]}", .{ .v = want, .p = max_coord_digits });
+    try std.testing.expectEqual(want, try std.fmt.parseFloat(f128, text));
+}
+
+test "the reference center's literal and its decimal text are the same f128" {
+    try std.testing.expectEqual(try std.fmt.parseFloat(f128, deep_center_re_text), deep_center_hi.re);
+    try std.testing.expectEqual(try std.fmt.parseFloat(f128, deep_center_im_text), deep_center_hi.im);
+}
+
+test "coord_text_buf_len holds a signed 34-decimal coordinate plus a terminator" {
+    var buf: [coord_text_buf_len]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{[v]d:.[p]}", .{
+        .v = @as(f128, -1.5),
+        .p = max_coord_digits,
+    });
+    try std.testing.expect(text.len < coord_text_buf_len);
 }

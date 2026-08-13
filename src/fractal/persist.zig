@@ -205,8 +205,12 @@ pub fn fromEngine(engine: *const engine_mod.Engine, alloc: std.mem.Allocator) er
     const mode_copy = try alloc.dupe(u8, mode_str);
 
     return AppState{
-        .center_re = engine.view.center_re,
-        .center_im = engine.view.center_im,
+        // M6/T2: the view center is `f128` but `AppState` is still `f64`, so this narrows and
+        // a center past ~17 significant decimals does NOT survive a save yet. T8 changes the
+        // save format (decimal string) to fix that; widening `AppState` here would break the
+        // JSON round trip this module owns.
+        .center_re = @floatCast(engine.view.center_re),
+        .center_im = @floatCast(engine.view.center_im),
         .side = engine.view.side,
         .policy_auto = engine.policy.auto,
         .policy_manual_value = engine.policy.manual_value,

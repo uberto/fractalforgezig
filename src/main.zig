@@ -176,8 +176,9 @@ const NavState = struct {
     drag_start_win_x: f32 = 0.0,
     drag_start_win_y: f32 = 0.0,
 
-    /// Stashed complex point for the right-click context menu.
-    right_click_pt: viewport.Complex = .{ .re = -0.75, .im = 0.0 },
+    /// Stashed complex point for the right-click context menu. FULL precision (M6): it is a
+    /// gesture anchor, and at depth an `f64` copy would round it onto the view center.
+    right_click_pt: viewport.ComplexHi = .{ .re = -0.75, .im = 0.0 },
     /// Whether to open the right-click popup this frame.
     open_ctx_menu: bool = false,
 

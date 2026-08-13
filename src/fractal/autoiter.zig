@@ -271,7 +271,7 @@ test "autoMaxIter rejects a non-finite or non-positive magnification" {
 }
 
 test "the ramp spans the whole f64-usable zoom range, capping at the precision floor" {
-    const center = viewport.Complex{ .re = -0.75, .im = 0.0 };
+    const center = viewport.ComplexHi{ .re = -0.75, .im = 0.0 };
     const floor_view = try SquareView.fromCenterSide(center, navigate.precision_floor_side);
     try std.testing.expectEqual(auto_max_iter, try autoMaxIter(floor_view.magnification()));
     // Two decades shallower than the floor the ramp is still climbing, so the cap is
