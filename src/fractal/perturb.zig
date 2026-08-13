@@ -428,18 +428,30 @@ test "an orbit shorter than max_iter still classifies its neighbourhood correctl
     // loop runs out of `Z_m` after four steps unless it re-anchors on `Z_0`.
     //
     // What the two assertions below are each worth, measured on throwaway copies of this file
-    // (nothing instrumented or mutated is committed):
+    // (nothing instrumented or mutated is committed; compile each variant with its OWN
+    // `--cache-dir`, or `zig run` serves a sibling copy's stale binary and every variant
+    // reports the first one's numbers):
     //   * these 25 pixels drive 7 exhaustion rebases and 0 dominance rebases, so the branch
     //     under test is the only one running here;
+    //   * on correct code all 25 `got` values equal `want` bit-for-bit in `f32` — worst
+    //     difference **0.0** — which is what pays for the tight tolerance below;
     //   * deleting the `m + 1 >= orbit_len` disjunct makes the loop read `orbit.re[5]` of a
     //     5-entry orbit — an `index out of bounds` panic, not a failed assertion;
-    //   * the two ways to get the branch *wrong* are caught by the VALUE assertion ONLY, since
-    //     neither misclassifies a single pixel. Splitting the `if` so exhaustion runs
-    //     `m = 0` alone (no `δ ← Z_m + δ`), and splitting it so exhaustion runs
-    //     `m = orbit_len - 2` (clamp onto the last entry instead of re-anchoring), each put
-    //     7 of these 25 pixels more than one iteration off, worst **14.19** at
-    //     `dc = (0.05, 0.01)`: want 5.0067, got 19.1991. Every other test in the file stays
-    //     green under both.
+    //   * three plausible ways to get the branch *wrong* are caught by the VALUE assertion
+    //     ONLY — none of them misclassifies a single pixel — and each is a different size, so
+    //     the figures do not transfer between them. Splitting the `if` so exhaustion runs
+    //     (a) `m = 0` alone, without `δ ← Z_m + δ`: worst **14.1925** at `dc = (0.05, 0.01)`
+    //         (want 5.0067, got 19.1991); 7 of the 25 pixels more than 1.0 off;
+    //     (b) `m = orbit_len - 2` alone (clamp onto the last entry, no re-anchor): worst
+    //         **2.5037** at `dc = (-0.01, -0.05)` (want 5.1577, got 7.6614); 3 pixels more
+    //         than 1.0 off. At `dc = (0.05, 0.01)` this variant is only 0.4782 off, i.e. (a)'s
+    //         worst pixel is not even a failing pixel here;
+    //     (c) `δ ← Z_m + δ` kept but `m = orbit_len - 2`: worst **0.8897** at
+    //         `dc = (0.05, -0.05)` (want 5.4877, got 4.5981); **0** pixels more than 1.0 off,
+    //         so a 1.0 tolerance let this one pass with the branch broken — that is why the
+    //         tolerance here is 0.25.
+    //     All three put 7 pixels more than 0.25 off, and every other test in the file stays
+    //     green under all three.
     const max_iter: u32 = 512;
     const shallow_center = viewport.ComplexHi{ .re = -0.5, .im = 0.9 };
     var orbit = try ReferenceOrbit.compute(testing.allocator, shallow_center, max_iter);
@@ -466,7 +478,11 @@ test "an orbit shorter than max_iter still classifies its neighbourhood correctl
                 got == mandelbrot.interior_sentinel,
             );
             if (want != mandelbrot.interior_sentinel) {
-                try testing.expectApproxEqAbs(want, got, 1.0);
+                // 0.25, tighter than AT3's approved 1.0, because a 1.0 tolerance passes with
+                // variant (c) above broken (0.8897). Not brittle: correct code is exact here
+                // (worst difference 0.0, and one `f32` ulp at these values is ~5e-7), so this
+                // sits ~5 decades above any arithmetic noise while failing (c) by 3.6×.
+                try testing.expectApproxEqAbs(want, got, 0.25);
             }
         }
     }
