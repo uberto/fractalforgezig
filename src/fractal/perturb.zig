@@ -424,16 +424,34 @@ test "a pixel whose delta outgrows the reference still matches full precision" {
 
 test "an orbit shorter than max_iter still classifies its neighbourhood correctly" {
     // Rebasing's exhaustion trigger, observed as an OUTCOME. This centre escapes after four
-    // steps, so the recorded orbit (5 entries) is far shorter than `max_iter`: without
-    // re-anchoring on `Z_0` the delta loop runs out of `Z_m` to read almost immediately —
-    // measured, 7 of these 25 pixels then come back on the wrong side of "escapes at all".
+    // steps, so the recorded orbit (5 entries) is far shorter than `max_iter` and the delta
+    // loop runs out of `Z_m` after four steps unless it re-anchors on `Z_0`.
+    //
+    // What the two assertions below are each worth, measured on throwaway copies of this file
+    // (nothing instrumented or mutated is committed):
+    //   * these 25 pixels drive 7 exhaustion rebases and 0 dominance rebases, so the branch
+    //     under test is the only one running here;
+    //   * deleting the `m + 1 >= orbit_len` disjunct makes the loop read `orbit.re[5]` of a
+    //     5-entry orbit — an `index out of bounds` panic, not a failed assertion;
+    //   * the two ways to get the branch *wrong* are caught by the VALUE assertion ONLY, since
+    //     neither misclassifies a single pixel. Splitting the `if` so exhaustion runs
+    //     `m = 0` alone (no `δ ← Z_m + δ`), and splitting it so exhaustion runs
+    //     `m = orbit_len - 2` (clamp onto the last entry instead of re-anchoring), each put
+    //     7 of these 25 pixels more than one iteration off, worst **14.19** at
+    //     `dc = (0.05, 0.01)`: want 5.0067, got 19.1991. Every other test in the file stays
+    //     green under both.
     const max_iter: u32 = 512;
     const shallow_center = viewport.ComplexHi{ .re = -0.5, .im = 0.9 };
     var orbit = try ReferenceOrbit.compute(testing.allocator, shallow_center, max_iter);
     defer orbit.deinit(testing.allocator);
     try testing.expect(orbit.len() < max_iter);
 
-    // A neighbourhood wide enough to contain both interior and escaping pixels.
+    // All 25 sampled pixels ESCAPE (`iterateExact` values 4.34–5.49); none is interior. So the
+    // classification assertion only rules out a sentinel-or-crash regression and the smooth
+    // value is what pins the arithmetic. The neighbourhood stays this narrow deliberately:
+    // widening it to ±0.35 does straddle the set (4 of 25 interior), but `δ` then dominates
+    // within the first steps, so dominance rebasing fires 1413 times and the exhaustion branch
+    // fires 0 times — it would test the other trigger twice and this one not at all.
     const offsets = [_]f64{ -0.05, -0.01, 0.0, 0.01, 0.05 };
     for (offsets) |dc_re| {
         for (offsets) |dc_im| {
@@ -447,6 +465,9 @@ test "an orbit shorter than max_iter still classifies its neighbourhood correctl
                 want == mandelbrot.interior_sentinel,
                 got == mandelbrot.interior_sentinel,
             );
+            if (want != mandelbrot.interior_sentinel) {
+                try testing.expectApproxEqAbs(want, got, 1.0);
+            }
         }
     }
 }
@@ -459,11 +480,16 @@ test "compute on a centre that escapes at once records a two-entry orbit" {
     try testing.expectEqual(@as(usize, 2), orbit.len());
 }
 
-test "a short orbit's slices are trimmed to the recorded length" {
+test "a short orbit's slices are trimmed below the allocation, which deinit still frees" {
+    // What "trimmed" means: `max_iter + 1 = 513` entries are allocated, but this centre escapes
+    // at once, so the PUBLIC slices are much shorter — a `for (orbit.re)` can never walk into
+    // the uninitialised tail. `capacity` is what keeps `deinit` freeing the whole allocation
+    // (asserted by the no-leak test, which fails on a partial free).
     var orbit = try ReferenceOrbit.compute(testing.allocator, .{ .re = 2.0, .im = 2.0 }, 512);
     defer orbit.deinit(testing.allocator);
-    try testing.expectEqual(orbit.len(), orbit.re.len);
-    try testing.expectEqual(orbit.len(), orbit.im.len);
+    try testing.expectEqual(@as(usize, 513), orbit.capacity);
+    try testing.expect(orbit.re.len < orbit.capacity);
+    try testing.expectEqual(orbit.re.len, orbit.im.len);
 }
 
 test "the recorded orbit starts at Z_0 = 0, which is what makes rebasing exact" {
