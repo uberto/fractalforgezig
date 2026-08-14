@@ -21,6 +21,7 @@ const stats_mod = @import("ui/stats.zig");
 const editor_mod = @import("ui/editor.zig");
 const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
+const perturb = @import("fractal/perturb.zig");
 const persist = @import("fractal/persist.zig");
 const dialog = @import("ui/dialog.zig");
 
@@ -31,6 +32,14 @@ var g_compute_pipeline: ?compute_mod.ComputePipeline = null;
 
 /// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled. One BAND per call
 /// (`engine.IterFn`), so a GPU render is chunked across frames like the CPU one.
+///
+/// M6/T4: a non-null `orbit` means the engine has decided this view needs the DEEP
+/// (perturbation) path. The Metal shader does not implement it yet — that is T6, which uploads
+/// the orbit and iterates the deltas on the GPU — and a direct `f32`/`f64` render at these
+/// depths would be a flat colour, i.e. a WRONG image, not a coarse one. So refuse the band: the
+/// engine logs the refusal and runs that band through `iterbuf.iterateDeepBandInto` on the CPU,
+/// which is correct (just slower). Deleting this branch without implementing the shader would
+/// silently reintroduce the flat deep zoom.
 fn gpuIterFn(
     view: viewport.SquareView,
     w: u32,
@@ -39,7 +48,9 @@ fn gpuIterFn(
     y0: u32,
     rows: u32,
     iter_band: []f32,
+    orbit: ?*const perturb.ReferenceOrbit,
 ) anyerror!void {
+    if (orbit != null) return error.DeepPathNotOnGpu;
     const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
     try compute_mod.gpuIterateRows(pl, view, w, h, max_iter, y0, rows, iter_band);
 }

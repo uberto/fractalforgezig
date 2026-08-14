@@ -50,6 +50,21 @@
 //! the returned error) is suppressed under `builtin.is_test`, because Zig's test runner
 //! treats any logged error as a failed test and this module's failure paths are themselves
 //! acceptance criteria. The wording is pinned by the builder tests instead.
+//!
+//! M6 — THE PATH DECISION LIVES HERE, and so does the reference orbit. `iterbuf` offers two
+//! iteration paths (`iterateRowsInto`, the proven direct `f64` one, and
+//! `iterateDeepBandInto`, T3's perturbation one) and chooses between them never; this module
+//! chooses, ONCE, in `usesDeepPath` — a view at or below `perturb.threshold_side` is deep.
+//! Both the one-shot `iterate` and the progressive `stepPassRows` route their CPU work
+//! through the single `cpuIterateBand`, so the two can not drift apart and a progressive deep
+//! render is scalar-identical to a one-shot one.
+//!
+//! The orbit is ENGINE-OWNED and per-RENDER, never cached across renders: `ensureOrbit`
+//! computes it lazily on the first band that needs it, every render boundary
+//! (`iterate`, `beginPass`, `cancelPass`, `finishPass`, `deinit`) releases it, and a progressive
+//! pass of N chunks therefore computes exactly ONE orbit — the expensive `f128` loop — and
+//! shares it across all N. `orbit_computations` and `path_summaries` count those two
+//! once-per-render facts so tests can assert them by number instead of by eye.
 const std = @import("std");
 const builtin = @import("builtin");
 const viewport = @import("viewport.zig");
@@ -60,6 +75,7 @@ const colorpass = @import("colorpass.zig");
 const color = @import("color.zig");
 const autoiter = @import("autoiter.zig");
 const progressive = @import("progressive.zig");
+const perturb = @import("perturb.zig");
 
 const Viewport = viewport.Viewport;
 const SquareView = viewport.SquareView;
@@ -95,7 +111,16 @@ pub const EngineError = error{
 /// `colorpass.ColorError` folds in as `BufferSizeMismatch`; `iterbuf.IterError` folds in
 /// whole, so M5's row-band path can surface `RowRangeOutOfBounds` under its own name rather
 /// than being flattened into a size mismatch it is not.
-pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoIterError || iterbuf.IterError;
+/// M6 folds in `OrbitFailure`: a deep view's iteration cannot start until its reference orbit
+/// exists, so `OutOfMemory` (the orbit is `max_iter + 1` f64 pairs) and `NonFiniteCenter` are
+/// now outcomes of an ITERATION, not only of a resize. Reported by `orbitFailureMessage`.
+pub const IterateError = EngineError || viewport.ViewportError || autoiter.AutoIterError ||
+    iterbuf.IterError || OrbitFailure;
+
+/// Everything computing this render's reference orbit can fail with: T3's own rejection plus
+/// the allocation. Named so `orbitFailureMessage`'s buffer bound is derived from the error set
+/// rather than guessed.
+pub const OrbitFailure = perturb.OrbitError || std.mem.Allocator.Error;
 
 /// `IterateError` plus allocation failure — what the paths that (re)allocate the buffers
 /// (`init`, `resize`) can return.
@@ -113,6 +138,13 @@ pub const ResizeError = IterateError || std.mem.Allocator.Error;
 /// GPU path: `compute.gpuIterateRows` wrapped in a thin free function in `main.zig`.
 /// CPU path: the built-in `iterbuf.iterateRowsInto` adapter.
 /// `anyerror` so GPU errors (SDL failures) propagate without widening IterateError.
+///
+/// M6 adds `orbit`: non-null means the engine decided this view needs the DEEP path and has
+/// already computed the one reference orbit for the whole render, so the backend must iterate
+/// perturbatively against it (`iterbuf.iterateDeepBandInto`) rather than direct-iterating `c`
+/// — at these depths every pixel's `f64` `c` is the same number and a direct render is a flat
+/// colour. A backend that cannot honour a non-null orbit must RETURN AN ERROR, not a shallow
+/// image: the engine then logs and falls back to the CPU, which renders it deep and correct.
 pub const IterFn = *const fn (
     view: SquareView,
     image_w: u32,
@@ -121,6 +153,7 @@ pub const IterFn = *const fn (
     y0: u32,
     rows: u32,
     iter_band: []f32,
+    orbit: ?*const perturb.ReferenceOrbit,
 ) anyerror!void;
 
 /// The persistent render state + decoupling counters. The app allocates one via `init`,
@@ -176,6 +209,24 @@ pub const Engine = struct {
     /// "rendering" and freeze the edit panels. Owned by `beginPass`/`stepPass`; read it
     /// through `passFraction`.
     pass: ?progressive.Pass,
+    /// This render's reference orbit (M6), or null when the current view is shallow or no band
+    /// has needed it yet. Owned here: `ensureOrbit` allocates it, `releaseOrbit` frees it, and
+    /// every render boundary releases — it is NEVER carried across renders. Read it through
+    /// `orbitPtr`; treat as private.
+    orbit: ?perturb.ReferenceOrbit,
+    /// The centre `orbit` was computed for, and the `max_iter` it was computed to. `ensureOrbit`
+    /// recomputes when either has moved, so an orbit left over from a superseded render can
+    /// never colour a different image.
+    orbit_center: viewport.ComplexHi,
+    orbit_max_iter: u32,
+    /// How many reference orbits this engine has computed. Bumped in the ONE place
+    /// `perturb.ReferenceOrbit.compute` is called, so it IS the call count: a deep render must
+    /// add exactly 1 however many chunks it took, and a shallow render must add 0.
+    orbit_computations: u32,
+    /// How many render-path summaries this engine has logged. Bumped in the ONE place
+    /// `perturb.pathSummary` is called (`logPathSummary`), so it IS that call count: exactly
+    /// one per completed render, one-shot or progressive.
+    path_summaries: u32,
 
     /// Allocate the smooth-value + RGBA8 buffers for a square image of side `image_side`,
     /// derive `max_iter` from `policy` at `view`'s magnification, install the default
@@ -242,15 +293,101 @@ pub const Engine = struct {
             .use_gpu = false,
             .gpu_iter_fn = null,
             .pass = null,
+            .orbit = null,
+            .orbit_center = .{ .re = 0, .im = 0 },
+            .orbit_max_iter = 0,
+            .orbit_computations = 0,
+            .path_summaries = 0,
         };
         gradient.bakeLut(g, &engine.lut);
         return engine;
     }
 
-    /// Free the owned buffers. Safe to call once after `init`.
+    /// Free the owned buffers (and this render's reference orbit, if one is in flight — a
+    /// `deinit` mid-pass must not leak it). Safe to call once after `init`.
     pub fn deinit(self: *Engine) void {
+        self.releaseOrbit();
         self.alloc.free(self.iter);
         self.alloc.free(self.rgba);
+    }
+
+    // ─── M6: which iteration path, and the one orbit that serves it ───────────
+
+    /// Whether the CURRENT view renders through the deep (perturbation) path: T3's
+    /// `perturb.threshold_side` and below. THE decision — `iterate`, `stepPassRows` and the
+    /// logged path summary all read it here, so they cannot disagree about which path ran.
+    pub fn usesDeepPath(self: *const Engine) bool {
+        return self.view.side <= perturb.threshold_side;
+    }
+
+    /// This render's reference orbit, computed on first use and then reused by every
+    /// subsequent band of the same render; null when the view is shallow (nothing is
+    /// allocated for a shallow render at all).
+    ///
+    /// The `f128` orbit loop is the single most expensive thing in a deep render, which is why
+    /// it must happen once per render and not once per chunk — `orbit_computations` pins that.
+    /// A failure is LOGGED with the depth and count that provoked it and RETURNED; the engine
+    /// keeps its previous image and stays renderable.
+    fn ensureOrbit(self: *Engine) IterateError!?*const perturb.ReferenceOrbit {
+        if (!self.usesDeepPath()) {
+            self.releaseOrbit();
+            return null;
+        }
+        // Guard against an orbit left behind by a render whose inputs have since moved.
+        if (self.orbit != null and (self.orbit_center.re != self.view.center_re or
+            self.orbit_center.im != self.view.center_im or
+            self.orbit_max_iter != self.max_iter))
+        {
+            self.releaseOrbit();
+        }
+        if (self.orbit == null) {
+            const center = self.view.center();
+            self.orbit = perturb.ReferenceOrbit.compute(self.alloc, center, self.max_iter) catch |err| {
+                self.logOrbitFailure(err);
+                return err;
+            };
+            self.orbit_center = center;
+            self.orbit_max_iter = self.max_iter;
+            self.orbit_computations += 1;
+        }
+        return self.orbitPtr();
+    }
+
+    /// Borrow this render's reference orbit, or null when there is none in flight. Read-only:
+    /// the engine frees it at the next render boundary, so callers must not retain the pointer
+    /// across `iterate` / `beginPass` / `cancelPass`.
+    pub fn orbitPtr(self: *const Engine) ?*const perturb.ReferenceOrbit {
+        if (self.orbit) |*o| return o;
+        return null;
+    }
+
+    /// Free this render's reference orbit, if any. Idempotent. Called at every render boundary
+    /// — including `cancelPass`, so abandoning a deep pass mid-flight hands the memory back
+    /// immediately instead of holding `max_iter + 1` f64 pairs until the next render.
+    fn releaseOrbit(self: *Engine) void {
+        if (self.orbit) |*o| o.deinit(self.alloc);
+        self.orbit = null;
+        self.orbit_max_iter = 0;
+    }
+
+    /// Iterate rows `y0 .. y0+rows` of the persistent buffer ON THE CPU, through whichever
+    /// path `orbit` selects. The ONE CPU dispatch site: `iterate`, `stepPassRows` and the GPU
+    /// fallback all come here, so the one-shot and progressive renders are the same arithmetic.
+    /// A band past the end of the buffer is a caller bug and returns `BufferSizeMismatch`
+    /// rather than writing out of bounds.
+    fn cpuIterateBand(
+        self: *Engine,
+        vp: Viewport,
+        y0: u32,
+        rows: u32,
+        orbit: ?*const perturb.ReferenceOrbit,
+    ) IterateError!void {
+        const o = orbit orelse return iterbuf.iterateRowsInto(self.iter, vp, self.max_iter, y0, rows);
+        const start: usize = @as(usize, y0) * @as(usize, self.image_w);
+        const count: usize = @as(usize, rows) * @as(usize, self.image_w);
+        if (start + count > self.iter.len) return EngineError.BufferSizeMismatch;
+        // The deep path is band-LOCAL (row `y0` at index 0), like the GPU's contract.
+        try iterbuf.iterateDeepBandInto(self.iter[start..][0..count], vp, self.max_iter, y0, rows, o);
     }
 
     /// (Re)run the EXPENSIVE stage for the current view / image side / policy: refresh
@@ -259,22 +396,27 @@ pub const Engine = struct {
     /// and log the one-line pass summary. Bumps `iteration_passes` AND `color_passes`.
     /// This is the ONLY path that touches `iteration_passes`.
     pub fn iterate(self: *Engine) IterateError!void {
-        // A one-shot pass supersedes any in-flight progressive pass for the old inputs.
+        // A one-shot pass supersedes any in-flight progressive pass for the old inputs — and
+        // that pass's orbit with it, which is for a view this render may not share.
         self.pass = null;
+        self.releaseOrbit();
         try validateGeometry(self.view, self.image_side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
         const vp = self.renderViewport();
+        // One orbit, for this render only: freed when the render ends, success or failure.
+        const orbit = try self.ensureOrbit();
+        defer self.releaseOrbit();
         if (self.use_gpu) {
             if (self.gpu_iter_fn) |iter_fn| {
-                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter) catch |err| {
+                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter, orbit) catch |err| {
                     log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
-                    try iterbuf.iterateInto(self.iter, vp, self.max_iter);
+                    try self.cpuIterateBand(vp, 0, self.image_h, orbit);
                 };
             } else {
-                try iterbuf.iterateInto(self.iter, vp, self.max_iter);
+                try self.cpuIterateBand(vp, 0, self.image_h, orbit);
             }
         } else {
-            try iterbuf.iterateInto(self.iter, vp, self.max_iter);
+            try self.cpuIterateBand(vp, 0, self.image_h, orbit);
         }
         self.iteration_passes += 1;
         try self.recolor();
@@ -388,6 +530,9 @@ pub const Engine = struct {
     /// previous buffers, dimensions and (cleared) pass state, still renderable.
     pub fn beginPass(self: *Engine, w: u32, h: u32) ResizeError!void {
         self.pass = null;
+        // A new pass supersedes the previous render, orbit included: the first chunk that needs
+        // one computes it for THIS view.
+        self.releaseOrbit();
         const side = @min(w, h);
         try validateGeometry(self.view, side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
@@ -455,6 +600,9 @@ pub const Engine = struct {
         var p = self.pass orelse return true;
         try validateGeometry(self.view, self.image_side);
         const vp = self.renderViewport();
+        // The SAME decision `iterate` makes, and the SAME orbit for every chunk of this pass:
+        // the first chunk pays for the `f128` loop, the rest borrow it.
+        const orbit = try self.ensureOrbit();
 
         const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
         const y0 = p.rows_done;
@@ -465,7 +613,7 @@ pub const Engine = struct {
                 const band_len: usize = @as(usize, chunk) * @as(usize, self.image_w);
                 if (band_start + band_len <= self.iter.len) {
                     const band = self.iter[band_start..][0..band_len];
-                    if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band)) |_| {
+                    if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band, orbit)) |_| {
                         done_on_gpu = true;
                     } else |err| {
                         log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
@@ -477,7 +625,7 @@ pub const Engine = struct {
                 }
             }
         }
-        if (!done_on_gpu) try iterbuf.iterateRowsInto(self.iter, vp, self.max_iter, y0, chunk);
+        if (!done_on_gpu) try self.cpuIterateBand(vp, y0, chunk, orbit);
         try self.recolorRows(y0, chunk);
         p.rows_done += chunk;
         self.pass = p;
@@ -492,14 +640,21 @@ pub const Engine = struct {
         self.iteration_passes += 1;
         self.color_passes += 1;
         self.logIteratePass();
+        // The render is over: its orbit has no further reader.
+        self.releaseOrbit();
         return true;
     }
 
     /// Abandon any in-flight progressive pass, leaving the partly refined image on display.
     /// The edge calls this when the user navigates again mid-pass: the new view starts its
     /// own pass, and the stale one must not write rows for the old inputs.
+    ///
+    /// Frees the abandoned pass's reference orbit too: navigating repeatedly during a deep zoom
+    /// cancels a pass per input event, and an orbit held past its render would be an unbounded
+    /// leak in exactly the interaction M6 exists for.
     pub fn cancelPass(self: *Engine) void {
         self.pass = null;
+        self.releaseOrbit();
     }
 
     /// Completion of the in-flight pass in `[0, 1]` for the status bar, or null when the
@@ -590,10 +745,18 @@ pub const Engine = struct {
         return iteratePassSummary(buf, self.iteration_passes, self.view, self.image_side, self.policy);
     }
 
+    /// Write WHICH iteration path this engine's current view uses into `buf` (T3's
+    /// `perturb.pathSummary`, e.g. `"render path: deep (perturbation), side=1e-30"`). Pass a
+    /// `[perturb.path_summary_buf_len]u8`. The depth and the path come from `usesDeepPath`, so
+    /// the line can never advertise a path the render did not take.
+    pub fn pathSummary(self: *const Engine, buf: []u8) ![]u8 {
+        return perturb.pathSummary(buf, self.view.side, self.usesDeepPath());
+    }
+
     /// Log the one-line summary of the pass that just completed. Thin by design: the string
     /// comes from the pure builder. A builder failure cannot be allowed to fail a successful
     /// render, so it degrades to a `.warn` naming the error instead of being swallowed.
-    fn logIteratePass(self: *const Engine) void {
+    fn logIteratePass(self: *Engine) void {
         var buf: [iterate_summary_buf_len]u8 = undefined;
         if (self.iterateSummary(&buf)) |line| {
             log.info("{s}", .{line});
@@ -603,6 +766,29 @@ pub const Engine = struct {
                 .{ self.iteration_passes, @errorName(err) },
             );
         }
+        self.logPathSummary();
+    }
+
+    /// Log which path rendered the pass that just completed. The ONLY caller of
+    /// `perturb.pathSummary` in the codebase, and it is called only from `logIteratePass` —
+    /// i.e. exactly once per completed render, whether that render was one-shot or N chunks.
+    /// `path_summaries` counts these, which is how the tests assert "once per render" by number.
+    fn logPathSummary(self: *Engine) void {
+        var buf: [perturb.path_summary_buf_len]u8 = undefined;
+        if (self.pathSummary(&buf)) |line| {
+            log.info("{s}", .{line});
+        } else |err| {
+            log.warn("render path summary could not be built ({s})", .{@errorName(err)});
+        }
+        self.path_summaries += 1;
+    }
+
+    /// Report a failed reference-orbit computation with the depth and iteration count that
+    /// provoked it. `.err` + a typed error returned by the caller (see `emitErr` for why the
+    /// emission is suppressed in the test tier).
+    fn logOrbitFailure(self: *const Engine, err: anyerror) void {
+        var buf: [orbit_message_buf_len]u8 = undefined;
+        logFailure(orbitFailureMessage(&buf, err, self.view.side, self.max_iter));
     }
 };
 
@@ -811,6 +997,39 @@ pub fn resizeFailureMessage(buf: []u8, image_side: u32, bytes: u64) ![]u8 {
     );
 }
 
+const orbit_prefix = "deep zoom reference orbit failed (";
+const orbit_infix_side = ") at view side ";
+const orbit_infix_iter = " with max_iter=";
+const orbit_suffix = "; zoom out or lower max_iter — the previous image is still on screen";
+
+/// Longest `@errorName` in `OrbitFailure`, taken FROM the error set so adding a failure mode
+/// cannot silently overflow `orbit_message_buf_len`. Any other error reaching
+/// `orbitFailureMessage` is truncated by the buffer, which surfaces as `NoSpaceLeft` and its
+/// own logged line rather than a wrong message.
+const max_orbit_error_name_len: usize = blk: {
+    var longest: usize = 0;
+    for (@typeInfo(OrbitFailure).error_set.?) |e| longest = @max(longest, e.name.len);
+    break :blk longest;
+};
+
+/// Buffer size that fits ANY `orbitFailureMessage` result. Exactly the worst case, pinned by a
+/// test; a shorter buffer returns `error.NoSpaceLeft`.
+pub const orbit_message_buf_len: usize = orbit_prefix.len + max_orbit_error_name_len +
+    orbit_infix_side.len + viewport.max_float_chars +
+    orbit_infix_iter.len + max_u32_digits + orbit_suffix.len;
+
+/// The human-actionable message for a reference orbit the engine could not compute: which
+/// failure, how deep the view was, how many iterations it asked for, and the two ways out.
+/// `side` uses `{e}` so a 1e-300 depth stays a few characters. Pure so the wording is
+/// unit-tested once; pass a `[orbit_message_buf_len]u8`.
+pub fn orbitFailureMessage(buf: []u8, err: anyerror, side: f64, max_iter: u32) ![]u8 {
+    return std.fmt.bufPrint(
+        buf,
+        orbit_prefix ++ "{s}" ++ orbit_infix_side ++ "{e}" ++ orbit_infix_iter ++ "{d}" ++ orbit_suffix,
+        .{ @errorName(err), side, max_iter },
+    );
+}
+
 /// Bytes both buffers need for a square image of side `image_side`: 4 for the f32 smooth
 /// value plus 4 for the RGBA8 texel, per pixel. `u64` and SATURATING, so reporting an
 /// absurd requested size cannot overflow on the very path that reports a failure.
@@ -859,7 +1078,21 @@ fn testEngine() !Engine {
 /// BAND-LOCAL buffer, which is exactly what `gpu/compute.zig`'s `gpuIterateRows` does. It
 /// calls `iterbuf.iterateBandInto` rather than re-deriving the mapping, so these tests cannot
 /// pass against a stub that disagrees with the real backends.
-fn bandStub(view: SquareView, w: u32, h: u32, max_iter: u32, y0: u32, rows: u32, band: []f32) anyerror!void {
+///
+/// It models the M6 GPU backend as `main.zig` wires it today: a non-null orbit is REFUSED
+/// (`error.DeepPathNotOnGpu`, T6's job), which is what makes the engine fall back to the CPU
+/// and still render the view deep.
+fn bandStub(
+    view: SquareView,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    band: []f32,
+    orbit: ?*const perturb.ReferenceOrbit,
+) anyerror!void {
+    if (orbit != null) return error.DeepPathNotOnGpu;
     try iterbuf.iterateBandInto(band, view.rectViewport(w, h), max_iter, y0, rows);
 }
 
@@ -1750,8 +1983,9 @@ test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increm
             y0: u32,
             rows: u32,
             band: []f32,
+            orbit: ?*const perturb.ReferenceOrbit,
         ) anyerror!void {
-            try bandStub(view, w, h, max_iter, y0, rows, band);
+            try bandStub(view, w, h, max_iter, y0, rows, band, orbit);
         }
     }.call;
 
@@ -1767,8 +2001,17 @@ test "use_gpu=true with a gpu_iter_fn: the fn is called, iteration_passes increm
 
 test "THE GUARANTEE holds with GPU path: setGradient after GPU iterate does not re-iterate" {
     const stub = struct {
-        fn call(view: SquareView, w: u32, h: u32, max_iter: u32, y0: u32, rows: u32, band: []f32) anyerror!void {
-            try bandStub(view, w, h, max_iter, y0, rows, band);
+        fn call(
+            view: SquareView,
+            w: u32,
+            h: u32,
+            max_iter: u32,
+            y0: u32,
+            rows: u32,
+            band: []f32,
+            orbit: ?*const perturb.ReferenceOrbit,
+        ) anyerror!void {
+            try bandStub(view, w, h, max_iter, y0, rows, band, orbit);
         }
     }.call;
 
@@ -1811,4 +2054,318 @@ test "the shallow render path is bit-identical at the home view after the f128 w
     for (shallow_golden) |g| {
         try testing.expectEqual(g.v, buf[g.i]);
     }
+}
+
+// ─── M6: the path decision, the per-render orbit, and the deep render ─────────
+//
+// The milestone's reference centre: the seahorse-valley boundary point. Deliberately NOT on the
+// real axis, so a vertically flipped image is a gross mismatch rather than a symmetry that hides
+// the flip. Shared with `iterbuf.zig`'s deep tests, which is why these numbers must match.
+const m6_center = viewport.ComplexHi{
+    .re = -0.743643887037158704752191506114774,
+    .im = 0.131825904205311970493132056385139,
+};
+
+/// Side of the (small) images the deep engine tests render. Deep pixels are ~100× a shallow
+/// pixel's cost, so keep the count low and the assertions sharp.
+const deep_side: u32 = 16;
+
+/// The reference deep view for these tests, and the `max_iter` it NEEDS. Both matter: at 1e-9
+/// the whole 16x16 image is inside `perturb.threshold_side` and resolves 256 distinct values at
+/// 4096 iterations — but only 1 (all interior) at 512, because a deep view is iteration-limited
+/// long before it is precision-limited. A "deep" fixture with too small a `max_iter` renders a
+/// FLAT image, against which an identity or fallback assertion proves nothing.
+const deep_test_side: f64 = 1.0e-9;
+const deep_test_iter: u32 = 4096;
+
+fn deepView(side: f64) !SquareView {
+    return SquareView.fromCenterSide(m6_center, side);
+}
+
+/// An engine at the reference centre, `side` wide, `deep_side` px square, with `max_iter` PINNED
+/// (`manual`) so the depth under test is not silently re-decided by the auto ramp.
+fn deepEngine(side: f64, max_iter: u32) !Engine {
+    return Engine.init(testing.allocator, try deepView(side), deep_side, try IterPolicy.manual(max_iter));
+}
+
+/// An engine on the reference deep view, resolved (256 distinct values on a correct render).
+fn resolvedDeepEngine() !Engine {
+    return deepEngine(deep_test_side, deep_test_iter);
+}
+
+/// Count how many distinct bit patterns a smooth buffer holds — the measure of whether a deep
+/// render resolved structure or collapsed to one flat value.
+fn distinctValues(values: []const f32) !usize {
+    var seen = std.AutoHashMap(u32, void).init(testing.allocator);
+    defer seen.deinit();
+    for (values) |v| try seen.put(@bitCast(v), {});
+    return seen.count();
+}
+
+test "usesDeepPath switches exactly at perturb.threshold_side, inclusive" {
+    const t = perturb.threshold_side;
+    var deep = try deepEngine(t, 512);
+    defer deep.deinit();
+    try testing.expect(deep.usesDeepPath()); // AT the threshold: deep
+
+    try deep.installView(try deepView(std.math.nextAfter(f64, t, 1.0)));
+    try testing.expect(!deep.usesDeepPath()); // one ulp above: shallow
+
+    try deep.installView(try deepView(std.math.nextAfter(f64, t, 0.0)));
+    try testing.expect(deep.usesDeepPath()); // one ulp below: deep
+}
+
+test "a shallow render computes no reference orbit at all" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 0), e.orbit_computations);
+    try testing.expectEqual(@as(?*const perturb.ReferenceOrbit, null), e.orbitPtr());
+}
+
+test "a one-shot deep render computes exactly one reference orbit" {
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.orbit_computations);
+}
+
+test "a progressive deep render of many chunks still computes exactly one reference orbit" {
+    // The load-bearing economy of the deep path: the `f128` orbit loop is the expensive part,
+    // and a 16-row image drained 3 rows at a time is 6 chunks. One orbit, not six.
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.beginPass(deep_side, deep_side);
+    try drainPass(&e, 3);
+    try testing.expectEqual(@as(u32, 1), e.orbit_computations);
+}
+
+test "a completed render logs exactly one render-path summary, one-shot or progressive" {
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.path_summaries);
+
+    try e.beginPass(deep_side, deep_side);
+    try drainPass(&e, 3); // six chunks, ONE more summary
+    try testing.expectEqual(@as(u32, 2), e.path_summaries);
+}
+
+test "a progressive deep render is scalar-identical to the one-shot deep render" {
+    // Chunking must not change one bit of the deep image either — the same guarantee M5 pinned
+    // for the shallow path, now across a shared orbit and band-local writes.
+    var one_shot = try resolvedDeepEngine();
+    defer one_shot.deinit();
+    try one_shot.iterate();
+
+    var chunked = try resolvedDeepEngine();
+    defer chunked.deinit();
+    try chunked.beginPass(deep_side, deep_side);
+    try drainPass(&chunked, 3);
+
+    // Non-flat first, or "identical" would be satisfied by two all-interior images.
+    try testing.expect(try distinctValues(one_shot.iter) > 1);
+    try testing.expectEqual(@as(usize, 0), diffCountF32(one_shot.iter, chunked.iter));
+}
+
+test "a completed deep progressive pass bumps each counter exactly once" {
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.beginPass(deep_side, deep_side);
+    try drainPass(&e, 3);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expectEqual(@as(u32, 1), e.color_passes);
+}
+
+test "cancelPass frees the abandoned deep pass's orbit, and re-beginning computes a fresh one" {
+    // Run under `testing.allocator`: a retained orbit here would be reported as a LEAK, which is
+    // the real assertion. Repeated begin/cancel is what a user zooming continuously produces.
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        try e.beginPass(deep_side, deep_side);
+        _ = try e.stepPassRows(2); // partway in: the orbit now exists
+        try testing.expect(e.orbitPtr() != null);
+        e.cancelPass();
+        try testing.expectEqual(@as(?*const perturb.ReferenceOrbit, null), e.orbitPtr());
+    }
+    try testing.expectEqual(@as(u32, 3), e.orbit_computations); // one per abandoned render
+}
+
+test "a completed deep render leaves no orbit behind" {
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.iterate();
+    try testing.expectEqual(@as(?*const perturb.ReferenceOrbit, null), e.orbitPtr());
+}
+
+test "a one-shot render supersedes an in-flight deep pass's orbit instead of reusing it" {
+    // `iterate` after a partial pass at another view must not colour the new image with the old
+    // view's orbit. Two renders happened, so two orbits were computed.
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    try e.beginPass(deep_side, deep_side);
+    _ = try e.stepPassRows(2);
+    try e.setViewport(try deepView(2.0e-9));
+    try testing.expectEqual(@as(u32, 2), e.orbit_computations);
+    try testing.expectEqual(@as(?*const perturb.ReferenceOrbit, null), e.orbitPtr());
+}
+
+test "an 8x8 render at side 1e-30 through the engine resolves mostly distinct values" {
+    // THE milestone, end to end through the public API: at 1e-30 every pixel's `f64` `c` is the
+    // same number, so the pre-M6 renderer produced one flat colour. `max_iter` is pinned at
+    // 65536 because the auto ramp still stops at `auto_max_iter` (4096) — raising it for these
+    // depths is T5's task, and until then a deep view under the auto policy is iteration-limited,
+    // not precision-limited.
+    const S: u32 = 8;
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-30), S, try IterPolicy.manual(65536));
+    defer e.deinit();
+    try e.iterate();
+    try testing.expect(try distinctValues(e.iter) >= 56); // 64 pixels
+}
+
+/// A 16x16 render of the reference centre at side 1e-3 (a SHALLOW view: 1000x above
+/// `perturb.threshold_side`) with `max_iter` 512, captured from the tree BEFORE the deep path
+/// was wired in and asserted here bit-exactly.
+///
+/// This is M6's other promise, the one that is easy to break silently: adding a second iteration
+/// path must not perturb the first by one bit. The samples span the image, and index 100 is an
+/// interior sentinel.
+const shallow_1e3_golden = [_]struct { i: usize, v: f32 }{
+    .{ .i = 0, .v = 36.18602 },
+    .{ .i = 17, .v = 36.594677 },
+    .{ .i = 40, .v = 40.206276 },
+    .{ .i = 100, .v = -1.0 }, // interior sentinel
+    .{ .i = 136, .v = 125.48962 },
+    .{ .i = 200, .v = 61.921837 },
+    .{ .i = 239, .v = 68.322136 },
+    .{ .i = 255, .v = 69.98453 },
+};
+
+test "a view just above the threshold still renders shallow, bit-identically to before M6" {
+    var e = try deepEngine(1.0e-3, 512);
+    defer e.deinit();
+    try testing.expect(!e.usesDeepPath());
+    try e.iterate();
+
+    for (shallow_1e3_golden) |g| {
+        try testing.expectEqual(g.v, e.iter[g.i]);
+    }
+    try testing.expectEqual(@as(u32, 0), e.orbit_computations);
+}
+
+test "THE GUARANTEE holds at a deep view: the three colour setters never re-iterate" {
+    // The decoupling has to survive the expensive path, which is where it MATTERS: a palette
+    // tweak at 1e-25 must not pay for a reference orbit and 65536-deep deltas again. 8x8 and
+    // 65536 iterations is what that depth needs to resolve (44 distinct values) — the guarantee
+    // is asserted over a REAL deep image, not a flat one.
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-25), 8, try IterPolicy.manual(65536));
+    defer e.deinit();
+    try e.iterate();
+    try testing.expect(e.usesDeepPath());
+    try testing.expect(try distinctValues(e.iter) > 1);
+    const iters = e.iteration_passes;
+    const orbits = e.orbit_computations;
+
+    try e.setGradient(solidGradient(.{ 255, 0, 0, 255 }));
+    try e.setMapping(.{ .mode = .cyclic, .period = 8.0 });
+    try e.setInterior(.{ 0, 0, 255, 255 });
+
+    try testing.expectEqual(iters, e.iteration_passes); // NEVER re-iterated
+    try testing.expectEqual(orbits, e.orbit_computations); // and no new orbit either
+    try testing.expectEqual(@as(u32, 4), e.color_passes); // the render's, plus three edits
+}
+
+test "a GPU backend that refuses the deep path falls back to the CPU and still renders deep" {
+    // What `main.zig` wires today: `gpuIterFn` errors on a non-null orbit (the shader is T6's).
+    // The fallback must produce the DEEP image, not a flat one.
+    const stub = struct {
+        fn call(
+            view: SquareView,
+            w: u32,
+            h: u32,
+            max_iter: u32,
+            y0: u32,
+            rows: u32,
+            band: []f32,
+            orbit: ?*const perturb.ReferenceOrbit,
+        ) anyerror!void {
+            try bandStub(view, w, h, max_iter, y0, rows, band, orbit);
+        }
+    }.call;
+
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = stub;
+    try e.iterate();
+
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expect(try distinctValues(e.iter) > 1); // not the flat image f64 would give
+}
+
+test "the engine's path summary names the deep path and the depth it is used at" {
+    var e = try deepEngine(1.0e-30, 512);
+    defer e.deinit();
+    var buf: [perturb.path_summary_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        try perturb.pathSummary(&buf, 1.0e-30, true),
+        try e.pathSummary(&buf),
+    );
+}
+
+test "an orbit allocation failure is reported and leaves the engine renderable" {
+    // `fail_index = 2` lets `init`'s two buffers through and fails the orbit. The deep render
+    // must surface `OutOfMemory` (not a wrong image), and a shallower view — which allocates
+    // nothing — must still render afterwards.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var e = try Engine.initRect(failing.allocator(), try deepView(1.0e-9), deep_side, deep_side, try IterPolicy.manual(512));
+    defer e.deinit();
+
+    try testing.expectError(error.OutOfMemory, e.iterate());
+    try testing.expectEqual(@as(u32, 0), e.iteration_passes);
+    try testing.expectEqual(@as(?*const perturb.ReferenceOrbit, null), e.orbitPtr());
+
+    try e.installView(testView()); // shallow: no allocation, no orbit
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+}
+
+test "a hand-built non-finite deep centre is rejected before any orbit is attempted" {
+    // `perturb.OrbitError.NonFiniteCenter` is in `IterateError` (and in `orbitFailureMessage`'s
+    // buffer bound) but is UNREACHABLE through the engine: `validateGeometry` re-runs T1's
+    // `fromCenterSide` first, so a hand-built view fails as `DegenerateRegion` and no orbit is
+    // allocated for a centre that has no orbit. Pinned so the ordering is not "simplified" away.
+    var e = try resolvedDeepEngine();
+    defer e.deinit();
+    e.view = SquareView{ .center_re = std.math.nan(f128), .center_im = 0.0, .side = deep_test_side };
+    try testing.expectError(viewport.ViewportError.DegenerateRegion, e.iterate());
+    try testing.expectEqual(@as(u32, 0), e.orbit_computations);
+}
+
+test "orbitFailureMessage names the failure, the depth, the count and the ways out" {
+    var buf: [orbit_message_buf_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        "deep zoom reference orbit failed (OutOfMemory) at view side 1e-30 with " ++
+            "max_iter=65536; zoom out or lower max_iter — the previous image is still on screen",
+        try orbitFailureMessage(&buf, error.OutOfMemory, 1.0e-30, 65536),
+    );
+}
+
+test "orbit_message_buf_len fits the worst-case message" {
+    var buf: [orbit_message_buf_len]u8 = undefined;
+    const message = try orbitFailureMessage(
+        &buf,
+        error.NonFiniteCenter,
+        -std.math.floatMin(f64),
+        std.math.maxInt(u32),
+    );
+    try testing.expect(message.len <= orbit_message_buf_len);
+}
+
+test "orbitFailureMessage reports NoSpaceLeft rather than truncating into a shorter buffer" {
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, orbitFailureMessage(&buf, error.OutOfMemory, 1.0e-30, 512));
 }
