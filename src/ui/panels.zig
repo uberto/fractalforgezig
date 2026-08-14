@@ -244,6 +244,14 @@ fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void 
     c.ffImguiImage(texture, @floatFromInt(image_rect.w), @floatFromInt(image_rect.h));
 }
 
+/// Width of the status bar's iteration field, the longest of its two forms
+/// (`"  interior (N)"`) at the widest `max_iter` the policy can hand the engine —
+/// `max_manual_iter`, which is larger than the auto ramp's `auto_max_iter`. DERIVED at comptime
+/// rather than a hand-written 32, so raising the auto ceiling (M6/T5 took it 4096 → 65536, and
+/// `iter 65536` is five digits where M0 assumed four) cannot silently truncate the readout.
+const iter_info_buf_len: usize =
+    std.fmt.comptimePrint("  interior ({d})", .{autoiter.max_manual_iter}).len;
+
 /// One-line status bar at the bottom of the fractal region. While a pass is in flight
 /// (`progress` non-null) it shows a PROGRESS BAR instead of the readout — the one place the
 /// user can see that the app is working rather than hung. Otherwise: coordinate + iteration
@@ -274,7 +282,7 @@ fn drawStatusBar(
         // lookup goes through the engine's own RENDER viewport, not the on-screen rect: the
         // buffer is `image_w × image_h` and only matches the screen rect once a pass at the
         // region's size has finished (see `DrawResult`).
-        var iter_info_buf: [32]u8 = undefined;
+        var iter_info_buf: [iter_info_buf_len]u8 = undefined;
         const iter_str: []u8 = blk: {
             if (rect.side == 0) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
             // `lo()`: the render buffer is f64 all the way down, and this only asks WHICH
@@ -294,9 +302,9 @@ fn drawStatusBar(
         };
 
         // Compose into a single null-terminated line.
-        var line_buf: [viewport.coord_buf_len + 32]u8 = undefined;
+        var line_buf: [viewport.coord_buf_len + iter_info_buf_len]u8 = undefined;
         const line = std.fmt.bufPrint(&line_buf, "{s}{s}", .{ coord_slice, iter_str }) catch coord_slice;
-        var nt: [viewport.coord_buf_len + 33]u8 = undefined;
+        var nt: [viewport.coord_buf_len + iter_info_buf_len + 1]u8 = undefined;
         @memcpy(nt[0..line.len], line);
         nt[line.len] = 0;
         ig.igTextUnformatted(nt[0..line.len :0].ptr, null);

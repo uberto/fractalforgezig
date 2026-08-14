@@ -561,33 +561,44 @@ test "the re-exported floor names are exactly viewport's definitions" {
     try std.testing.expectEqual(&viewport.precisionFloorMessage, &precisionFloorMessage);
 }
 
-test "the re-exported floor value is still 1e-13" {
-    try std.testing.expectEqual(@as(f64, 1.0e-13), precision_floor_side);
+test "the re-exported floor value is the deep-zoom floor" {
+    try std.testing.expectEqual(@as(f64, 1.0e-30), precision_floor_side);
 }
 
 test "the re-exported atPrecisionFloor still flags a side below the floor" {
-    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-14);
+    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-31);
     try std.testing.expect(atPrecisionFloor(v));
     try std.testing.expect(!atPrecisionFloor(SquareView.defaultView()));
 }
 
 test "the re-exported precisionFloorMessage still builds the actionable warning" {
     var buf: [floor_message_buf_len]u8 = undefined;
-    const msg = try precisionFloorMessage(&buf, 9.9e-14);
+    const msg = try precisionFloorMessage(&buf, 9.9e-31);
     try std.testing.expectEqualStrings(
-        "precision floor reached: side=9.9e-14 is below the f64 limit 1e-13; " ++
+        "precision floor reached: side=9.9e-31 is below the deepest supported side 1e-30; " ++
             "the image quantizes into blocks from here, so zoom out or reset the view",
         msg,
     );
 }
 
 test "a zoom that crosses the precision floor still succeeds but is flagged" {
-    // 3.5 · 2^-45 ≈ 9.9476e-14 — the first power-of-two zoom step below the floor.
+    // 3.5 · 2^-102 ≈ 6.9e-31 — the first power-of-two zoom step below the floor.
     const deep = try zoomCentered(
         SquareView.defaultView(),
         .{ .re = -0.75, .im = 0.0 },
-        std.math.ldexp(@as(f64, 1.0), -45),
+        std.math.ldexp(@as(f64, 1.0), -102),
     );
     try std.testing.expect(deep.side < precision_floor_side);
     try std.testing.expect(atPrecisionFloor(deep));
+}
+
+test "the newly usable deep range crosses no floor through the re-exported predicate" {
+    // The gesture path an actual deep zoom takes: 3.5 · 2^-99 ≈ 5.5e-30 is still above the
+    // floor, so navigating there must not warn.
+    const deep = try zoomCentered(
+        SquareView.defaultView(),
+        .{ .re = -0.75, .im = 0.0 },
+        std.math.ldexp(@as(f64, 1.0), -99),
+    );
+    try std.testing.expect(!atPrecisionFloor(deep));
 }

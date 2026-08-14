@@ -6,7 +6,8 @@
 //!
 //! THE HEURISTIC (`autoMaxIter`), spelled out because T7's tooltip and T8's docs quote it:
 //!
-//!     max_iter = clamp(base_max_iter + iter_per_doubling · log2(magnification / mag0),
+//!     d        = max(0, log2(magnification / mag0))          // doublings past the home view
+//!     max_iter = clamp(base_max_iter + iter_per_doubling_squared · d²,
 //!                      base_max_iter, auto_max_iter)
 //!
 //! where `mag0` is the DEFAULT view's magnification (read from T1's
@@ -14,17 +15,28 @@
 //! `magnification = 1/(side·√2)` (plan A3). Rationale, term by term:
 //!   * `base_max_iter = 512` — the M0 value, so the home view renders exactly as it did
 //!     before M3 and the auto ramp can only ever ADD detail.
-//!   * one doubling of magnification (one 2× zoom step) costs `iter_per_doubling = 80`
-//!     extra iterations. Linear-in-log2 is the standard ramp: escape-time detail near the
-//!     boundary needs roughly a constant number of extra iterations per zoom step, and a
-//!     linear-in-log law is what keeps it monotone and predictable to the user.
-//!   * `auto_max_iter = 4096` is where the AUTO ramp stops. Not a cost limit but a
-//!     usefulness limit: `80` is not arbitrary — `(4096 − 512)/80 = 44.8` doublings puts
-//!     that value at side ≈ 1.15e-13, i.e. essentially exactly
-//!     `navigate.precision_floor_side` (1e-13, the deepest zoom f64 supports). So the ramp
-//!     climbs across the WHOLE usable zoom range and only tops out where f64 has run out of
-//!     precision and the image cannot improve anyway. Pinned by the tests, so changing one
-//!     constant without the others breaks the build.
+//!   * the ramp is QUADRATIC in `d`, not linear (M6/T5 changed this). Measured on the
+//!     milestone's reference centre, the iterations a view needs to escape at all grow far
+//!     faster than linearly with depth: ~1850 at side 1e-8, ~9971 at 1e-20, ~19132 at 1e-25,
+//!     >20000 at 1e-30. A linear-in-log2 ramp steep enough for 1e-30 would massively
+//!     over-iterate shallow views; one gentle enough for shallow views renders every deep
+//!     view as a solid blob. `d²` tracks the measured curve — gentle where the measurements
+//!     are gentle, steep where they are steep — while staying monotone and predictable.
+//!   * `d` is clamped at 0 BEFORE squaring. That clamp is what makes a quadratic safe here:
+//!     `d²` climbs again once `d` goes negative, so without it, zooming OUT past the home
+//!     view would ask for ever more iterations.
+//!   * `auto_max_iter = 65536` is where the AUTO ramp stops, and
+//!     `iter_per_doubling_squared` is DERIVED (below) so the ramp lands on it exactly at
+//!     `viewport.precision_floor_side` — the deepest view the app supports. Not a cost limit
+//!     but a usefulness limit: the ramp climbs across the WHOLE usable zoom range and only
+//!     tops out where the extended-precision centre has run out of digits and the image
+//!     cannot improve anyway. Nothing here is hand-tuned: move the floor, the home view or
+//!     either count and the coefficient follows at comptime.
+//!
+//! The COST is deliberate and must not be traded away: at 1e-30 nearly every pixel runs to
+//! `max_iter` with no early exit, so a deep render is ~`w·h·65536` delta steps. The ceiling is
+//! what makes a deep view CORRECT rather than a blob; `progressive.zig` is what keeps the UI
+//! responsive at that count. Lowering it to make renders feel faster reintroduces the bug.
 //!
 //! Both auto clamps are load-bearing: zooming OUT past the home view never drops below the
 //! M0 baseline, and the auto ramp can never ask for a count the zoom depth cannot use.
@@ -36,10 +48,11 @@
 //! hand-built struct can never hand the engine a 1-iteration render.
 //!
 //! A pinned value is bounded SEPARATELY from the ramp, and far higher (`max_manual_iter` =
-//! 2^24): the ramp is calibrated to f64 zoom depth, but someone pinning the count by hand is
-//! doing something the ramp does not model — hunting boundary filaments that need many more
-//! iterations at a magnification f64 still resolves. That is their time to spend, so the only
-//! bound left is representational (the `f32` iteration buffer), not a policy judgement.
+//! 2^24): the ramp is calibrated to supported zoom depth, but someone pinning the count by
+//! hand is doing something the ramp does not model — hunting boundary filaments that need many
+//! more iterations at a magnification the app still resolves. That is their time to spend, so
+//! the only bound left is representational (the `f32` iteration buffer), not a policy
+//! judgement.
 //!
 //! Errors are returned UNLOGGED (this tier never imports `log`, see
 //! `src/fractal/context.md`): the edge logs them, using `maxIterRangeMessage` for a rejected
@@ -55,9 +68,9 @@ const SquareView = viewport.SquareView;
 /// the auto ramp (zooming out never renders coarser than M0 did).
 pub const base_max_iter: u32 = 512;
 
-/// Where the AUTO ramp stops — the count that matches the deepest zoom f64 supports (see the
-/// file header). It bounds the ramp ONLY: a manual value may go far past it.
-pub const auto_max_iter: u32 = 4096;
+/// Where the AUTO ramp stops — the count the deepest SUPPORTED zoom needs (see the file
+/// header). It bounds the ramp ONLY: a manual value may go far past it.
+pub const auto_max_iter: u32 = 65536;
 
 /// Highest value the user may pin manually: 2^24, the largest integer an `f32` represents
 /// EXACTLY. The iteration buffer is `[]f32` smooth values, so past this bound consecutive
@@ -71,13 +84,35 @@ pub const max_manual_iter: u32 = 1 << 24;
 /// so a smaller number is almost certainly a typo rather than a deliberate speed trade.
 pub const min_manual_iter: u32 = 16;
 
-/// Extra iterations granted per doubling of magnification (one 2× zoom step). See the file
-/// header for why it is 80.
-pub const iter_per_doubling: f64 = 80.0;
-
 /// The magnification the ramp is anchored at: the default (home) view's, straight from T1.
 /// Comptime-evaluated, so there is no second definition of the magnification formula.
 pub const default_magnification: f64 = SquareView.defaultView().magnification();
+
+/// The magnification of the DEEPEST supported view — `viewport.precision_floor_side` read
+/// through T1's own constructor and `magnification()`, never a second copy of `1/(side·√2)`.
+/// Comptime. The centre is irrelevant to a magnification (only the side is), so it is the home
+/// view's; `catch unreachable` cannot fire because the floor is a finite positive side, and if
+/// someone ever makes it one that is not, this fails the BUILD rather than at runtime.
+pub const floor_magnification: f64 = blk: {
+    const floor_view = SquareView.fromCenterSide(
+        SquareView.defaultView().center(),
+        viewport.precision_floor_side,
+    ) catch unreachable;
+    break :blk floor_view.magnification();
+};
+
+/// Doublings of magnification between the home view and the precision floor: ≈ 101.47 today
+/// (`log2(3.5 / 1e-30)`). This is the ramp's full horizontal span.
+pub const floor_doublings: f64 = std.math.log2(floor_magnification / default_magnification);
+
+/// The quadratic ramp's coefficient `k`: extra iterations per SQUARED doubling. DERIVED at
+/// comptime from the four anchors (`default_magnification`, `viewport.precision_floor_side`,
+/// `base_max_iter`, `auto_max_iter`) by solving `base + k·d_floor² = auto` — so the ramp hits
+/// the ceiling exactly at the floor, and moving any anchor moves `k` with it. Do NOT replace
+/// this with the literal it happens to evaluate to (≈ 6.316): that is precisely the latent
+/// inconsistency the derivation exists to prevent.
+pub const iter_per_doubling_squared: f64 =
+    @as(f64, @floatFromInt(auto_max_iter - base_max_iter)) / (floor_doublings * floor_doublings);
 
 /// Rejected `max_iter` inputs. Returned, never logged (see the file header). Named for this
 /// module (like `viewport.ViewportError` / `engine.EngineError`) because `iterbuf.zig` already
@@ -105,8 +140,11 @@ pub fn autoMaxIter(magnification: f64) AutoIterError!u32 {
     if (!std.math.isFinite(magnification) or magnification <= 0.0) {
         return AutoIterError.InvalidMagnification;
     }
-    const doublings = std.math.log2(magnification / default_magnification);
-    const raw = @as(f64, @floatFromInt(base_max_iter)) + iter_per_doubling * doublings;
+    // Clamped at zero BEFORE squaring: see the file header — a negative `d` (zoomed out past
+    // the home view) squares back into a positive one, which would climb again.
+    const doublings = @max(0.0, std.math.log2(magnification / default_magnification));
+    const raw = @as(f64, @floatFromInt(base_max_iter)) +
+        iter_per_doubling_squared * doublings * doublings;
     // Negated comparison so a NaN `raw` (unreachable today, but one refactor away) falls
     // back to the baseline instead of trapping in `@intFromFloat`.
     if (!(raw > @as(f64, @floatFromInt(base_max_iter)))) return base_max_iter;
@@ -208,29 +246,55 @@ pub fn policySummary(buf: []u8, policy: IterPolicy, magnification: f64) ![]u8 {
 /// The default view's magnification, taken from T1's API (never recomputed here).
 const mag0: f64 = SquareView.defaultView().magnification();
 
-/// `iter_per_doubling` as the integer step the tests below compare against.
-const step: u32 = @intFromFloat(iter_per_doubling);
+test "the ramp's coefficient is derived from the four anchors, not hard-coded" {
+    // Guards against someone pasting a literal (≈ 6.316, or the plan's estimated 7.24): k·d² at
+    // the floor must be EXACTLY the span the ramp has to climb, so moving any anchor — either
+    // count, the home view, the floor — still lands the ceiling on the floor.
+    const span: f64 = @floatFromInt(auto_max_iter - base_max_iter);
+    try std.testing.expectApproxEqRel(
+        span,
+        iter_per_doubling_squared * floor_doublings * floor_doublings,
+        1.0e-12,
+    );
+}
+
+test "floor_doublings measures the home view to the precision floor" {
+    const floor_view = try SquareView.fromCenterSide(
+        SquareView.defaultView().center(),
+        viewport.precision_floor_side,
+    );
+    try std.testing.expectApproxEqRel(
+        std.math.log2(floor_view.magnification() / mag0),
+        floor_doublings,
+        1.0e-15,
+    );
+}
 
 test "autoMaxIter returns the M0 baseline at the default view's magnification" {
     try std.testing.expectEqual(@as(u32, 512), try autoMaxIter(mag0));
 }
 
 test "autoMaxIter follows the documented formula eight doublings in" {
-    // base + k·log2(mag/mag0) = 512 + 80·8 = 1152.
-    try std.testing.expectEqual(@as(u32, 1152), try autoMaxIter(std.math.ldexp(mag0, 8)));
+    // base + k·d² = 512 + 6.315961…·8² = 916.22, which rounds to 916.
+    try std.testing.expectEqual(@as(u32, 916), try autoMaxIter(std.math.ldexp(mag0, 8)));
 }
 
 test "autoMaxIter rounds the ramp to the nearest iteration, not down" {
-    // 3× the default magnification ⇒ 512 + 80·log2(3) = 638.797, which rounds to 639.
-    try std.testing.expectEqual(@as(u32, 639), try autoMaxIter(mag0 * 3.0));
+    // 3× the default magnification ⇒ 512 + 6.315961…·log2(3)² = 527.866, which rounds to 528
+    // (truncation would give 527).
+    try std.testing.expectEqual(@as(u32, 528), try autoMaxIter(mag0 * 3.0));
 }
 
-test "each doubling of magnification adds exactly iter_per_doubling inside the ramp" {
-    var e: i32 = 1;
-    while (e <= 40) : (e += 1) {
-        const lo = try autoMaxIter(std.math.ldexp(mag0, e - 1));
-        const hi = try autoMaxIter(std.math.ldexp(mag0, e));
-        try std.testing.expectEqual(step, hi - lo);
+test "each doubling of magnification costs more iterations than the one before it" {
+    // The quadratic's shape, which is the whole point of choosing it: the extra iterations a
+    // zoom step needs GROW with depth (k·(2d−1) per doubling), so shallow views stay near
+    // their M0 counts while deep ones get the thousands they need.
+    var e: i32 = 2;
+    while (e <= 90) : (e += 1) {
+        const before = try autoMaxIter(std.math.ldexp(mag0, e - 2));
+        const middle = try autoMaxIter(std.math.ldexp(mag0, e - 1));
+        const after = try autoMaxIter(std.math.ldexp(mag0, e));
+        try std.testing.expect(after - middle >= middle - before);
     }
 }
 
@@ -257,10 +321,37 @@ test "autoMaxIter clamps to the documented cap at extreme magnification" {
     try std.testing.expectEqual(auto_max_iter, try autoMaxIter(std.math.floatMax(f64)));
 }
 
-test "the ramp reaches the cap on the 45th doubling and not the 44th" {
-    // 512 + 80·44 = 4032 < 4096; 512 + 80·45 = 4112, clamped to 4096.
-    try std.testing.expectEqual(@as(u32, 4032), try autoMaxIter(std.math.ldexp(mag0, 44)));
-    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(std.math.ldexp(mag0, 45)));
+test "zooming OUT never climbs back up the quadratic's other arm" {
+    // The hazard a quadratic brings that a linear ramp does not: `d²` grows again once `d`
+    // goes negative, so without clamping the doublings at zero, zooming out past the home
+    // view would ask for MORE iterations the further out the user goes.
+    var mag = mag0;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        mag /= 1.1;
+        try std.testing.expectEqual(base_max_iter, try autoMaxIter(mag));
+    }
+}
+
+test "the ramp is still climbing one doubling before the floor and capped just past it" {
+    // `floor_doublings` ≈ 101.47, so 100 doublings is inside the ramp and 102 is past its top.
+    try std.testing.expect(try autoMaxIter(std.math.ldexp(mag0, 100)) < auto_max_iter);
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(std.math.ldexp(mag0, 102)));
+}
+
+test "the ramp does not sag where it meets the clamp" {
+    // Rounding plus the clamp is where a quadratic is most likely to step backwards, so sweep
+    // the last few doublings in fine increments instead of spot-checking the boundary.
+    var mag = std.math.ldexp(mag0, 95);
+    var prev: u32 = 0;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const value = try autoMaxIter(mag);
+        try std.testing.expect(value >= prev);
+        prev = value;
+        mag *= 1.005;
+    }
+    try std.testing.expectEqual(auto_max_iter, prev);
 }
 
 test "autoMaxIter rejects a non-finite or non-positive magnification" {
@@ -270,14 +361,51 @@ test "autoMaxIter rejects a non-finite or non-positive magnification" {
     try std.testing.expectError(AutoIterError.InvalidMagnification, autoMaxIter(std.math.inf(f64)));
 }
 
-test "the ramp spans the whole f64-usable zoom range, capping at the precision floor" {
+test "the ramp spans the whole usable zoom range, capping at the precision floor" {
     const center = viewport.ComplexHi{ .re = -0.75, .im = 0.0 };
     const floor_view = try SquareView.fromCenterSide(center, navigate.precision_floor_side);
     try std.testing.expectEqual(auto_max_iter, try autoMaxIter(floor_view.magnification()));
     // Two decades shallower than the floor the ramp is still climbing, so the cap is
-    // not reached long before f64 gives up.
-    const usable = try SquareView.fromCenterSide(center, 1.0e-11);
+    // not reached long before the precision runs out.
+    const usable = try SquareView.fromCenterSide(center, 1.0e-28);
     try std.testing.expect(try autoMaxIter(usable.magnification()) < auto_max_iter);
+}
+
+test "auto_max_iter is the documented 65536 ceiling" {
+    try std.testing.expectEqual(@as(u32, 65536), auto_max_iter);
+}
+
+test "the ramp never decreases stepping from the home view down to the floor" {
+    // The criterion's own sweep: divide the side by 8 each step, home → floor. A spot check at
+    // the two ends would miss a ramp that sags in between.
+    const center = viewport.ComplexHi{ .re = -0.75, .im = 0.0 };
+    var side: f64 = SquareView.defaultView().side;
+    var prev: u32 = 0;
+    var steps: usize = 0;
+    while (side > navigate.precision_floor_side) : (side /= 8.0) {
+        const v = try SquareView.fromCenterSide(center, side);
+        const value = try autoMaxIter(v.magnification());
+        try std.testing.expect(value >= prev);
+        prev = value;
+        steps += 1;
+    }
+    // The sweep really did cross the whole range rather than exiting immediately.
+    try std.testing.expect(steps >= 30);
+}
+
+test "the ramp meets the measured iteration need at each sampled depth" {
+    // Measured on the milestone's reference centre (see the file header): a ramp that hits both
+    // endpoints but sags in the middle renders these depths as a solid blob.
+    const center = viewport.ComplexHi{ .re = -0.75, .im = 0.0 };
+    const cases = [_]struct { side: f64, need: u32 }{
+        .{ .side = 1.0e-8, .need = 1800 },
+        .{ .side = 1.0e-20, .need = 9900 },
+        .{ .side = 1.0e-25, .need = 19000 },
+    };
+    for (cases) |c| {
+        const v = try SquareView.fromCenterSide(center, c.side);
+        try std.testing.expect(try autoMaxIter(v.magnification()) >= c.need);
+    }
 }
 
 test "an auto policy delegates to the heuristic" {

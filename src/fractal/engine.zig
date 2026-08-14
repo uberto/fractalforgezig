@@ -1064,7 +1064,7 @@ fn testView() SquareView {
 }
 
 /// The golden view zoomed 8 doublings in (side / 256, so magnification is exactly 256x the
-/// default): T3's ramp gives `base_max_iter + 8 * iter_per_doubling` = 1152 there.
+/// default): the auto ramp gives `base_max_iter + iter_per_doubling_squared · 8²` there.
 fn zoomedView() viewport.ViewportError!SquareView {
     return SquareView.fromCenterSide(testView().center(), 3.5 / 256.0);
 }
@@ -1407,9 +1407,12 @@ test "setViewport refreshes max_iter from the auto ramp for the new magnificatio
     defer e.deinit();
     try e.iterate();
     try e.setViewport(try zoomedView());
-    // 8 doublings in: base_max_iter + 8 * iter_per_doubling = 512 + 640.
+    // 8 doublings in, from the ramp's own coefficient rather than a literal: base_max_iter +
+    // k·8². Spelled out here (not by calling `autoMaxIter`) so this still asserts the engine
+    // installed the RAMP's count and not some other number it happened to compute.
     try testing.expectEqual(
-        autoiter.base_max_iter + 8 * @as(u32, @intFromFloat(autoiter.iter_per_doubling)),
+        autoiter.base_max_iter +
+            @as(u32, @intFromFloat(@round(autoiter.iter_per_doubling_squared * 64.0))),
         e.max_iter,
     );
 }
@@ -2215,13 +2218,26 @@ test "a one-shot render supersedes an in-flight deep pass's orbit instead of reu
 
 test "an 8x8 render at side 1e-30 through the engine resolves mostly distinct values" {
     // THE milestone, end to end through the public API: at 1e-30 every pixel's `f64` `c` is the
-    // same number, so the pre-M6 renderer produced one flat colour. `max_iter` is pinned at
-    // 65536 because the auto ramp still stops at `auto_max_iter` (4096) — raising it for these
-    // depths is T5's task, and until then a deep view under the auto policy is iteration-limited,
-    // not precision-limited.
+    // same number, so the pre-M6 renderer produced one flat colour. `max_iter` is pinned rather
+    // than left to the auto policy so this test pins the deep PATH and nothing else; T5 has
+    // since raised `auto_max_iter` to the same 65536, so the auto policy reaches this count at
+    // this depth by itself (pinned in `autoiter.zig`).
     const S: u32 = 8;
     var e = try Engine.init(testing.allocator, try deepView(1.0e-30), S, try IterPolicy.manual(65536));
     defer e.deinit();
+    try e.iterate();
+    try testing.expect(try distinctValues(e.iter) >= 56); // 64 pixels
+}
+
+test "an 8x8 render at side 1e-30 resolves detail under the DEFAULT auto policy" {
+    // M6/T5's user-visible unlock, end to end and without a hand-pinned count: what an actual
+    // user gets. Before T5 the auto ramp stopped at 4096 here and this same render came back as
+    // a single flat colour, so this asserts BOTH halves — the ramp reaches its ceiling at this
+    // depth, and that count is enough to resolve the image.
+    const S: u32 = 8;
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-30), S, .{});
+    defer e.deinit();
+    try testing.expectEqual(autoiter.auto_max_iter, e.max_iter);
     try e.iterate();
     try testing.expect(try distinctValues(e.iter) >= 56); // 64 pixels
 }

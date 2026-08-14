@@ -459,16 +459,22 @@ pub fn degenerateRegionMessage(buf: []u8, what: []const u8, value: f64) ![]u8 {
 
 // ─── Precision floor ─────────────────────────────────────────────────────────
 //
-// MOVED HERE (M6/T2) from `navigate.zig`, unchanged in value and behavior: the floor is a
-// property of what a VIEW can represent, which is this module's subject, and both this
-// module and `navigate.zig` now need it. `navigate.zig` re-exports all four names, so its
-// callers (and its own tests) keep using them unqualified.
+// MOVED HERE (M6/T2) from `navigate.zig`: the floor is a property of what a VIEW can
+// represent, which is this module's subject, and both this module and `navigate.zig` now need
+// it. `navigate.zig` re-exports all four names, so its callers (and its own tests) keep using
+// them unqualified. M6/T5 then lowered the VALUE to 1e-30; the behaviour is unchanged — still
+// a warning, never a refusal.
 
 /// Side below which coordinate arithmetic visibly quantizes: a view around |re| ≈ 1 has
-/// ~1e-16 absolute resolution in f64, so a side of 1e-13 leaves only ~3 significant digits
-/// across the image — the documented warning threshold, not a hard stop. (M6/T5 moves this
-/// value to the deep-zoom floor; T2 only moved the constant's HOME.)
-pub const precision_floor_side: f64 = 1.0e-13;
+/// ~1e-34 absolute resolution once the centre is `f128`, so a side of 1e-30 leaves only ~4
+/// significant digits across the image — the documented warning threshold, not a hard stop.
+///
+/// M6/T5 moved this DOWN by 17 decades, from f64's 1e-13 to the extended-precision centre's
+/// 1e-30, because f64 is no longer what binds: `perturb.zig` iterates a per-pixel *offset* in
+/// f64 while the centre itself is `f128` (`max_coord_digits` ≈ 34 decimals), so the centre is
+/// what quantizes first. Same "only a handful of digits left across the image" judgement the
+/// old f64 bound made, applied to the representation that actually binds now.
+pub const precision_floor_side: f64 = 1.0e-30;
 
 /// Whether `v` is zoomed past `precision_floor_side` and will therefore render blocky. The
 /// comparison is strict, so the floor value itself still counts as usable. Callers warn with
@@ -481,9 +487,14 @@ pub fn atPrecisionFloor(v: SquareView) bool {
 
 const floor_prefix = "precision floor reached: side=";
 /// The limit is rendered from `precision_floor_side` at comptime, so the wording can never
-/// disagree with the predicate.
+/// disagree with the predicate — and the buffer length below follows the wording's real size,
+/// so lowering the floor cannot silently overflow the message.
+///
+/// It names the limit as "the deepest supported side" rather than M0's "the f64 limit": since
+/// M6 the bound is the extended-precision centre, not f64, and a message naming f64 at 1e-30
+/// would send the user looking for the wrong problem.
 const floor_suffix = std.fmt.comptimePrint(
-    " is below the f64 limit {e}; the image quantizes into blocks from here, " ++
+    " is below the deepest supported side {e}; the image quantizes into blocks from here, " ++
         "so zoom out or reset the view",
     .{precision_floor_side},
 );
@@ -866,8 +877,8 @@ test "pixelToComplex and complexToPixel are exact inverses at pixel centers" {
 
 test "the pixel round-trip stays far sub-pixel on a deep zoom" {
     // side 1e-6 near re = -0.74: the complex offset is ~1e-9 ULP of the center, so the
-    // recovered pixel drifts ~1e-7 px. Still invisible; the f64 floor proper is ~1e-13
-    // (milestone non-goal — M7 widens the center).
+    // recovered pixel drifts ~1e-7 px. Still invisible; the f64 floor proper is ~1e-13, which
+    // is why M6 widened the CENTRE to `f128` and this f64 round trip is for shallow work only.
     const v = round_trip_views[1];
     const s: u32 = 900;
     for (pixel_centers) |p| {
@@ -1253,8 +1264,12 @@ test "computeImageRect fills full window: w=w, h=h, side=min(w,h), origin at (0,
 /// warning message's buffer. Same value brute-forced for `degenerateRegionMessage`.
 const widest_float: f64 = -1.3508404415422605e-270;
 
-test "atPrecisionFloor flags a side below the f64 precision floor" {
-    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-14);
+test "precision_floor_side is the deep-zoom floor, not the old f64 one" {
+    try std.testing.expectEqual(@as(f64, 1.0e-30), precision_floor_side);
+}
+
+test "atPrecisionFloor flags a side below the deep-zoom precision floor" {
+    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-31);
     try std.testing.expect(atPrecisionFloor(v));
 }
 
@@ -1263,8 +1278,15 @@ test "atPrecisionFloor does not flag the default view" {
 }
 
 test "atPrecisionFloor does not flag a side just above the floor" {
-    const shallow = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-12);
+    const shallow = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-29);
     try std.testing.expect(!atPrecisionFloor(shallow));
+}
+
+test "atPrecisionFloor leaves the whole newly usable deep range unflagged" {
+    // M6/T5's user-visible unlock: 1e-20 is seven decades past where the OLD f64 floor
+    // warned, and the deep path renders it, so the warning must stay silent there.
+    const usable = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-20);
+    try std.testing.expect(!atPrecisionFloor(usable));
 }
 
 test "atPrecisionFloor puts the boundary one ULP below the floor value" {
@@ -1276,14 +1298,20 @@ test "atPrecisionFloor puts the boundary one ULP below the floor value" {
     try std.testing.expect(atPrecisionFloor(below));
 }
 
-test "precisionFloorMessage names the offending side, the limit and what to do" {
+test "precisionFloorMessage names the offending side, the 1e-30 limit and what to do" {
     var buf: [floor_message_buf_len]u8 = undefined;
-    const msg = try precisionFloorMessage(&buf, 9.9e-14);
+    const msg = try precisionFloorMessage(&buf, 1.0e-31);
     try std.testing.expectEqualStrings(
-        "precision floor reached: side=9.9e-14 is below the f64 limit 1e-13; " ++
+        "precision floor reached: side=1e-31 is below the deepest supported side 1e-30; " ++
             "the image quantizes into blocks from here, so zoom out or reset the view",
         msg,
     );
+}
+
+test "precisionFloorMessage renders a deep side in exponent form, not 33 leading zeros" {
+    var buf: [floor_message_buf_len]u8 = undefined;
+    const msg = try precisionFloorMessage(&buf, 4.7e-33);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "side=4.7e-33") != null);
 }
 
 test "floor_message_buf_len is exactly the worst-case message length" {
