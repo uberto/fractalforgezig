@@ -30,17 +30,27 @@ const app_log = std.log.scoped(.app);
 /// Module-level compute pipeline so the IterFn (which has no closure) can reach it.
 var g_compute_pipeline: ?compute_mod.ComputePipeline = null;
 
+/// Install (or clear) the pipeline the `IterFn` reaches through. `main` sets it once after the
+/// device exists; a test uses it to drive `gpuIterFn` against a headless device, which is the
+/// only way to pin THE ROUTING the app actually runs rather than a copy of it.
+pub fn installComputePipeline(pl: ?compute_mod.ComputePipeline) void {
+    g_compute_pipeline = pl;
+}
+
 /// The IterFn wired into engine.gpu_iter_fn when GPU mode is enabled. One BAND per call
 /// (`engine.IterFn`), so a GPU render is chunked across frames like the CPU one.
 ///
-/// M6/T4: a non-null `orbit` means the engine has decided this view needs the DEEP
-/// (perturbation) path. The Metal shader does not implement it yet — that is T6, which uploads
-/// the orbit and iterates the deltas on the GPU — and a direct `f32`/`f64` render at these
-/// depths would be a flat colour, i.e. a WRONG image, not a coarse one. So refuse the band: the
-/// engine logs the refusal and runs that band through `iterbuf.iterateDeepBandInto` on the CPU,
-/// which is correct (just slower). Deleting this branch without implementing the shader would
-/// silently reintroduce the flat deep zoom.
-fn gpuIterFn(
+/// ROUTING (M6/T6): a non-null `orbit` means the engine has decided this view needs the DEEP
+/// (perturbation) path, so the band goes to `gpuIterateDeepRows`, which uploads that orbit and
+/// iterates per-pixel deltas; a null orbit is a shallow view and goes to `gpuIterateRows`,
+/// unchanged. This is the ONLY path from the running app to the deep kernel — if the deep branch
+/// is ever removed or made to fall through to `gpuIterateRows`, the app renders a flat colour at
+/// depth (a WRONG image, not a coarse one) while every unit test still passes.
+///
+/// `gpuIterateDeepRows` refuses views outside the `f32` envelope with a typed error; the engine
+/// has already checked the same envelope and would not have called us, but if it somehow does,
+/// the returned error puts that band back on the CPU rather than on screen.
+pub fn gpuIterFn(
     view: viewport.SquareView,
     w: u32,
     h: u32,
@@ -50,9 +60,12 @@ fn gpuIterFn(
     iter_band: []f32,
     orbit: ?*const perturb.ReferenceOrbit,
 ) anyerror!void {
-    if (orbit != null) return error.DeepPathNotOnGpu;
     const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
-    try compute_mod.gpuIterateRows(pl, view, w, h, max_iter, y0, rows, iter_band);
+    if (orbit) |o| {
+        try compute_mod.gpuIterateDeepRows(pl, view, o, w, h, max_iter, y0, rows, iter_band);
+    } else {
+        try compute_mod.gpuIterateRows(pl, view, w, h, max_iter, y0, rows, iter_band);
+    }
 }
 
 const window_title = "fractalforge";

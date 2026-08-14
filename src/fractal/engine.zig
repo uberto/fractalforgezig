@@ -219,6 +219,19 @@ pub const Engine = struct {
     /// never colour a different image.
     orbit_center: viewport.ComplexHi,
     orbit_max_iter: u32,
+    /// How many times this engine has reported that a deep render could not use the GPU (M6/T6).
+    /// Bumped in the ONE place `perturb.gpuFallbackMessage` is logged (`reportGpuFallback`), so it
+    /// IS that call count: a progressive deep render of N chunks outside the GPU envelope must
+    /// bump it by ONE, not by N.
+    gpu_fallbacks: u32,
+    /// Why the current (or most recent) render skipped the GPU deep path, or null when it did
+    /// not skip it. Cleared at the start of every render, so it always describes the render whose
+    /// image is on screen.
+    gpu_fallback_reason: ?perturb.FallbackReason,
+    /// Whether the CURRENT render has already reported its GPU fallback — what makes the warning
+    /// once-per-render instead of once-per-chunk. Reset by the two render starts (`iterate`,
+    /// `beginPass`); treat as private.
+    gpu_fallback_reported: bool,
     /// How many reference orbits this engine has computed. Bumped in the ONE place
     /// `perturb.ReferenceOrbit.compute` is called, so it IS the call count: a deep render must
     /// add exactly 1 however many chunks it took, and a shallow render must add 0.
@@ -297,6 +310,9 @@ pub const Engine = struct {
             .orbit_center = .{ .re = 0, .im = 0 },
             .orbit_max_iter = 0,
             .orbit_computations = 0,
+            .gpu_fallbacks = 0,
+            .gpu_fallback_reason = null,
+            .gpu_fallback_reported = false,
             .path_summaries = 0,
         };
         gradient.bakeLut(g, &engine.lut);
@@ -370,6 +386,56 @@ pub const Engine = struct {
         self.orbit_max_iter = 0;
     }
 
+    /// The GPU backend to use for THIS render's bands, or null when the render belongs on the
+    /// CPU. Null covers three cases: the toggle is off, no backend is wired, and — M6/T6 — a
+    /// deep view outside the GPU's envelope (`gpuDeepFallbackReason`), which is reported once
+    /// and NOT dispatched.
+    ///
+    /// The decision happens HERE, before the call, on purpose: an approved acceptance test
+    /// asserts the backend is invoked ZERO times below the GPU floor, so a try-then-refuse flow
+    /// (dispatch, get an error back, fall back) is wrong however correct its image is. The
+    /// band-level `catch` at both call sites stays as the safety net for genuine GPU failures at
+    /// depths the GPU does support.
+    fn gpuBackendFor(self: *Engine, orbit: ?*const perturb.ReferenceOrbit) ?IterFn {
+        if (!self.use_gpu) return null;
+        const iter_fn = self.gpu_iter_fn orelse return null;
+        // A null orbit is a shallow view: the GPU's direct kernel has no precision floor of its
+        // own to respect beyond the one the deep path exists to replace.
+        const o = orbit orelse return iter_fn;
+        if (gpuDeepFallbackReason(self.view.side, o.len())) |reason| {
+            self.reportGpuFallback(reason);
+            return null;
+        }
+        return iter_fn;
+    }
+
+    /// Report — ONCE per render — that this deep view is being rendered on the CPU, naming the
+    /// limit that ruled the GPU out (`perturb.gpuFallbackMessage`). Later chunks of the same
+    /// render find the flag set and stay silent, so a 16-chunk progressive render logs one line
+    /// rather than sixteen identical ones. `gpu_fallbacks` counts the emissions, which is how the
+    /// tests assert "once per render" by number.
+    ///
+    /// `.warn`, not `.err`: the render still happens and the image is correct — only slower.
+    fn reportGpuFallback(self: *Engine, reason: perturb.FallbackReason) void {
+        self.gpu_fallback_reason = reason;
+        if (self.gpu_fallback_reported) return;
+        self.gpu_fallback_reported = true;
+        self.gpu_fallbacks += 1;
+        var buf: [perturb.fallback_message_buf_len]u8 = undefined;
+        if (perturb.gpuFallbackMessage(&buf, reason)) |line| {
+            log.warn("{s}", .{line});
+        } else |err| {
+            log.warn("GPU deep-zoom path skipped ({s}); the CPU completed this render", .{@errorName(err)});
+        }
+    }
+
+    /// Forget the previous render's GPU-fallback report. Called by both render starts so the
+    /// flag scopes a RENDER and every render that falls back says so.
+    fn resetGpuFallback(self: *Engine) void {
+        self.gpu_fallback_reported = false;
+        self.gpu_fallback_reason = null;
+    }
+
     /// Iterate rows `y0 .. y0+rows` of the persistent buffer ON THE CPU, through whichever
     /// path `orbit` selects. The ONE CPU dispatch site: `iterate`, `stepPassRows` and the GPU
     /// fallback all come here, so the one-shot and progressive renders are the same arithmetic.
@@ -400,21 +466,18 @@ pub const Engine = struct {
         // that pass's orbit with it, which is for a view this render may not share.
         self.pass = null;
         self.releaseOrbit();
+        self.resetGpuFallback();
         try validateGeometry(self.view, self.image_side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
         const vp = self.renderViewport();
         // One orbit, for this render only: freed when the render ends, success or failure.
         const orbit = try self.ensureOrbit();
         defer self.releaseOrbit();
-        if (self.use_gpu) {
-            if (self.gpu_iter_fn) |iter_fn| {
-                iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter, orbit) catch |err| {
-                    log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
-                    try self.cpuIterateBand(vp, 0, self.image_h, orbit);
-                };
-            } else {
+        if (self.gpuBackendFor(orbit)) |iter_fn| {
+            iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter, orbit) catch |err| {
+                log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
                 try self.cpuIterateBand(vp, 0, self.image_h, orbit);
-            }
+            };
         } else {
             try self.cpuIterateBand(vp, 0, self.image_h, orbit);
         }
@@ -533,6 +596,7 @@ pub const Engine = struct {
         // A new pass supersedes the previous render, orbit included: the first chunk that needs
         // one computes it for THIS view.
         self.releaseOrbit();
+        self.resetGpuFallback();
         const side = @min(w, h);
         try validateGeometry(self.view, side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
@@ -607,21 +671,19 @@ pub const Engine = struct {
         const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
         const y0 = p.rows_done;
         var done_on_gpu = false;
-        if (self.use_gpu) {
-            if (self.gpu_iter_fn) |iter_fn| {
-                const band_start: usize = @as(usize, y0) * @as(usize, self.image_w);
-                const band_len: usize = @as(usize, chunk) * @as(usize, self.image_w);
-                if (band_start + band_len <= self.iter.len) {
-                    const band = self.iter[band_start..][0..band_len];
-                    if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band, orbit)) |_| {
-                        done_on_gpu = true;
-                    } else |err| {
-                        log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
-                            @errorName(err),
-                            y0,
-                            y0 + chunk,
-                        });
-                    }
+        if (self.gpuBackendFor(orbit)) |iter_fn| {
+            const band_start: usize = @as(usize, y0) * @as(usize, self.image_w);
+            const band_len: usize = @as(usize, chunk) * @as(usize, self.image_w);
+            if (band_start + band_len <= self.iter.len) {
+                const band = self.iter[band_start..][0..band_len];
+                if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band, orbit)) |_| {
+                    done_on_gpu = true;
+                } else |err| {
+                    log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
+                        @errorName(err),
+                        y0,
+                        y0 + chunk,
+                    });
                 }
             }
         }
@@ -791,6 +853,25 @@ pub const Engine = struct {
         logFailure(orbitFailureMessage(&buf, err, self.view.side, self.max_iter));
     }
 };
+
+/// Which GPU limit (if any) forbids the deep path for a view of `side` whose reference orbit
+/// holds `orbit_len` entries — the ONE definition of the GPU deep-zoom envelope, keyed on T3's
+/// `perturb.gpu_floor_side` and `perturb.gpu_max_orbit_len`. `null` means the GPU may render it.
+///
+/// Consulted TWICE, deliberately. `Engine.gpuBackendFor` consults it BEFORE calling
+/// `gpu_iter_fn`, which is what makes the backend's invocation count zero outside the envelope;
+/// `gpu/compute.zig`'s `gpuIterateDeepRows` consults it again as defence in depth, so a future
+/// caller that skips the pre-check gets a typed error instead of a quantized image. It lives
+/// HERE, in the pure tier, because `src/fractal/` may not import `src/gpu/` while `src/gpu/`
+/// may — and does — import this module; two copies of a limit are how a floor drifts.
+///
+/// The floor is checked first, so a view that violates both limits reports its DEPTH: that is
+/// the one the user can act on by zooming out.
+pub fn gpuDeepFallbackReason(side: f64, orbit_len: usize) ?perturb.FallbackReason {
+    if (side < perturb.gpu_floor_side) return .below_gpu_precision_floor;
+    if (orbit_len > perturb.gpu_max_orbit_len) return .orbit_too_long_for_gpu;
+    return null;
+}
 
 /// Buffer lengths for a square image: `pixels` f32 smooth values and `bytes` RGBA8 bytes.
 const BufferSizes = struct { pixels: usize, bytes: usize };
@@ -1079,9 +1160,11 @@ fn testEngine() !Engine {
 /// calls `iterbuf.iterateBandInto` rather than re-deriving the mapping, so these tests cannot
 /// pass against a stub that disagrees with the real backends.
 ///
-/// It models the M6 GPU backend as `main.zig` wires it today: a non-null orbit is REFUSED
-/// (`error.DeepPathNotOnGpu`, T6's job), which is what makes the engine fall back to the CPU
-/// and still render the view deep.
+/// A non-null orbit is REFUSED (`error.DeepPathNotOnGpu`): the real backend now HAS a deep
+/// kernel, but it still refuses views outside its `f32` envelope, so this stub models a backend
+/// that cannot take the band — the case where the engine must fall back to the CPU and render
+/// the view deep anyway. The deep GPU path itself is covered in `src/gpu_headless_test.zig`,
+/// which can bind a real device.
 fn bandStub(
     view: SquareView,
     w: u32,
@@ -2320,6 +2403,179 @@ test "a GPU backend that refuses the deep path falls back to the CPU and still r
 
     try testing.expectEqual(@as(u32, 1), e.iteration_passes);
     try testing.expect(try distinctValues(e.iter) > 1); // not the flat image f64 would give
+}
+
+// ─── M6/T6: the GPU deep-zoom envelope, decided BEFORE the backend is called ──
+
+/// Call count of `countingStub`, reset by each test that reads it. A file-level counter is the
+/// only way an `IterFn` (a bare function pointer, no closure) can be observed; the tests below
+/// run in one thread and each one zeroes it first, so nothing carries between them.
+var gpu_stub_calls: u32 = 0;
+
+/// `bandStub` plus a call counter, and it iterates a non-null orbit DEEP instead of refusing —
+/// i.e. the backend T6 ships. Used to assert that the engine's pre-check never calls it, which
+/// a refusing stub could not distinguish from "called and refused".
+fn countingStub(
+    view: SquareView,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    band: []f32,
+    orbit: ?*const perturb.ReferenceOrbit,
+) anyerror!void {
+    gpu_stub_calls += 1;
+    const vp = view.rectViewport(w, h);
+    if (orbit) |o| return iterbuf.iterateDeepBandInto(band, vp, max_iter, y0, rows, o);
+    return iterbuf.iterateBandInto(band, vp, max_iter, y0, rows);
+}
+
+test "gpuDeepFallbackReason names the depth for a view below the GPU precision floor" {
+    try testing.expectEqual(
+        perturb.FallbackReason.below_gpu_precision_floor,
+        gpuDeepFallbackReason(1.0e-25, 4096),
+    );
+}
+
+test "gpuDeepFallbackReason clears a view exactly at the GPU precision floor" {
+    // The floor is a strict `<`, matching `perturb.gpu_floor_side`'s documented wording, so the
+    // deepest GPU-supported view is the floor itself and one ulp below it is the first refusal.
+    try testing.expectEqual(
+        @as(?perturb.FallbackReason, null),
+        gpuDeepFallbackReason(perturb.gpu_floor_side, 4096),
+    );
+    try testing.expectEqual(
+        perturb.FallbackReason.below_gpu_precision_floor,
+        gpuDeepFallbackReason(std.math.nextAfter(f64, perturb.gpu_floor_side, 0.0), 4096),
+    );
+}
+
+test "gpuDeepFallbackReason names the budget for an orbit one entry too long" {
+    try testing.expectEqual(
+        @as(?perturb.FallbackReason, null),
+        gpuDeepFallbackReason(1.0e-15, perturb.gpu_max_orbit_len),
+    );
+    try testing.expectEqual(
+        perturb.FallbackReason.orbit_too_long_for_gpu,
+        gpuDeepFallbackReason(1.0e-15, perturb.gpu_max_orbit_len + 1),
+    );
+}
+
+test "gpuDeepFallbackReason reports the depth first when both limits are exceeded" {
+    // Deterministic precedence, and the useful one: the depth is what the user can act on.
+    try testing.expectEqual(
+        perturb.FallbackReason.below_gpu_precision_floor,
+        gpuDeepFallbackReason(1.0e-25, perturb.gpu_max_orbit_len + 1),
+    );
+}
+
+test "below the GPU floor the backend is never called and the CPU renders the deep image" {
+    // AT6's behaviour, asserted here because A1 has not run yet: zero invocations, not one
+    // invocation that returns an error. A try-then-refuse flow passes every other assertion
+    // in this test and fails this one.
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-25), 8, try IterPolicy.manual(65536));
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    gpu_stub_calls = 0;
+    try e.iterate();
+
+    try testing.expectEqual(@as(u32, 0), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expect(try distinctValues(e.iter) > 1); // a real deep image, not a flat one
+    try testing.expectEqual(
+        @as(?perturb.FallbackReason, .below_gpu_precision_floor),
+        e.gpu_fallback_reason,
+    );
+}
+
+test "an orbit longer than the GPU budget keeps the render on the CPU" {
+    // Above the GPU floor (1e-15), so the ONLY thing the GPU is refused for is the orbit
+    // length: `max_iter = gpu_max_orbit_len` records `max_iter + 1` entries, one too many.
+    // Centre −0.75 never escapes, so the recorded orbit really is that long.
+    const interior_center = viewport.ComplexHi{ .re = -0.75, .im = 0.0 };
+    const max_iter: u32 = @intCast(perturb.gpu_max_orbit_len);
+    var e = try Engine.init(
+        testing.allocator,
+        try SquareView.fromCenterSide(interior_center, 1.0e-15),
+        4,
+        try IterPolicy.manual(max_iter),
+    );
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    gpu_stub_calls = 0;
+    try e.iterate();
+
+    try testing.expectEqual(@as(u32, 0), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expectEqual(
+        @as(?perturb.FallbackReason, .orbit_too_long_for_gpu),
+        e.gpu_fallback_reason,
+    );
+}
+
+test "a deep view inside the GPU envelope is still dispatched to the GPU backend" {
+    // The other half of the decision: refusing too eagerly would move every deep render onto
+    // the CPU and cost the milestone its interactivity, while passing every refusal test.
+    var e = try resolvedDeepEngine(); // side 1e-9: deep, and well above the GPU floor
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    gpu_stub_calls = 0;
+    try e.iterate();
+
+    try testing.expectEqual(@as(u32, 1), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 0), e.gpu_fallbacks);
+    try testing.expectEqual(@as(?perturb.FallbackReason, null), e.gpu_fallback_reason);
+}
+
+test "a progressive render below the GPU floor reports the fallback once, not once per chunk" {
+    // T4's interim warning fired per BAND: a 16-chunk render logged 16 identical lines. The
+    // count is the assertion — `gpu_fallbacks` is bumped in the one place the warning is
+    // emitted, so 1 means one line was logged for the whole render.
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-25), 8, try IterPolicy.manual(512));
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    gpu_stub_calls = 0;
+    try e.beginPass(8, 8);
+    try drainPass(&e, 1); // eight chunks, one row each
+
+    try testing.expectEqual(@as(u32, 0), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expectEqual(@as(u32, 1), e.gpu_fallbacks);
+}
+
+test "each render below the GPU floor reports its own fallback" {
+    // The flag is per-RENDER, not per-engine: two renders warn twice, so a long session does
+    // not go silent about a fallback the user can still act on.
+    var e = try Engine.init(testing.allocator, try deepView(1.0e-25), 8, try IterPolicy.manual(512));
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    try e.iterate();
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 2), e.gpu_fallbacks);
+}
+
+test "a shallow GPU render reports no fallback at all" {
+    var e = try testEngine();
+    defer e.deinit();
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+
+    gpu_stub_calls = 0;
+    try e.iterate();
+
+    try testing.expectEqual(@as(u32, 1), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 0), e.gpu_fallbacks);
 }
 
 test "the engine's path summary names the deep path and the depth it is used at" {

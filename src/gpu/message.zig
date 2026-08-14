@@ -24,6 +24,28 @@ pub fn gpuIterateSummary(buf: []u8, image_side: u32, max_iter: u32, elapsed_ms: 
     return std.fmt.bufPrint(buf, "gpu iterate: S={d}, max_iter={d}, {d:.2} ms", .{ image_side, max_iter, elapsed_ms });
 }
 
+/// Build the timing summary logged after each DEEP (perturbation) GPU dispatch. Names the deep
+/// path and the uploaded orbit explicitly: this line is how an operator — or a reviewer piloting
+/// the app — tells that a deep view really ran on the GPU rather than falling back to the CPU,
+/// so "deep" and the row band are the load-bearing parts of the wording.
+/// Example: "gpu deep iterate: 16x16 rows 0..16, max_iter=20000, orbit=20001, 3.45 ms"
+pub fn gpuDeepIterateSummary(
+    buf: []u8,
+    width: u32,
+    height: u32,
+    y0: u32,
+    rows: u32,
+    max_iter: u32,
+    orbit_len: usize,
+    elapsed_ms: f64,
+) ![]u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "gpu deep iterate: {d}x{d} rows {d}..{d}, max_iter={d}, orbit={d}, {d:.2} ms",
+        .{ width, height, y0, y0 + rows, max_iter, orbit_len, elapsed_ms },
+    );
+}
+
 test "sdlFailure embeds the call name and SDL error string" {
     var buf: [128]u8 = undefined;
     const msg = try sdlFailure(&buf, "SDL_CreateGPUDevice", "no usable GPU found");
@@ -40,4 +62,13 @@ test "gpuIterateSummary formats side, max_iter, and elapsed ms" {
     var buf: [128]u8 = undefined;
     const msg = try gpuIterateSummary(&buf, 720, 512, 3.45);
     try std.testing.expectEqualStrings("gpu iterate: S=720, max_iter=512, 3.45 ms", msg);
+}
+
+test "gpuDeepIterateSummary names the deep path, the band, the orbit and the time" {
+    var buf: [128]u8 = undefined;
+    const msg = try gpuDeepIterateSummary(&buf, 16, 16, 0, 16, 20000, 20001, 3.45);
+    try std.testing.expectEqualStrings(
+        "gpu deep iterate: 16x16 rows 0..16, max_iter=20000, orbit=20001, 3.45 ms",
+        msg,
+    );
 }
