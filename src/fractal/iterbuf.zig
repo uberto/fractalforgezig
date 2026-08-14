@@ -503,9 +503,12 @@ test "iterateDeepBandInto with zero rows is a no-op" {
 }
 
 test "at the switch threshold the deep band agrees with the shallow band on classification" {
-    // Crossing `perturb.threshold_side` must be INVISIBLE. Both paths are still accurate at
-    // 1e-6 (T3 measured the deep one as the more accurate of the two against `f128` ground
-    // truth), so every pixel must land on the same side of "escapes at all".
+    // Crossing `perturb.threshold_side` must preserve STRUCTURE: every pixel lands on the same
+    // side of "escapes at all", so the shape on screen is the same shape. Smooth values are a
+    // different matter and deliberately not asserted equal here — the shallow path is off by up
+    // to ~85 iterations at 1e-6 (see the two tests below), so some near-boundary pixels DO
+    // change colour when the threshold is crossed. That is an accepted consequence of the
+    // agreed 1e-6 switch, with the deep side being the correct one; it is not blended away.
     var f = try deepFixture(perturb.threshold_side, deep_iter);
     defer f.orbit.deinit(std.testing.allocator);
 
@@ -536,10 +539,12 @@ fn exactAt(vp: Viewport, x: u32, row: u32) f32 {
 }
 
 test "at the switch threshold every pixel of the deep band is within 1.0 iteration of full precision" {
-    // The other half of "invisible": the same classification is not enough, the COLOUR must
-    // not jump either. Measured against `iterateExact` because that is the accuracy the spec
-    // requires ("within 1.0 iteration of ... full-precision direct iteration") — and because
-    // the SHALLOW path is the inaccurate one here, as the next test pins.
+    // The accuracy half of the contract, and the ONE comparison it is worded against: the spec's
+    // scenario `Accuracy where the shallow and deep paths meet` requires "within 1.0 iteration of
+    // the same pixel computed by full-precision direct iteration", and AT3 measures exactly that.
+    // Not against the shallow render — the SHALLOW path is the inaccurate one here, as the next
+    // test pins. Interior pixels have no smooth value to compare; the sibling test above covers
+    // their classification.
     //
     // Not a duplicate of `perturb.zig`'s grid test: that one drives `iterateDelta` with
     // hand-written offsets, this one drives the whole BAND — so it is the band's geometry
