@@ -2,20 +2,21 @@
 
 # src/fractal/ context
 
-Pure core: view → Mandelbrot image. NEVER import SDL/GPU/`c.zig`/`@cImport`. No
-globals/clock/random; register each module in `src/root.zig`'s `test`. Failures: TYPED
-error + pure message builder; ONLY `engine.zig` logs (`std.log(.fractal)`).
+Pure core:view→Mandelbrot image. NEVER import SDL/GPU/`c.zig`/`@cImport`. No
+globals/clock/random;register every module in `src/root.zig`'s `test`.
+Failures:TYPED error+pure message builder;ONLY `engine.zig` logs(`std.log(.fractal)`).
 
-Decoupling:ITERATE ONCE into a persistent `[]f32`;palette edits rerun ONLY the CHEAP
+Decoupling:ITERATE ONCE into a persistent `[]f32`;palette edits rerun ONLY CHEAP
 `colorpass`(baked `gradient` LUT+`mapping`→RGBA8),NEVER `iterbuf`.
 
 ## Precision split
 
-`ComplexHi{re,im:f128}`+`.lo()`=where the view IS;`Complex`/`Viewport`=where a pixel is
-RELATIVE to it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset in
-f64,added ONCE onto the f128 centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
+`ComplexHi{re,im:f128}`+`.lo()`=where the view IS;`Complex`/`Viewport`=a pixel RELATIVE to
+it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset in f64,added
+ONCE onto the centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
 `mandelbrot.iterateExact`. `Viewport`,`iterbuf`,`mandelbrot`,GPU stay f64
-end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` narrows on save.
+end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` keeps the centre
+EXACT(TEXT).
 
 ## Modules
 
@@ -34,8 +35,8 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` n
   `precisionFloorMessage(buf[floor_message_buf_len],side)`.
   RECT render:`rectViewport(w,h)`(scale=`side/min(w,h)`),
   `Viewport.complexToPixel(pt)`+`pixelIndex(pt)→?usize`(null off-image),NOT the square map.
-  ASPECT:`fitImageRect(rx,ry,rw,rh,tex_w,tex_h)`=LETTERBOX fit(`scale=min(rw/tw,rh/th)`);its
-  centred rect drives BOTH drawing+mapping,NEVER a stretch.
+  ASPECT:`fitImageRect(rx,ry,rw,rh,tex_w,tex_h)`=LETTERBOX fit(`scale=min(rw/tw,rh/th)`);that
+  centred rect drives drawing+mapping,NEVER a stretch.
 - `navigate.zig`—transforms→a NEW `SquareView`;`factor` scales the SIDE(`<1`=zoom IN).
   `zoomAbout(v,anchor:ComplexHi,f)` pins `anchor` to its pixel;`zoomCentered(v,point,f)`
   recenters;`panByPixels(v,dpx,dpy,S)` moves the VIEW(pass NEGATED mouse delta);
@@ -50,7 +51,7 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` n
   `iter_per_doubling_squared`=comptime-DERIVED(`floor_doublings`,`floor_magnification`)⇒the
   ceiling hits `viewport.precision_floor_side` EXACTLY;NEVER hard-code it. 65536 caps the RAMP
   only;PINNED reach `max_manual_iter`(2^24,f32-exact). 1e-30 iterates most pixels to
-  `max_iter`:ACCEPTED cost,never lower the ceiling.
+  `max_iter`:ACCEPTED,never lower the ceiling.
   `IterPolicy{auto=true,manual_value=512}`:`manual(v)` demands
   `[min_manual_iter(16),max_manual_iter]`,else `MaxIterOutOfRange`;
   `effective(mag)`=ramp if `auto` else `clampManual(v)`.
@@ -77,8 +78,8 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` n
 - `iterbuf.zig`—ITERATION only. `iterationBufferLen(vp)`=w*h;`iterateInto(buf,vp,max_iter)`
   PURE(pixel centers;bad `buf.len`→`BufferSizeMismatch`);
   `iterateRowsInto(buf,vp,max_iter,y0,rows)` band-only/composable,
-  overrun→`RowRangeOutOfBounds`;`iterateBandInto(band,…)`=same but buffer-LOCAL (row `y0`
-  at index 0 = the GPU's contract);`iterate(...)`→`IterationResult{values,elapsed_ns}`.
+  overrun→`RowRangeOutOfBounds`;`iterateBandInto(band,…)`=same but buffer-LOCAL(row `y0`
+  at index 0=the GPU's contract);`iterate(...)`→`IterationResult{values,elapsed_ns}`.
   `iterateDeepBandInto(band,vp,max_iter,y0,rows,orbit:*const perturb.ReferenceOrbit)`=DEEP
   twin:SAME band-local contract/errors,offsets f64 ONLY(NEVER f128),`perturb.iterateDelta` per
   pixel,SAME sample points as `iterateBandInto`(test-pinned).
@@ -98,8 +99,8 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` n
   `stepPassRows` both dispatch via ONE private `cpuIterateBand`.`ensureOrbit` builds ONE
   `ReferenceOrbit` per render(lazy;`orbit_computations` counts),`orbitPtr()` borrows it,
   EVERY boundary(`iterate`,`beginPass`,`cancelPass`,`finishPass`,`deinit`)FREES it—never
-  cache/retain it.A non-null `orbit` obliges a backend to iterate DEEP or RETURN an
-  error(engine warns,CPU finishes that band;`main.gpuIterFn` refuses until T6).
+  cache it.A non-null `orbit` obliges a backend to iterate DEEP or RETURN an
+  error(engine warns,CPU finishes that band).
   `pathSummary(buf)`+`path_summaries`=1/completed render;`IterateError` folds
   `OrbitFailure`→`orbitFailureMessage(buf[orbit_message_buf_len],err,side,max_iter)`.
   `setViewport`/`setPolicy`/`resize` re-iterate(bump BOTH counters);
@@ -109,9 +110,13 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` n
   `stepPass()`=one self-timed chunk(`stepPassRows(rows)` deterministic),
   `true`=complete→bumps each counter ONCE,clears `pass:?progressive.Pass`;`cancelPass()` on
   input change;`passFraction()→?f32` drives the progress bar.
-- `persist.zig`—pure JSON. `AppState` heap-owns `stops`+`mapping_mode`→ALWAYS
-  `freeState(state,alloc)`. `fromEngine`→`toJson(buf)`,`fromJson(json,alloc)`,
-  `applyToEngine`(color setters first,`setViewport` LAST).
+- `persist.zig`—pure JSON,NO file I/O. `AppState`(centre f128,`side` f64)heap-owns
+  `stops`+`mapping_mode`→ALWAYS `freeState(state,alloc)`.
+  `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
+  setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
+  (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=COARSER than
+  f128's ulp below 1). NO version field⇒`CenterJson.jsonParse` IS the back-compat:string(M6)OR
+  number(pre-M6),RAW digits→f128,NEVER drop that branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.
 
 ## Conventions

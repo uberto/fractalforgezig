@@ -745,7 +745,9 @@ fn handleDialogResult(
             };
             defer file.close();
 
-            var json_buf: [8192]u8 = undefined;
+            // Sized from persist's own constant: M6/T8 made the centre two decimal STRINGS, so
+            // the minimum grew. Never hand-write a length here.
+            var json_buf: [persist.min_json_buf_len]u8 = undefined;
             const json_bytes = persist.toJson(state, &json_buf) catch |err| {
                 app_log.err("save: toJson failed ({s})", .{@errorName(err)});
                 return;
@@ -763,7 +765,10 @@ fn handleDialogResult(
             };
             defer file.close();
 
-            var file_buf: [8192]u8 = undefined;
+            // Read allowance: a state we WRITE always fits in `min_json_buf_len`; a hand-edited
+            // or re-indented file gets room on top of that rather than being truncated into a
+            // parse error.
+            var file_buf: [4 * persist.min_json_buf_len]u8 = undefined;
             const n = file.readAll(&file_buf) catch |err| {
                 app_log.err("open: read failed for '{s}' ({s})", .{ path, @errorName(err) });
                 return;
