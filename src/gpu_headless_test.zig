@@ -647,3 +647,69 @@ test "compute: the app's IterFn wrapper still dispatches a shallow band to the d
 
     try std.testing.expectEqualSlices(f32, &direct, &through_app);
 }
+
+// ---------------------------------------------------------------------------
+// M6 acceptance test (AT5, AMENDED 2026-08-14) — materialized verbatim from
+// `.inception/m6-deep-zoom/acceptance-tests.md:280-338`. Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "compute: GPU deep zoom at 1e-20 matches the CPU deep path" {
+    const mandelbrot = @import("fractal/mandelbrot.zig");
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const max_iter: u32 = 20000;
+    const view = try viewport.SquareView.fromCenterSide(.{
+        .re = -0.743643887037158704752191506114774,
+        .im = 0.131825904205311970493132056385139,
+    }, 1.0e-20);
+
+    var orbit = try perturb.ReferenceOrbit.compute(std.testing.allocator, view.center(), max_iter);
+    defer orbit.deinit(std.testing.allocator);
+
+    var gpu_buf: [16 * 16]f32 = undefined;
+    var cpu_buf: [16 * 16]f32 = undefined;
+    try compute.gpuIterateDeepRows(pipeline, view, &orbit, 16, 16, max_iter, 0, 16, &gpu_buf);
+    try iterbuf.iterateDeepBandInto(&cpu_buf, view.rectViewport(16, 16), max_iter, 0, 16, &orbit);
+
+    // AMENDED 2026-08-14 by user ruling; see this test's amendment note above.
+    const per_pixel_tol: f64 = 0.01 * @as(f64, @floatFromInt(max_iter)); // 200 iterations
+    var class_mismatches: u32 = 0;
+    var over_tol: u32 = 0;
+    var exterior: u32 = 0;
+    var sum_abs_err: f64 = 0;
+    // The capture is `cpu` and not the approved text's `c`: this file's `c` is the cimgui
+    // @cImport alias at :8, and a capture may not shadow a container declaration in Zig.
+    for (gpu_buf, cpu_buf) |g, cpu| {
+        const c_interior = cpu == mandelbrot.interior_sentinel;
+        const g_interior = g == mandelbrot.interior_sentinel;
+        if (c_interior != g_interior) {
+            class_mismatches += 1;
+            continue;
+        }
+        if (!c_interior) {
+            const d = @abs(@as(f64, cpu) - @as(f64, g));
+            if (d > per_pixel_tol) over_tol += 1;
+            sum_abs_err += d;
+            exterior += 1;
+        }
+    }
+
+    // 256 pixels; only near-boundary flips are tolerated. A real kernel defect mismatches
+    // by the dozen. UNCHANGED from the original approved test — measured 0 on every variant.
+    try std.testing.expect(class_mismatches <= 2);
+
+    // f32 deltas alone put a handful of hypersensitive pixels over the 200-iteration figure
+    // even with perfect f64 arithmetic (measured: 4 with an f64 orbit, 11 with an f32 orbit).
+    // Budget the outliers rather than the tolerance.
+    try std.testing.expect(over_tol <= 16);
+
+    // The mean is what actually has teeth: broad defects — wrong slot order, mismatched struct
+    // layout, broken rebasing, wrong orbit indexing, a flipped or half-pixel-shifted grid —
+    // spread error across the whole tile and measure in the hundreds or thousands here, not 60.
+    try std.testing.expect(exterior > 0);
+    const mean_abs_err = sum_abs_err / @as(f64, @floatFromInt(exterior));
+    try std.testing.expect(mean_abs_err < 60.0);
+}

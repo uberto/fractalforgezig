@@ -1476,3 +1476,19 @@ test "coord_text_buf_len holds a signed 34-decimal coordinate plus a terminator"
     });
     try std.testing.expect(text.len < coord_text_buf_len);
 }
+
+// ---------------------------------------------------------------------------
+// M6 acceptance test (AT8) — materialized verbatim from
+// `.inception/m6-deep-zoom/acceptance-tests.md`. Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "acceptance: coordinate digits grow with depth up to 34" {
+    const home = SquareView.defaultView();
+    const mid = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-15);
+    const floor = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, precision_floor_side);
+
+    try std.testing.expect(coordDigits(home.magnification()) < coordDigits(mid.magnification()));
+    try std.testing.expect(coordDigits(mid.magnification()) < coordDigits(floor.magnification()));
+    try std.testing.expectEqual(max_coord_digits, coordDigits(floor.magnification()));
+    try std.testing.expectEqual(@as(usize, 34), max_coord_digits);
+}

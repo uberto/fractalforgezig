@@ -537,3 +537,27 @@ test "policySummary reports NoSpaceLeft instead of truncating" {
     const p = try IterPolicy.manual(max_manual_iter);
     try std.testing.expectError(error.NoSpaceLeft, policySummary(&buf, p, mag0));
 }
+
+// ---------------------------------------------------------------------------
+// M6 acceptance test (AT13) — materialized verbatim from
+// `.inception/m6-deep-zoom/acceptance-tests.md`. Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "acceptance: the auto ramp spans home to the precision floor" {
+    const home = SquareView.defaultView();
+    try std.testing.expectEqual(base_max_iter, try autoMaxIter(home.magnification()));
+
+    const floor = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, viewport.precision_floor_side);
+    try std.testing.expectEqual(auto_max_iter, try autoMaxIter(floor.magnification()));
+    try std.testing.expectEqual(@as(u32, 65536), auto_max_iter);
+
+    // Monotonic across the whole range: never fewer iterations for a deeper view.
+    var side: f64 = home.side;
+    var previous: u32 = 0;
+    while (side > viewport.precision_floor_side) : (side /= 8.0) {
+        const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, side);
+        const got = try autoMaxIter(v.magnification());
+        try std.testing.expect(got >= previous);
+        previous = got;
+    }
+}

@@ -602,3 +602,28 @@ test "the newly usable deep range crosses no floor through the re-exported predi
     );
     try std.testing.expect(!atPrecisionFloor(deep));
 }
+
+// ---------------------------------------------------------------------------
+// M6 acceptance tests (AT2, AT12) — materialized verbatim from
+// `.inception/m6-deep-zoom/acceptance-tests.md`. Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "acceptance: past the precision floor the view is still accepted and the warning is actionable" {
+    const deep = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-31);
+    try std.testing.expect(atPrecisionFloor(deep));
+
+    var buf: [floor_message_buf_len]u8 = undefined;
+    const msg = try precisionFloorMessage(&buf, deep.side);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "1e-31") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "1e-30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "zoom out") != null);
+}
+
+test "acceptance: the precision floor sits at 1e-30" {
+    const usable = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-20);
+    const past = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 1.0e-31);
+
+    try std.testing.expect(!atPrecisionFloor(usable));
+    try std.testing.expect(atPrecisionFloor(past));
+    try std.testing.expectEqual(@as(f64, 1.0e-30), precision_floor_side);
+}

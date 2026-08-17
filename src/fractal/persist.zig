@@ -974,3 +974,45 @@ test "applyToEngine: loaded state matches original engine" {
     try testing.expectApproxEqAbs(0.0, engine.view.center_im, 1e-15);
     try testing.expectApproxEqAbs(2.0, engine.view.side, 1e-15);
 }
+
+// ---------------------------------------------------------------------------
+// M6 acceptance tests (AT10, AT11) — materialized verbatim from
+// `.inception/m6-deep-zoom/acceptance-tests.md`. Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "acceptance: a deep center round-trips through JSON exactly" {
+    const alloc = testing.allocator;
+    const center_re_text = "-0.743643887037158704752191506114774";
+    const center_im_text = "0.131825904205311970493132056385139";
+
+    var engine = try engine_mod.Engine.init(alloc, try viewport.SquareView.fromCenterSide(.{
+        .re = -0.743643887037158704752191506114774,
+        .im = 0.131825904205311970493132056385139,
+    }, 1.0e-25), 64, .{});
+    defer engine.deinit();
+
+    const state = try fromEngine(&engine, alloc);
+    defer freeState(state, alloc);
+
+    var json_buf: [4096]u8 = undefined;
+    const json_bytes = try toJson(state, &json_buf);
+    const loaded = try fromJson(json_bytes, alloc);
+    defer freeState(loaded, alloc);
+
+    try testing.expectEqual(try std.fmt.parseFloat(f128, center_re_text), loaded.center_re);
+    try testing.expectEqual(try std.fmt.parseFloat(f128, center_im_text), loaded.center_im);
+}
+
+test "acceptance: a legacy numeric center still parses" {
+    const legacy =
+        \\{"center_re":-0.75,"center_im":0.1,"side":0.5,"policy_auto":true,
+        \\"policy_manual_value":512,"stops":[{"pos":0.0,"r":0,"g":0,"b":0,"a":255}],
+        \\"mapping_mode":"linear","mapping_period":32.0,
+        \\"interior_r":0,"interior_g":0,"interior_b":0,"interior_a":255}
+    ;
+    const loaded = try fromJson(legacy, testing.allocator);
+    defer freeState(loaded, testing.allocator);
+
+    try testing.expectEqual(@as(f128, -0.75), loaded.center_re);
+    try testing.expectEqual(@as(f128, 0.1), loaded.center_im);
+}

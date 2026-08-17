@@ -31,6 +31,8 @@ test {
     _ = @import("fractal/refine.zig");
     _ = @import("fractal/progressive.zig");
     _ = @import("fractal/persist.zig");
+    // Cross-module acceptance tests for M6 deep zoom (pure tier: no window, no GPU).
+    _ = @import("deep_zoom_test.zig");
     std.testing.refAllDecls(@This());
 }
 
