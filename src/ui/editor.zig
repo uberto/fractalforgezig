@@ -215,54 +215,78 @@ pub const ViewEditor = struct {
     }
 };
 
-/// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
-///
-/// Format: fixed notation at `viewport.max_coord_digits` decimals — the one shared digit cap,
-/// verified there to make `format → parseFloat(f128, …)` bit-exact — then TRAILING ZEROS ARE
-/// TRIMMED (at least one decimal is kept). Trimming trailing zeros of a fixed-notation number
-/// does not change the decimal value it denotes, so the shorter text still parses back to the
-/// identical `f128`: the home centre reads `-0.75` instead of `-0.7500…0` (34 zeros) while a
-/// deep centre keeps every digit it has. This is why the display is NOT cut to
-/// `coordDigits(magnification)`: that would drop real digits (29 decimals at side 1e-25) and
-/// break the lossless round trip the save file and the panel both rely on. The depth-dependent
-/// `coordDigits` count is for the READ-ONLY readout (`viewport.formatCoord`, status bar).
-///
-/// `buf` must be at least `viewport.coord_text_buf_len` bytes; a coordinate inside the
-/// Mandelbrot region needs 37. An absurd magnitude (|value| ≥ 1e27, reachable only by pasting
-/// one in) does not fit in fixed notation, so it falls back to the short exponent form — which
-/// still round-trips exactly — rather than writing past the end or showing a rounded lie.
-fn writeCoordHi(buf: []u8, value: f128) void {
-    std.debug.assert(buf.len >= viewport.coord_text_buf_len);
-    const s = std.fmt.bufPrint(buf, "{[v]d:.[p]}", .{
-        .v = value,
-        .p = viewport.max_coord_digits,
-    }) catch {
-        writeExponentForm(buf, value);
-        return;
-    };
-    var end = s.len;
-    // Keep one digit after the decimal point so the text always reads as a decimal number.
-    const dot = std.mem.indexOfScalar(u8, s, '.') orelse s.len;
-    while (end > dot + 2 and s[end - 1] == '0') end -= 1;
-    // `bufPrint` may have filled `buf` exactly, leaving no room for the terminator; only the
-    // trim can give it back. If it did not, the text does not fit — same fallback as above.
-    if (end >= buf.len) {
-        writeExponentForm(buf, value);
-        return;
-    }
-    buf[end] = 0;
+/// Significant decimal digits a shortest-round-trip `f128` can need (`viewport.max_coord_digits`
+/// is 34, the DISPLAY budget; the format itself can want 36).
+const max_f128_digits = 36;
+
+/// Scratch for the decimal rendering, NOT the field: `std.fmt.float.render`'s decimal mode
+/// rejects a buffer that cannot hold its conservative bound — the leading `0.`, the zero run
+/// after the point AND every significant digit again (`req_bytes` in `std/fmt/float.zig`) — so
+/// the 37-character reference centre demands 68 bytes even though it prints in 37. That bound
+/// exceeds the text by at most the digit count, so this size renders every text that can fit a
+/// coordinate field; whether it FITS is then a plain length check.
+const decimal_scratch_len = viewport.coord_text_buf_len + max_f128_digits;
+
+comptime {
+    // `writeCoordHi`'s exponent-form fallback must ALWAYS fit, terminator included, so its
+    // `catch unreachable` really is unreachable: 53 bytes name any `f128` in scientific mode.
+    std.debug.assert(viewport.coord_text_buf_len - 1 >= std.fmt.float.bufferSize(.scientific, f128));
+    std.debug.assert(decimal_scratch_len >= std.fmt.float.min_buffer_size);
 }
 
-/// The last-resort coordinate form: `{e}`, which is at most ~40 bytes for ANY `f128` and still
-/// round-trips exactly. Only a magnitude no fixed-notation rendering can fit gets here (see
-/// `writeCoordHi`), so the user sees a truthful `1e30` rather than a truncated number.
-fn writeExponentForm(buf: []u8, value: f128) void {
-    const e = std.fmt.bufPrint(buf, "{e}", .{value}) catch {
-        // Unreachable for a `coord_text_buf_len` buffer; still safe rather than undefined.
-        @memcpy(buf[0..4], "0.0\x00");
+/// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
+///
+/// Form: the SHORTEST-ROUND-TRIP decimal (`0.131825904205311970493132056385139`) when it fits,
+/// else the shortest-round-trip exponent form (`3.7e-33`). Both name the value exactly, so
+/// `parseCoordHi` returns the identical `f128` — which is what a user pasting a coordinate back
+/// depends on. A FIXED number of decimals is what does NOT work: `{d:.34}` prints on an absolute
+/// 1e-34 grid, coarser than the `f128` ulp for |value| < 1 (~1.2e-35 near the reference centre
+/// 0.13), so neighbouring centres collapse onto one text and anything below the grid prints as
+/// `0.0`. `viewport.max_coord_digits` is the READOUT's digit budget (`viewport.formatCoord`,
+/// status bar), not a losslessness guarantee; nothing here cuts the editable text to
+/// `coordDigits(magnification)`, which would drop real digits (29 decimals at side 1e-25).
+///
+/// Rendering goes through `std.fmt.float.render` rather than `{d}`, deliberately. `{d}` renders
+/// via a stack buffer sized for an `f64` (347 bytes) and, when a value needs more, SILENTLY
+/// substitutes the literal text `"(float)"` — which fits here, so `bufPrint` would succeed and
+/// put a non-number in the field. `render` writes into THIS buffer and returns
+/// `error.BufferTooSmall` instead, making the fallback a branch we control.
+///
+/// WHICH FORM A FIELD SHOWS, measured on this code (not guessed): decimal while its text fits the
+/// 63 usable bytes, i.e. `2 + zeros-after-the-point + significant digits`. A coordinate in the
+/// Mandelbrot region needs ~37 and is always decimal. A FULL-length 36-digit mantissa fits down to
+/// 1e-27 and takes the exponent form from 1e-28; a shorter mantissa reaches deeper (`3.7e-33` with
+/// two digits is still decimal at 36 characters). So the exponent form is ORDINARY at this
+/// milestone's depths — deep zooming leaves a long-mantissa residue in the other axis — NOT an
+/// absurd-paste corner. It round-trips exactly and `parseCoordHi` reads it back, so copy/paste
+/// keeps working; do not "fix" it by truncating digits to keep the decimal shape.
+///
+/// `buf` must be at least `viewport.coord_text_buf_len` bytes. The last byte is never rendered
+/// into, so the terminator always has room.
+fn writeCoordHi(buf: []u8, value: f128) void {
+    std.debug.assert(buf.len >= viewport.coord_text_buf_len);
+    // The last byte is the terminator's; nothing may render into it.
+    const room = buf[0 .. buf.len - 1];
+    var scratch: [decimal_scratch_len]u8 = undefined;
+    if (decimalIfExact(&scratch, value, room.len)) |s| {
+        @memcpy(room[0..s.len], s);
+        buf[s.len] = 0;
         return;
-    };
-    if (e.len < buf.len) buf[e.len] = 0;
+    }
+    // Never errors without a precision, and `min_buffer_size` is asserted above.
+    const e = std.fmt.float.render(room, value, .{ .mode = .scientific }) catch unreachable;
+    buf[e.len] = 0;
+}
+
+/// The plain decimal name of `value` — rendered into `scratch` — but ONLY if it is at most
+/// `room` bytes long and parses back to the identical `f128`. Null (the caller's signal to use
+/// the exponent form) when any check fails. The re-parse is what makes losslessness ENFORCED
+/// rather than claimed: no text the panel shows can name a different number than the view holds.
+fn decimalIfExact(scratch: []u8, value: f128, room: usize) ?[]const u8 {
+    const s = std.fmt.float.render(scratch, value, .{ .mode = .decimal }) catch return null;
+    if (s.len > room) return null;
+    const back = std.fmt.parseFloat(f128, s) catch return null;
+    return if (back == value) s else null;
 }
 
 /// Parse ONE coordinate from a null-terminated buffer at full `f128` precision. Returns null
@@ -528,6 +552,45 @@ fn typeInto(buf: []u8, text: []const u8) void {
     @memcpy(buf[0..text.len], text);
 }
 
+/// The `f128` `k` steps from `x` along its own bit pattern. One zoom or pan step moves a centre
+/// by a handful of ulps, and such a value is NOT a short decimal literal — so it round-trips
+/// through text only if the writer emits a shortest-round-trip form. Fixtures parsed from typed
+/// decimals cannot tell an exact writer from a 34-decimal one; these can.
+fn ulpShift(x: f128, k: i32) f128 {
+    const bits: u128 = @bitCast(x);
+    const moved = if (k >= 0) bits + @as(u128, @intCast(k)) else bits - @as(u128, @intCast(-k));
+    return @bitCast(moved);
+}
+
+/// Offsets applied to the reference centre: 0 is the number a user types, the others are the
+/// neighbouring `f128` values real navigation actually lands on.
+const ulp_offsets = [_]i32{ 0, 1, -1, 3, -7 };
+
+/// Centres the panel must carry losslessly. Beyond the reference point: zooming deep along the
+/// real axis leaves `center_im` a tiny NON-ZERO residue, and zooming toward the origin does the
+/// same to `center_re` — magnitudes whose plain-decimal text is far longer than the buffer.
+const centre_bases = [_][2][]const u8{
+    .{ deep_re_text, deep_im_text },
+    .{ deep_re_text, "3.7e-33" },
+    .{ "1.9e-31", deep_im_text },
+};
+
+/// Magnitudes one coordinate FIELD must survive: the residues above, a centre a real deep-zoom
+/// trajectory toward the real axis produced (34 digits at 1e-11), a full-length mantissa past the
+/// exponent-form crossover, ordinary depth, the home centre, and pasted absurdities at both ends.
+const magnitude_texts = [_][]const u8{
+    "1e-4900",          "-3.7e-33",
+    "1.9e-31",          "7.500000620552782493177801370620728e-11",
+    exponent_form_text, "1e-20",
+    deep_im_text,       deep_re_text,
+    "-0.75",            "1e30",
+    "-1e300",           "1e4900",
+};
+
+/// A full-length mantissa at a depth this milestone reaches: 36 significant digits at 1e-28, whose
+/// decimal spelling is 64 characters — one past the field — so it is written in exponent form.
+const exponent_form_text = "1.23456789012345678901234567890123456e-28";
+
 test "a 30-decimal centre typed into the panel applies exactly, unrounded" {
     var ve = ViewEditor.initFromView(try deepView(1.0e-25));
     typeInto(&ve.center_re_buf, deep_re_text);
@@ -537,14 +600,61 @@ test "a 30-decimal centre typed into the panel applies exactly, unrounded" {
 }
 
 test "syncFromView writes a centre that parses back to the identical f128 at every depth" {
-    for (depth_sides) |side| {
-        const view = try deepView(side);
-        var ve = ViewEditor{};
-        ve.syncFromView(view);
-        const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(view.center_re, applied.center_re);
-        try testing.expectEqual(view.center_im, applied.center_im);
+    for (centre_bases) |base| {
+        const re0 = try std.fmt.parseFloat(f128, base[0]);
+        const im0 = try std.fmt.parseFloat(f128, base[1]);
+        for (ulp_offsets) |k| {
+            const center: viewport.ComplexHi = .{ .re = ulpShift(re0, k), .im = ulpShift(im0, k) };
+            for (depth_sides) |side| {
+                const view = try viewport.SquareView.fromCenterSide(center, side);
+                var ve = ViewEditor{};
+                ve.syncFromView(view);
+                const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+                try testing.expectEqual(view.center_re, applied.center_re);
+                try testing.expectEqual(view.center_im, applied.center_im);
+            }
+        }
     }
+}
+
+test "a coordinate whose decimal text cannot fit the field still round-trips exactly" {
+    for (magnitude_texts) |text| {
+        const value = try std.fmt.parseFloat(f128, text);
+        var buf = std.mem.zeroes([coord_buf_bytes]u8);
+        writeCoordHi(&buf, value);
+        const back = parseCoordHi(&buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(value, back);
+    }
+}
+
+test "a deep coordinate too long for the field is shown in exponent form, and exactly" {
+    // The exponent branch is reached by ordinary deep navigation, not only by a pasted absurdity,
+    // so it needs its own pin: the form must actually be taken AND still name the value.
+    const value = try std.fmt.parseFloat(f128, exponent_form_text);
+    var buf = std.mem.zeroes([coord_buf_bytes]u8);
+    writeCoordHi(&buf, value);
+    try testing.expect(std.mem.indexOfScalar(u8, sliceUntilNull(&buf), 'e') != null);
+    try testing.expectEqual(value, parseCoordHi(&buf) orelse return error.TestUnexpectedResult);
+}
+
+test "no coordinate is ever displayed as the float formatter's placeholder text" {
+    // `{d}` renders a value needing over 347 bytes as the literal `"(float)"`, silently. That
+    // fits a coordinate field, so it would reach the screen as a number the user cannot paste.
+    for (magnitude_texts) |text| {
+        var buf = std.mem.zeroes([coord_buf_bytes]u8);
+        writeCoordHi(&buf, try std.fmt.parseFloat(f128, text));
+        try testing.expect(std.mem.indexOf(u8, sliceUntilNull(&buf), "(float)") == null);
+    }
+}
+
+test "a centre finer than the display's decimal grid is shown as itself, never as zero" {
+    // 1e-35 is below one step of a 34-decimal grid, so a fixed-decimal writer prints "-0.0" and
+    // the panel would hand `main.zig` a centre of exactly zero for a non-zero view.
+    const tiny = try std.fmt.parseFloat(f128, "-1e-35");
+    var ve = ViewEditor{};
+    ve.syncFromView(try viewport.SquareView.fromCenterSide(.{ .re = -0.75, .im = tiny }, 1.0e-30));
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(tiny, applied.center_im);
 }
 
 test "the displayed centre gains decimals with depth and never passes the 34-digit cap" {
@@ -559,7 +669,7 @@ test "the displayed centre gains decimals with depth and never passes the 34-dig
 test "a shallow view's centre is displayed without trailing-zero padding" {
     var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
     try testing.expectEqualStrings("-0.75", sliceUntilNull(&ve.center_re_buf));
-    try testing.expectEqualStrings("0.0", sliceUntilNull(&ve.center_im_buf));
+    try testing.expectEqualStrings("0", sliceUntilNull(&ve.center_im_buf));
 }
 
 test "syncFromView null-terminates every coordinate buffer inside its bounds" {
@@ -575,8 +685,8 @@ test "syncFromView null-terminates every coordinate buffer inside its bounds" {
 }
 
 test "an absurd centre magnitude is displayed in a form that still round-trips, not overrun" {
-    // `{d:.34}` of 1e30 needs 65 bytes — one more than the buffer. The fallback must keep the
-    // value truthful rather than write past the end or show a rounded lie.
+    // `{d}` of 1e30 is 31 positional digits, and of 1e-300 over 300 — past the buffer, so the
+    // exponent fallback must keep the value truthful rather than write past the end or lie.
     var ve = ViewEditor{};
     ve.syncFromView(try viewport.SquareView.fromCenterSide(.{ .re = 1.0e30, .im = -1.0e30 }, 1.0));
     const text = sliceUntilNull(&ve.center_re_buf);
@@ -613,9 +723,9 @@ test "parseAndApplyCorners at depth keeps the centre's digits to within an f128 
     // The corner text is lossless; re-centring is `(a + b) / 2`, so the recovered centre can
     // land one `f128` ulp (~1.4e-34 here) off — nine orders of magnitude finer than the f64
     // rounding this milestone exists to escape.
-    const ulps: f128 = 2.0 * std.math.floatEps(f128);
-    try testing.expectApproxEqRel(view.center_re, applied.center_re, ulps);
-    try testing.expectApproxEqRel(view.center_im, applied.center_im, ulps);
+    const one_ulp: f128 = std.math.floatEps(f128);
+    try testing.expectApproxEqRel(view.center_re, applied.center_re, one_ulp);
+    try testing.expectApproxEqRel(view.center_im, applied.center_im, one_ulp);
 }
 
 test "parseAndApplyCorners at depth recovers a square side to the f128 differencing limit" {
@@ -646,7 +756,7 @@ test "the magnification field still round-trips at the precision floor" {
     const view = try deepView(viewport.precision_floor_side);
     var ve = ViewEditor.initFromView(view);
     const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
-    try testing.expectApproxEqRel(view.magnification(), applied.magnification(), 1e-12);
+    try testing.expectEqual(view.magnification(), applied.magnification());
 }
 
 test "ViewEditor.parseIterPolicy parses valid number" {
