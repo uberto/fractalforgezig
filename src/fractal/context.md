@@ -15,8 +15,7 @@ Decoupling:ITERATE ONCE into a persistent `[]f32`;palette edits rerun ONLY CHEAP
 it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset in f64,added
 ONCE onto the centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
 `mandelbrot.iterateExact`. `Viewport`,`iterbuf`,`mandelbrot`,GPU stay f64
-end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64;`persist.zig` keeps the centre
-EXACT(TEXT).
+end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
 
 ## Modules
 
@@ -110,12 +109,13 @@ EXACT(TEXT).
   `stepPass()`=one self-timed chunk(`stepPassRows(rows)` deterministic),
   `true`=complete→bumps each counter ONCE,clears `pass:?progressive.Pass`;`cancelPass()` on
   input change;`passFraction()→?f32` drives the progress bar.
-- `persist.zig`—pure JSON,NO file I/O. `AppState`(centre f128,`side` f64)heap-owns
+- `persist.zig`—pure JSON,NO I/O. `AppState`(centre f128,`side` f64)heap-owns
   `stops`+`mapping_mode`→ALWAYS `freeState(state,alloc)`.
   `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
   setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
-  (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=COARSER than
-  f128's ulp below 1). NO version field⇒`CenterJson.jsonParse` IS the back-compat:string(M6)OR
+  (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=LOSSY<1).
+  PLAIN or e-notation(deep centres OFTEN e-form);both EXACT,NEVER prune that fallback.
+  NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
   number(pre-M6),RAW digits→f128,NEVER drop that branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.
 

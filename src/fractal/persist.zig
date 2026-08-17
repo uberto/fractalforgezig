@@ -12,7 +12,9 @@
 //! other tool — which threw away the ~17 low digits that put a deep view where it is. The
 //! loader accepts BOTH spellings (string and number); see `CenterJson`. There is deliberately
 //! NO version field in this format, so that loader branch is the whole of its backwards
-//! compatibility. `side` stays `f64`, matching `SquareView`.
+//! compatibility. That string is base-10 either way, but plain (`-0.75`) for shallow centres and
+//! e-notation (`7.5…e-11`) for the deep ones — both exact, see `writeCenter`. `side` stays `f64`,
+//! matching `SquareView`.
 const std = @import("std");
 const gradient_mod = @import("gradient.zig");
 const mapping_mod = @import("mapping.zig");
@@ -79,16 +81,19 @@ pub const ApplyError = engine_mod.EngineError || engine_mod.IterateError || erro
 /// after the point" — see `writeCenter`.
 const max_center_digits = 36;
 
-/// The decimal exponent range written in plain (non-exponent) notation. Every centre a view can
-/// hold sits inside the Mandelbrot region (|c| < 2), so 1e±40 is far past anything navigation
-/// can produce; a magnitude beyond it — only reachable by pasting one into the coordinate panel
-/// — takes the exponent form instead (`writeCenter`).
-const max_plain_center_exponent = 40;
+/// How many leading zeros after the point the PLAIN decimal form is budgeted for. This is a
+/// BUDGET, not a claim about what values exist: it buys a readable plain form for the shallow
+/// centres a user actually looks at, at a fraction of the type's own worst case
+/// (`std.fmt.float.bufferSize(.decimal, f128)` = 5011 bytes, which nothing here needs and no
+/// event handler's stack should carry). A centre `std.fmt.float.render` will not commit to this
+/// many bytes is written in the exponent form instead — routine at this milestone's depths, and
+/// sooner than the digits alone suggest: see `writeCenter` for the bound that decides it.
+const plain_center_zeros_budget = 40;
 
-/// Bytes one persisted centre coordinate can need: sign, the leading `0`, the point, the run of
-/// zeros an exponent of `-max_plain_center_exponent` puts after it, and the digits themselves.
-/// Two of these replaced M5's two ~20-character numbers, which is why `min_json_buf_len` grew.
-pub const center_text_max_len = 3 + max_plain_center_exponent + max_center_digits;
+/// Bytes one persisted centre coordinate can need: sign, the leading `0`, the point, the
+/// `plain_center_zeros_budget` zeros after it, and the digits themselves. Two of these replaced
+/// M5's two ~20-character numbers, which is why `min_json_buf_len` grew.
+pub const center_text_max_len = 3 + plain_center_zeros_budget + max_center_digits;
 
 comptime {
     // `writeCenter`'s exponent-form fallback must ALWAYS fit, so its `catch unreachable` really
@@ -118,9 +123,24 @@ pub const min_json_buf_len = json_fixed_fields_len + 2 * (center_text_max_len + 
 /// We call `std.fmt.float.render` — exactly what the `{d}` formatter calls — rather than
 /// `bufPrint("{d}", …)` on purpose: the FORMATTER renders into a fixed 347-byte scratch buffer
 /// and, for a value needing more, silently emits the placeholder `(float)`. That text would go
-/// straight into the save file and fail to load. Calling `render` makes it a branch we control:
-/// an absurd magnitude (outside ~1e±40, only reachable by pasting one into the coordinate panel)
-/// is written in the full-precision EXPONENT form, which reparses exactly as well.
+/// straight into the save file and fail to load. Calling `render` makes it a branch we control.
+///
+/// BOTH FORMS ARE ON THE NORMAL PATH; the exponent fallback is NOT dead code for absurd pasted
+/// magnitudes, so do not "simplify" it away. We get the plain form for exactly as long as `render`
+/// ACCEPTS THE DESTINATION BUFFER we hand it, and that acceptance test is a conservative BOUND, not
+/// the real output length: `formatDecimal` demands `2 + |exponent of the last digit| + digit count`
+/// bytes (`std/fmt/float.zig:282-288`), which counts every significant digit a second time on top
+/// of the zero run after the point. So a value of `d` significant digits at decimal exponent `-E`
+/// must fit `1 + 2·d + E` into `center_text_max_len` (79) even though its text is far shorter — the
+/// 37-character reference centre already asks for 68. Measured crossovers: a 34-digit mantissa
+/// takes the exponent form from 1e-11, a 35-digit one from 1e-9. That is a property of THIS call,
+/// not of `f128`, of decimal text, or of how deep a decimal string can name a centre: `src/ui/`'s
+/// `editor.decimalIfExact` renders into a generous scratch and then length-checks the ACTUAL
+/// output, which keeps a full 36-digit mantissa plain down to ~1e-27. Adopting that here is a
+/// deliberate non-goal for now — the current spelling is the one verified at scale — so expect the
+/// exponent form at ordinary deep-zoom magnitudes: a real `zoomAbout` sequence near the real axis
+/// left `center_im` at `7.500000620552782493177801370620728e-11`. Both forms name the value
+/// exactly, so the round trip is unaffected either way, and the tests below pin each.
 fn writeCenter(buf: *[center_text_max_len]u8, value: f128) []const u8 {
     return std.fmt.float.render(buf, value, .{ .mode = .decimal }) catch
         std.fmt.float.render(buf, value, .{ .mode = .scientific }) catch unreachable;
@@ -469,6 +489,13 @@ test "fromJson: unsorted stops returns GradientNotSorted" {
 const deep_re_text = "-0.743643887037158704752191506114774";
 const deep_im_text = "0.131825904205311970493132056385139";
 
+/// A `center_im` a REAL `zoomAbout` sequence toward the real axis landed on (34 significant
+/// digits at 1e-11), i.e. the residue an ordinary deep zoom leaves behind. Its plain decimal form
+/// does not fit `center_text_max_len`, so it is the navigation-reachable value that exercises
+/// `writeCenter`'s exponent-form branch. CAREFUL: it is exactly an `f64` value (the offset that
+/// produced it was f64), so shift it by an ulp before using it to prove nothing narrows.
+const nav_residue_im_text = "7.500000620552782493177801370620728e-11";
+
 /// A minimal single-stop state at `centre`, so a centre test asserts ONLY the centre.
 fn deepState(center_re: f128, center_im: f128, side: f64, stops: []SerialStop) AppState {
     return AppState{
@@ -686,13 +713,83 @@ test "every centre text this module writes reparses to the identical f128" {
     }
 }
 
-test "a centre inside the Mandelbrot region is written in plain decimal, not exponent form" {
+test "the centres a user reads stay in plain decimal, not a wall of zeros" {
+    // ONLY about readability, and only for these two magnitudes: which form is used depends on the
+    // conservative bound `render` applies to our buffer (`writeCenter`), not on the region, so this
+    // is NOT an invariant of "centres inside the Mandelbrot region" — deeper ones legitimately take
+    // the exponent form. What it pins is that the shallow view a user recognises stays recognisable
+    // in the file, which is the whole reason `writeCenter` prefers `.decimal` first.
     var buf: [center_text_max_len]u8 = undefined;
     try testing.expectEqualStrings("-0.75", writeCenter(&buf, -0.75));
     try testing.expectEqualStrings(
         "-0.743643887037158704752191506114774",
         writeCenter(&buf, try std.fmt.parseFloat(f128, deep_re_text)),
     );
+}
+
+test "a centre a deep zoom really lands on is written in the exponent form" {
+    // Guards the FIXTURE of the round-trip test below: if a future std widens the plain form's
+    // reach and this goes green-to-red, nothing is broken — but `writeCenter`'s measured
+    // crossover, and the test below's claim to cover the fallback, both need re-deriving.
+    var buf: [center_text_max_len]u8 = undefined;
+    try testing.expectEqualStrings(
+        nav_residue_im_text,
+        writeCenter(&buf, try std.fmt.parseFloat(f128, nav_residue_im_text)),
+    );
+}
+
+test "a centre in exponent form round-trips out of the engine bit-identically" {
+    const alloc = testing.allocator;
+    // ONE ulp off `nav_residue_im_text`, because that literal is itself EXACTLY an `f64` value
+    // (measured) — a zoom near the axis reaches it by adding an f64 offset to the centre. A test
+    // that used it unshifted would still pass if this module narrowed the centre through `f64`.
+    const center_im = ulpsUp(try std.fmt.parseFloat(f128, nav_residue_im_text), 1);
+    var engine = try engine_mod.Engine.init(alloc, try viewport.SquareView.fromCenterSide(.{
+        .re = try std.fmt.parseFloat(f128, deep_re_text),
+        .im = center_im,
+    }, 1.0e-25), 64, .{});
+    defer engine.deinit();
+
+    const state = try fromEngine(&engine, alloc);
+    defer freeState(state, alloc);
+
+    var json_buf: [min_json_buf_len]u8 = undefined;
+    const json_bytes = try toJson(state, &json_buf);
+    const loaded = try fromJson(json_bytes, alloc);
+    defer freeState(loaded, alloc);
+
+    try testing.expectEqual(center_im, loaded.center_im);
+}
+
+test "an exponent-form centre one f128 ulp off a literal still round-trips bit-identically" {
+    // The fallback gets the same treatment as the plain form: values no decimal literal in this
+    // file could name, so a lossy rendering cannot hide behind a hand-picked fixture.
+    const alloc = testing.allocator;
+    var stops = oneStop();
+    const base_re = try std.fmt.parseFloat(f128, deep_re_text);
+    const base_im = try std.fmt.parseFloat(f128, nav_residue_im_text);
+
+    var exponent_forms: u32 = 0;
+    var n: u32 = 0;
+    while (n < 64) : (n += 1) {
+        const center_im = ulpsUp(base_im, n);
+        var text_buf: [center_text_max_len]u8 = undefined;
+        if (std.mem.indexOfScalar(u8, writeCenter(&text_buf, center_im), 'e') != null) {
+            exponent_forms += 1;
+        }
+
+        const state = deepState(base_re, center_im, 1.0e-25, &stops);
+        var json_buf: [min_json_buf_len]u8 = undefined;
+        const json_bytes = try toJson(state, &json_buf);
+        const loaded = try fromJson(json_bytes, alloc);
+        defer freeState(loaded, alloc);
+        try testing.expectEqual(state.center_im, loaded.center_im);
+    }
+    // Fixture guard, part of the same intent: a sweep that had drifted entirely into the plain
+    // form would stop covering the fallback while still passing. Not all 64 neighbours take it —
+    // one whose shortest text happens to be a digit or two shorter fits the plain form again,
+    // which is the mantissa-length dependence `writeCenter` documents.
+    try testing.expect(exponent_forms > 0);
 }
 
 test "min_json_buf_len fits the largest state: max_stops and worst-case centres" {
