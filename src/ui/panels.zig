@@ -24,8 +24,24 @@ const ui_log = std.log.scoped(.ui);
 const window_name = "fractalforge";
 const about_popup = "About fractalforge";
 
-/// Width (px) reserved for the data panel; the fractal region gets the rest.
-pub const data_panel_w: f32 = 260.0;
+/// Width (px) of one character of the bundled default ImGui font (ProggyClean is a 7×13
+/// bitmap font, so every glyph advances 7 px). Only used to SIZE the coordinate fields; nothing
+/// depends on it being exact, a pixel either way just changes the spare column.
+const font_char_w: f32 = 7.0;
+
+/// Characters one coordinate field must SHOW: the sign, `0.`, `max_coord_digits` decimals and a
+/// spare column for the caret. A field narrower than this hides digits behind a horizontal
+/// scroll, which defeats the point of carrying 34 of them (M6/T7).
+const coord_field_chars: f32 = @floatFromInt(viewport.max_coord_digits + 4);
+
+/// Room kept to the RIGHT of a coordinate field for its ImGui label (`a.re`, the longest, plus
+/// the item-inner spacing).
+const coord_label_gutter: f32 = 5.0 * font_char_w + 8.0;
+
+/// Width (px) reserved for the data panel; the fractal region gets the rest. Wide enough that a
+/// `coord_field_chars` coordinate field AND its label fit inside the child's padding — a
+/// full-precision centre the user cannot read is not a readout (M6/T7 widened 260 → 340).
+pub const data_panel_w: f32 = 340.0;
 /// Horizontal gap between the fractal region and the data panel.
 pub const region_spacing: f32 = 8.0;
 
@@ -283,21 +299,24 @@ fn drawStatusBar(
         // buffer is `image_w × image_h` and only matches the screen rect once a pass at the
         // region's size has finished (see `DrawResult`).
         var iter_info_buf: [iter_info_buf_len]u8 = undefined;
-        const iter_str: []u8 = blk: {
-            if (rect.side == 0) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
+        // `catch` yields a SHORT LITERAL, never `&iter_info_buf`: the buffer is `undefined`, so
+        // handing it back on overflow would paint the whole thing as text — garbage on screen,
+        // not a truncated number. `iter_info_buf_len` is still sized to the widest form, so the
+        // fallbacks stay unreachable; they are cheap insurance against the next widening.
+        const iter_str: []const u8 = blk: {
+            if (rect.side == 0) break :blk "";
             // `lo()`: the render buffer is f64 all the way down, and this only asks WHICH
             // pixel the cursor is over.
-            const idx = engine.renderViewport().pixelIndex(pt.lo()) orelse
-                break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
-            if (idx >= engine.iter.len) break :blk std.fmt.bufPrint(&iter_info_buf, "", .{}) catch &iter_info_buf;
+            const idx = engine.renderViewport().pixelIndex(pt.lo()) orelse break :blk "";
+            if (idx >= engine.iter.len) break :blk "";
             const smooth = engine.iter[idx];
             if (smooth < 0.0) {
                 // Interior means "never escaped within max_iter", so the bound is the useful
                 // number to show — it says how hard the point was tested.
-                break :blk std.fmt.bufPrint(&iter_info_buf, "  interior ({d})", .{engine.max_iter}) catch &iter_info_buf;
+                break :blk std.fmt.bufPrint(&iter_info_buf, "  interior ({d})", .{engine.max_iter}) catch "  interior";
             } else {
                 const iters: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(engine.max_iter)), smooth));
-                break :blk std.fmt.bufPrint(&iter_info_buf, "  iter {d}", .{iters}) catch &iter_info_buf;
+                break :blk std.fmt.bufPrint(&iter_info_buf, "  iter {d}", .{iters}) catch "  iter";
             }
         };
 
@@ -363,6 +382,24 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
     return toggled;
 }
 
+/// Width (px) for one coordinate input: enough to SHOW `coord_field_chars` characters, capped by
+/// the room actually left in the data panel (minus the label gutter) and floored at 8 characters
+/// so a squeezed panel still draws a usable field. Call inside the data-panel child.
+///
+/// This reads `ContentAvail` but does NOT reopen the scrollbar↔ContentAvail feedback loop this
+/// repo hit in M5: the loop needed content size to feed back into the REGION size. Here the
+/// child's width comes from the `data_panel_w` constant, and an item's width cannot change the
+/// panel's content HEIGHT (these are single-line inputs) — so a scrollbar appearing only narrows
+/// the fields once and settles.
+fn coordFieldWidth() f32 {
+    var avail_w: f32 = 0;
+    var avail_h: f32 = 0;
+    c.ffImguiContentAvail(&avail_w, &avail_h);
+    const want = coord_field_chars * font_char_w;
+    const room = avail_w - coord_label_gutter;
+    return @max(@min(want, room), 8.0 * font_char_w);
+}
+
 /// The coordinate editing panel: center+magnification and corners (both forms, kept in
 /// sync), Reset to home button, and the auto/manual max_iter control. On commit (Enter on
 /// an input field, Reset clicked, or Auto toggled) the panel:
@@ -375,10 +412,18 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
 ///
 /// At most ONE view request and ONE policy request per frame: the fields are alternative
 /// spellings of the same view, so committing two in one frame would queue a stale one.
+///
+/// M6/T7: the centre and corner fields carry the view's FULL `f128` precision, so a 34-decimal
+/// location can be read off, written down and pasted back unrounded. They are sized by
+/// `coordFieldWidth` to show all of it (an `igInputText` also stays selectable + horizontally
+/// scrollable, so a copy always takes the whole value even if the panel is squeezed).
 fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) CoordRequest {
     var req = CoordRequest{};
 
     ig.igSeparatorText("Coord");
+
+    // One width for every coordinate field this panel draws (see `coordFieldWidth`).
+    const field_w = coordFieldWidth();
 
     ig.igSeparatorText("Center / Mag");
     // Center Re / Center Im / Magnification — three spellings of one center+mag commit.
@@ -387,6 +432,7 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
     // `viewport.coord_text_buf_len` while the magnification kept its own smaller one.
     const center_mag_bufs = [_][]u8{ &ve.center_re_buf, &ve.center_im_buf, &ve.mag_buf };
     for (center_mag_ids, center_mag_bufs) |label, buf| {
+        ig.igSetNextItemWidth(field_w);
         if (ig.igInputText(label, buf.ptr, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
             if (req.view != null) continue;
             if (ve.parseAndApplyCenterMag()) |new_view| {
@@ -407,6 +453,7 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
         &ve.corner_b_im_buf,
     };
     for (corner_ids, corner_bufs) |label, buf| {
+        ig.igSetNextItemWidth(field_w);
         if (ig.igInputText(label, buf.ptr, buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
             if (req.view != null) continue;
             if (ve.parseAndApplyCorners()) |new_view| {

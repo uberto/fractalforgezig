@@ -141,6 +141,11 @@ pub extern fn igGetContentRegionAvail() ImVec2;
 // Layout helpers
 pub extern fn igGetTextLineHeightWithSpacing() f32;
 
+/// Width (px) of the NEXT item only, label excluded — M6/T7 uses it to make the coordinate
+/// fields wide enough to SHOW a full-precision centre instead of scrolling it out of sight.
+/// A negative value means "end this many pixels from the right edge".
+pub extern fn igSetNextItemWidth(item_width: f32) void;
+
 // Foreground draw list: draws on top of all windows; works outside of any window context.
 // Pass null for the main viewport.
 pub extern fn igGetForegroundDrawList_ViewportPtr(viewport: ?*anyopaque) ?*ImDrawList;

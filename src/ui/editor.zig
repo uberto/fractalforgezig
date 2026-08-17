@@ -124,8 +124,13 @@ fn lessByPos(_: void, a: gradient.Stop, b: gradient.Stop) bool {
 /// definition of "text long enough for a full-precision center" (a 34-significant-decimal
 /// signed number plus its terminator). Never hand-write a size here; a short buffer would
 /// truncate a deep coordinate on the way to the screen. The magnification is a plain `f64`
-/// and keeps its own smaller buffer. Parsing/formatting still goes through `f64` — widening
-/// that is T7's job, and it must reuse `viewport.max_coord_digits`.
+/// and keeps its own smaller buffer.
+///
+/// M6/T7: the NUMBER path through the coordinate buffers is `f128` end to end
+/// (`writeCoordHi` / `parseCoordHi`), so a 34-decimal center typed here reaches the view
+/// unrounded. Magnification and the manual iteration count deliberately stay `f64` / `u32`:
+/// a magnification is a scale, not a position — its `f64` ~17 digits still pin the side to
+/// far better than a pixel at every depth this app reaches.
 pub const coord_buf_bytes = viewport.coord_text_buf_len;
 
 pub const ViewEditor = struct {
@@ -152,22 +157,22 @@ pub const ViewEditor = struct {
     pub fn syncFromView(ve: *ViewEditor, view: viewport.SquareView) void {
         const cm = view.centerMag();
         const crs = view.corners();
-        // `@floatCast`: the panel still shows and parses `f64` (T7 widens it). The buffers are
-        // already sized for the full-precision text so T7 changes only the number path.
-        writeF64(&ve.center_re_buf, @floatCast(cm.center.re));
-        writeF64(&ve.center_im_buf, @floatCast(cm.center.im));
+        // Coordinates go out at FULL precision (`writeCoordHi`); the magnification is a scale
+        // and stays `f64` (`writeF64`) — see `coord_buf_bytes`.
+        writeCoordHi(&ve.center_re_buf, cm.center.re);
+        writeCoordHi(&ve.center_im_buf, cm.center.im);
         writeF64(&ve.mag_buf, cm.magnification);
-        writeF64(&ve.corner_a_re_buf, @floatCast(crs.min.re));
-        writeF64(&ve.corner_a_im_buf, @floatCast(crs.min.im));
-        writeF64(&ve.corner_b_re_buf, @floatCast(crs.max.re));
-        writeF64(&ve.corner_b_im_buf, @floatCast(crs.max.im));
+        writeCoordHi(&ve.corner_a_re_buf, crs.min.re);
+        writeCoordHi(&ve.corner_a_im_buf, crs.min.im);
+        writeCoordHi(&ve.corner_b_re_buf, crs.max.re);
+        writeCoordHi(&ve.corner_b_im_buf, crs.max.im);
     }
 
     /// Parse center + magnification buffers and build a `SquareView`. Returns null on any
     /// parse failure or if the view is degenerate.
     pub fn parseAndApplyCenterMag(ve: ViewEditor) ?viewport.SquareView {
-        const re = parseF64(&ve.center_re_buf) orelse return null;
-        const im = parseF64(&ve.center_im_buf) orelse return null;
+        const re = parseCoordHi(&ve.center_re_buf) orelse return null;
+        const im = parseCoordHi(&ve.center_im_buf) orelse return null;
         const mag = parseF64(&ve.mag_buf) orelse return null;
         const cm = viewport.CenterMag{
             .center = .{ .re = re, .im = im },
@@ -179,10 +184,10 @@ pub const ViewEditor = struct {
     /// Parse corner buffers and build a `SquareView` (snapped to the larger axis). Returns
     /// null on any parse failure or if the view is degenerate.
     pub fn parseAndApplyCorners(ve: ViewEditor) ?viewport.SquareView {
-        const a_re = parseF64(&ve.corner_a_re_buf) orelse return null;
-        const a_im = parseF64(&ve.corner_a_im_buf) orelse return null;
-        const b_re = parseF64(&ve.corner_b_re_buf) orelse return null;
-        const b_im = parseF64(&ve.corner_b_im_buf) orelse return null;
+        const a_re = parseCoordHi(&ve.corner_a_re_buf) orelse return null;
+        const a_im = parseCoordHi(&ve.corner_a_im_buf) orelse return null;
+        const b_re = parseCoordHi(&ve.corner_b_re_buf) orelse return null;
+        const b_im = parseCoordHi(&ve.corner_b_im_buf) orelse return null;
         const a = viewport.ComplexHi{ .re = a_re, .im = a_im };
         const b = viewport.ComplexHi{ .re = b_re, .im = b_im };
         return viewport.SquareView.fromCorners(a, b) catch null;
@@ -210,8 +215,67 @@ pub const ViewEditor = struct {
     }
 };
 
-/// Write an f64 value into a null-terminated text buffer using `"{d}"` format. Takes a SLICE
-/// so the coordinate buffers and the (shorter) magnification buffer share one writer.
+/// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
+///
+/// Format: fixed notation at `viewport.max_coord_digits` decimals — the one shared digit cap,
+/// verified there to make `format → parseFloat(f128, …)` bit-exact — then TRAILING ZEROS ARE
+/// TRIMMED (at least one decimal is kept). Trimming trailing zeros of a fixed-notation number
+/// does not change the decimal value it denotes, so the shorter text still parses back to the
+/// identical `f128`: the home centre reads `-0.75` instead of `-0.7500…0` (34 zeros) while a
+/// deep centre keeps every digit it has. This is why the display is NOT cut to
+/// `coordDigits(magnification)`: that would drop real digits (29 decimals at side 1e-25) and
+/// break the lossless round trip the save file and the panel both rely on. The depth-dependent
+/// `coordDigits` count is for the READ-ONLY readout (`viewport.formatCoord`, status bar).
+///
+/// `buf` must be at least `viewport.coord_text_buf_len` bytes; a coordinate inside the
+/// Mandelbrot region needs 37. An absurd magnitude (|value| ≥ 1e27, reachable only by pasting
+/// one in) does not fit in fixed notation, so it falls back to the short exponent form — which
+/// still round-trips exactly — rather than writing past the end or showing a rounded lie.
+fn writeCoordHi(buf: []u8, value: f128) void {
+    std.debug.assert(buf.len >= viewport.coord_text_buf_len);
+    const s = std.fmt.bufPrint(buf, "{[v]d:.[p]}", .{
+        .v = value,
+        .p = viewport.max_coord_digits,
+    }) catch {
+        writeExponentForm(buf, value);
+        return;
+    };
+    var end = s.len;
+    // Keep one digit after the decimal point so the text always reads as a decimal number.
+    const dot = std.mem.indexOfScalar(u8, s, '.') orelse s.len;
+    while (end > dot + 2 and s[end - 1] == '0') end -= 1;
+    // `bufPrint` may have filled `buf` exactly, leaving no room for the terminator; only the
+    // trim can give it back. If it did not, the text does not fit — same fallback as above.
+    if (end >= buf.len) {
+        writeExponentForm(buf, value);
+        return;
+    }
+    buf[end] = 0;
+}
+
+/// The last-resort coordinate form: `{e}`, which is at most ~40 bytes for ANY `f128` and still
+/// round-trips exactly. Only a magnitude no fixed-notation rendering can fit gets here (see
+/// `writeCoordHi`), so the user sees a truthful `1e30` rather than a truncated number.
+fn writeExponentForm(buf: []u8, value: f128) void {
+    const e = std.fmt.bufPrint(buf, "{e}", .{value}) catch {
+        // Unreachable for a `coord_text_buf_len` buffer; still safe rather than undefined.
+        @memcpy(buf[0..4], "0.0\x00");
+        return;
+    };
+    if (e.len < buf.len) buf[e.len] = 0;
+}
+
+/// Parse ONE coordinate from a null-terminated buffer at full `f128` precision. Returns null
+/// on failure — the panel's "null means rejected, change nothing" convention. A buffer with no
+/// terminator at all (the longest paste ImGui can leave) is parsed as its whole length; never
+/// past the end.
+fn parseCoordHi(buf: []const u8) ?f128 {
+    const s = sliceUntilNull(buf);
+    return std.fmt.parseFloat(f128, s) catch null;
+}
+
+/// Write an f64 value into a null-terminated text buffer using `"{d}"` format. Used for the
+/// MAGNIFICATION only (coordinates go through `writeCoordHi`).
 fn writeF64(buf: []u8, value: f64) void {
     const s = std.fmt.bufPrint(buf, "{d}", .{value}) catch {
         // If the value somehow doesn't fit (shouldn't happen for f64), write "0".
@@ -432,6 +496,157 @@ test "a ViewEditor coordinate buffer holds a full-precision center plus a termin
     @memcpy(ve.center_re_buf[0..typed.len], typed);
     try testing.expect(typed.len < ve.center_re_buf.len);
     try testing.expectEqualStrings(typed, sliceUntilNull(&ve.center_re_buf));
+}
+
+// ─── ViewEditor full-precision coordinate tests (M6/T7) ───────────────────────
+
+/// The milestone's reference centre, as the user would type it: 33 decimals of a
+/// seahorse-valley boundary point. Text, not a float literal, so the tests compare against
+/// exactly what `parseFloat` makes of the typed characters.
+const deep_re_text = "-0.743643887037158704752191506114774";
+const deep_im_text = "0.131825904205311970493132056385139";
+
+/// Every depth the panel must stay lossless across: home, the middle of the range, and the
+/// `viewport.precision_floor_side` floor.
+const depth_sides = [_]f64{ 3.5, 1.0e-3, 1.0e-9, 1.0e-15, 1.0e-20, 1.0e-25, 1.0e-30 };
+
+fn deepView(side: f64) !viewport.SquareView {
+    return viewport.SquareView.fromCenterSide(.{
+        .re = try std.fmt.parseFloat(f128, deep_re_text),
+        .im = try std.fmt.parseFloat(f128, deep_im_text),
+    }, side);
+}
+
+/// Decimals in a fixed-notation number text (0 when there is no decimal point).
+fn decimalsOf(text: []const u8) usize {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return 0;
+    return text.len - dot - 1;
+}
+
+fn typeInto(buf: []u8, text: []const u8) void {
+    @memset(buf, 0);
+    @memcpy(buf[0..text.len], text);
+}
+
+test "a 30-decimal centre typed into the panel applies exactly, unrounded" {
+    var ve = ViewEditor.initFromView(try deepView(1.0e-25));
+    typeInto(&ve.center_re_buf, deep_re_text);
+
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(try std.fmt.parseFloat(f128, deep_re_text), applied.center_re);
+}
+
+test "syncFromView writes a centre that parses back to the identical f128 at every depth" {
+    for (depth_sides) |side| {
+        const view = try deepView(side);
+        var ve = ViewEditor{};
+        ve.syncFromView(view);
+        const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(view.center_re, applied.center_re);
+        try testing.expectEqual(view.center_im, applied.center_im);
+    }
+}
+
+test "the displayed centre gains decimals with depth and never passes the 34-digit cap" {
+    var home = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    var deep = ViewEditor.initFromView(try deepView(1.0e-25));
+    const home_decimals = decimalsOf(sliceUntilNull(&home.center_re_buf));
+    const deep_decimals = decimalsOf(sliceUntilNull(&deep.center_re_buf));
+    try testing.expect(home_decimals < deep_decimals);
+    try testing.expect(deep_decimals <= viewport.max_coord_digits);
+}
+
+test "a shallow view's centre is displayed without trailing-zero padding" {
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    try testing.expectEqualStrings("-0.75", sliceUntilNull(&ve.center_re_buf));
+    try testing.expectEqualStrings("0.0", sliceUntilNull(&ve.center_im_buf));
+}
+
+test "syncFromView null-terminates every coordinate buffer inside its bounds" {
+    var ve = ViewEditor{};
+    ve.syncFromView(try deepView(1.0e-30));
+    inline for (.{
+        "center_re_buf",   "center_im_buf",   "mag_buf",         "corner_a_re_buf",
+        "corner_a_im_buf", "corner_b_re_buf", "corner_b_im_buf",
+    }) |name| {
+        const buf = &@field(ve, name);
+        try testing.expect(std.mem.indexOfScalar(u8, buf, 0) != null);
+    }
+}
+
+test "an absurd centre magnitude is displayed in a form that still round-trips, not overrun" {
+    // `{d:.34}` of 1e30 needs 65 bytes — one more than the buffer. The fallback must keep the
+    // value truthful rather than write past the end or show a rounded lie.
+    var ve = ViewEditor{};
+    ve.syncFromView(try viewport.SquareView.fromCenterSide(.{ .re = 1.0e30, .im = -1.0e30 }, 1.0));
+    const text = sliceUntilNull(&ve.center_re_buf);
+    try testing.expect(text.len < ve.center_re_buf.len);
+    try testing.expectEqual(@as(f128, 1.0e30), try std.fmt.parseFloat(f128, text));
+}
+
+test "a paste that fills the whole buffer with no terminator is parsed within bounds" {
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    // What ImGui can leave behind at most: every byte a digit, no null anywhere.
+    @memset(&ve.center_re_buf, '1');
+    ve.center_re_buf[1] = '.';
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    const whole = try std.fmt.parseFloat(f128, &ve.center_re_buf);
+    try testing.expectEqual(whole, applied.center_re);
+}
+
+test "a paste longer than the buffer is rejected or truncated, never applied past the end" {
+    const too_long = "-0.1234567890123456789012345678901234567890123456789012345678901234567890";
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    // ImGui copies at most `buf_size - 1` bytes and terminates; mirror that exactly.
+    const keep = ve.center_re_buf.len - 1;
+    @memset(&ve.center_re_buf, 0);
+    @memcpy(ve.center_re_buf[0..keep], too_long[0..keep]);
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(try std.fmt.parseFloat(f128, too_long[0..keep]), applied.center_re);
+    try testing.expectEqual(@as(u8, 0), ve.center_re_buf[ve.center_re_buf.len - 1]);
+}
+
+test "parseAndApplyCorners at depth keeps the centre's digits to within an f128 ulp" {
+    const view = try deepView(1.0e-25);
+    var ve = ViewEditor.initFromView(view);
+    const applied = ve.parseAndApplyCorners() orelse return error.TestUnexpectedResult;
+    // The corner text is lossless; re-centring is `(a + b) / 2`, so the recovered centre can
+    // land one `f128` ulp (~1.4e-34 here) off — nine orders of magnitude finer than the f64
+    // rounding this milestone exists to escape.
+    const ulps: f128 = 2.0 * std.math.floatEps(f128);
+    try testing.expectApproxEqRel(view.center_re, applied.center_re, ulps);
+    try testing.expectApproxEqRel(view.center_im, applied.center_im, ulps);
+}
+
+test "parseAndApplyCorners at depth recovers a square side to the f128 differencing limit" {
+    const view = try deepView(1.0e-25);
+    var ve = ViewEditor.initFromView(view);
+    const applied = ve.parseAndApplyCorners() orelse return error.TestUnexpectedResult;
+    // The corner TEXT is exact; the residual error is intrinsic to describing a 1e-25 span by
+    // two absolute coordinates near 0.74, whose `f128` ulp is ~1.4e-34 — i.e. ~3e-10 of the
+    // side. Differencing the corners without text (`view.corners()` in `f128`) gives the same
+    // 2.8e-10, so this is `SquareView`'s geometry, not the panel's formatting.
+    try testing.expectApproxEqRel(view.side, applied.side, 1e-8);
+}
+
+test "the centre a deep view shows is not the f64 rounding of itself" {
+    var ve = ViewEditor.initFromView(try deepView(1.0e-25));
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    const rounded: f128 = @as(f64, @floatCast(applied.center_re));
+    try testing.expect(applied.center_re != rounded);
+}
+
+test "a non-numeric magnification is rejected, leaving no view to apply" {
+    var ve = ViewEditor.initFromView(viewport.SquareView.defaultView());
+    typeInto(&ve.mag_buf, "wide");
+    try testing.expect(ve.parseAndApplyCenterMag() == null);
+}
+
+test "the magnification field still round-trips at the precision floor" {
+    const view = try deepView(viewport.precision_floor_side);
+    var ve = ViewEditor.initFromView(view);
+    const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqRel(view.magnification(), applied.magnification(), 1e-12);
 }
 
 test "ViewEditor.parseIterPolicy parses valid number" {
