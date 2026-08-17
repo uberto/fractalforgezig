@@ -53,6 +53,25 @@ test "compute: pipeline creates successfully with embedded MSL source" {
     // If we reach here the MSL compiled without error.
 }
 
+test "compute: pipeline creation reports ShaderCompilationFailed on a broken shader" {
+    // Could not be written before round 2: this path logged with `std.log.err`, and Zig 0.15's
+    // test runner turns any logged error into a non-zero exit ("1 errors were logged") while
+    // still reporting every test as passing. Routing it through `emitErr` — a no-op under test —
+    // is what makes the failure assertable, and it is the exit a future `mandelbrot.metal` typo
+    // takes, so it must return a typed error rather than crash or hand back a half-built pipeline.
+    //
+    // EXPECTED NOISE: Metal itself prints `ERROR: Creating MTLLibrary failed … expected
+    // unqualified-id` while this test runs. That line is the shader compiler doing its job on
+    // deliberately invalid MSL, not a failing gate — the tier stays green and exits 0.
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+
+    try std.testing.expectError(
+        compute.Error.ShaderCompilationFailed,
+        compute.ComputePipeline.createFromSource(device, "this is not valid MSL"),
+    );
+}
+
 test "compute: gpuIterate interior pixels match CPU (deep interior, no precision boundary)" {
     const device = try openHeadlessDevice();
     defer closeHeadlessDevice(device);
@@ -317,20 +336,26 @@ test "compute: f32 inputs alone move a dozen pixels past 1% of max_iter at 1e-20
 
 test "compute: the deep kernel agrees with the CPU deep path at 1e-20" {
     // At `perturb.gpu_floor_side` the `float` delta kernel must produce the CPU deep path's
-    // image. Measured on this machine: 0 of 256 classification mismatches, 7 pixels beyond 1% of
-    // `max_iter`, worst deviation 429 iterations (2.15%).
+    // image. The three assertions below are AT5's, as the user amended it — see
+    // `.inception/m6-deep-zoom/acceptance-tests.md`, AT5 `### AMENDMENT 2026-08-14`, which settled
+    // the question this comment used to record as open: the per-pixel 1%-of-`max_iter` figure is
+    // no longer fatal on first breach (no MSL kernel can hold it — the test above measures the
+    // f32-input floor with perfect arithmetic), so the outliers are BUDGETED and a mean-absolute-
+    // error bound was added to carry the teeth that budget gives up. Statistics accumulate in
+    // `f64` here for the same reason they do in AT5.
     //
-    // The three budgets, and what each one catches:
-    //   * classification (AT5's own budget of 2, unchanged, measured 0) — a wrong slot order, a
+    // What each assertion catches:
+    //   * classification (budget 2, unchanged, measured 0 of 256) — a wrong slot order, a
     //     mismatched uniform layout or a dead kernel turns escaping pixels interior wholesale;
-    //   * a COUNT of pixels beyond 1% of `max_iter` — the test above measures 12 for `f32` inputs
-    //     with perfect arithmetic, so 16 leaves headroom over the floor while a broken rebasing
-    //     rule or a re-derived pixel mapping puts most of the 256 outside it;
-    //   * a worst-case ceiling of 5% — nothing may move by thousands of iterations.
-    //
-    // NOTE (blocked question, see results/T6.md): approved AT5 asserts the 1% tolerance
-    // PER PIXEL, which the test above shows no `float` kernel can satisfy at 1e-20. That wording
-    // is the user's to change, not this executor's, and not A1's.
+    //   * a COUNT of pixels beyond 1% of `max_iter` (budget 16, measured 7) — the geometry pin at
+    //     this depth: every pixel of this tile escapes, so classification is blind to a flipped or
+    //     shifted grid, whereas a y-flip puts 52 pixels over the figure and a dropped `+0.5`
+    //     puts 41. DO NOT widen this budget without replacing that coverage;
+    //   * the MEAN absolute error (< 60.0, measured 15.9) — broad defects (wrong slot order,
+    //     struct layout, rebasing, orbit indexing) spread error over the whole tile.
+    // `worst` is logged as a diagnostic and deliberately NOT asserted: a per-pixel maximum
+    // measures this scene's hypersensitivity, not the kernel (it reads 1111 one step away, at
+    // side 5e-20, while all three assertions above still pass there).
     const device = try openHeadlessDevice();
     defer closeHeadlessDevice(device);
     const pipeline = try compute.ComputePipeline.create(device);
@@ -347,10 +372,12 @@ test "compute: the deep kernel agrees with the CPU deep path at 1e-20" {
     try compute.gpuIterateDeepRows(pipeline, view, &orbit, 16, 16, max_iter, 0, 16, &gpu_buf);
     try iterbuf.iterateDeepBandInto(&cpu_buf, view.rectViewport(16, 16), max_iter, 0, 16, &orbit);
 
-    const tolerance = 0.01 * @as(f32, @floatFromInt(max_iter));
+    const per_pixel_tol: f64 = 0.01 * @as(f64, @floatFromInt(max_iter)); // 200 iterations
     var class_mismatches: u32 = 0;
-    var beyond_tolerance: u32 = 0;
-    var worst: f32 = 0;
+    var over_tol: u32 = 0;
+    var exterior: u32 = 0;
+    var sum_abs_err: f64 = 0;
+    var worst: f64 = 0;
     for (gpu_buf, cpu_buf) |g, cpu| {
         const cpu_interior = cpu == mandelbrot_mod.interior_sentinel;
         const gpu_interior = g == mandelbrot_mod.interior_sentinel;
@@ -359,14 +386,26 @@ test "compute: the deep kernel agrees with the CPU deep path at 1e-20" {
             continue;
         }
         if (!cpu_interior) {
-            const delta = @abs(cpu - g);
+            const delta = @abs(@as(f64, cpu) - @as(f64, g));
             if (delta > worst) worst = delta;
-            if (delta > tolerance) beyond_tolerance += 1;
+            if (delta > per_pixel_tol) over_tol += 1;
+            sum_abs_err += delta;
+            exterior += 1;
         }
     }
+    // NaN when nothing escaped, which the `exterior > 0` assertion below reports properly (and
+    // `NaN < 60.0` is false, so a vacuous tile cannot pass the mean check either way).
+    const mean_abs_err = sum_abs_err / @as(f64, @floatFromInt(exterior));
+    // Silent when green, and the numbers when red: `expect` prints no values, and this suite logs
+    // nothing at `info` under the test runner. `worst` rides along as a DIAGNOSTIC only.
+    errdefer std.log.warn(
+        "deep agreement at 1e-20 FAILED: exterior={d}/256 class_mismatches={d} over_tol={d} mean={d:.4} worst={d:.2}",
+        .{ exterior, class_mismatches, over_tol, mean_abs_err, worst },
+    );
     try std.testing.expect(class_mismatches <= 2);
-    try std.testing.expect(beyond_tolerance <= 16);
-    try std.testing.expect(worst <= 5.0 * tolerance);
+    try std.testing.expect(over_tol <= 16);
+    try std.testing.expect(exterior > 0);
+    try std.testing.expect(mean_abs_err < 60.0);
 }
 
 test "compute: the deep render resolves structure at 1e-20 rather than one flat value" {
@@ -437,7 +476,12 @@ test "compute: a deep band that runs past the last row is rejected, not clamped"
     );
 }
 
-test "compute: a deep dispatch of zero rows leaves the buffer untouched" {
+test "compute: a deep dispatch of zero rows is a no-op, not an error" {
+    // RENAMED in round 2 (was "…leaves the buffer untouched"): `iter_out.len` must equal
+    // `width * band_rows`, so a zero-row band's buffer is necessarily zero-length and there is no
+    // content an assertion could observe. What is actually under test is that an empty band is
+    // accepted and creates no zero-sized GPU buffer — which is what lets the progressive pass ask
+    // for a band of nothing at the end of a render.
     const device = try openHeadlessDevice();
     defer closeHeadlessDevice(device);
     const pipeline = try compute.ComputePipeline.create(device);
@@ -449,6 +493,46 @@ test "compute: a deep dispatch of zero rows leaves the buffer untouched" {
 
     var empty: [0]f32 = undefined;
     try compute.gpuIterateDeepRows(pipeline, view, &orbit, 4, 4, 64, 2, 0, &empty);
+}
+
+test "compute: a deep band whose buffer is the wrong length is rejected" {
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const view = try viewport.SquareView.fromCenterSide(deep_center, 1.0e-12);
+    var orbit = try perturb.ReferenceOrbit.compute(std.testing.allocator, view.center(), 64);
+    defer orbit.deinit(std.testing.allocator);
+
+    var band: [4 * 2]f32 = undefined; // one row short of the 4×3 band asked for below
+    try std.testing.expectError(
+        compute.Error.IterBufferSizeMismatch,
+        compute.gpuIterateDeepRows(pipeline, view, &orbit, 4, 4, 64, 0, 3, &band),
+    );
+}
+
+test "compute: the deep kernel answers the interior sentinel for a degenerate orbit" {
+    // Parity with `perturb.iterateDelta` on the edge case both implementations document: an orbit
+    // of only `Z_0 = 0` carries no `Z_1 = C`, so there is nothing to iterate against and no way to
+    // recover the centre. The CPU side is pinned in `perturb.zig`; this pins the kernel's own
+    // `orbit_len < 2` branch, which is otherwise unreachable from any test.
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const view = try viewport.SquareView.fromCenterSide(deep_center, 1.0e-12);
+    // `max_iter = 0` records `Z_0` alone — the same construction the CPU parity test uses.
+    var orbit = try perturb.ReferenceOrbit.compute(std.testing.allocator, view.center(), 0);
+    defer orbit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), orbit.len());
+
+    // Pre-filled with a marker no kernel produces, so a dispatch that wrote NOTHING would fail
+    // here rather than passing on undefined memory that happened to read as the sentinel.
+    var band: [4 * 4]f32 = @splat(1234.5);
+    try compute.gpuIterateDeepRows(pipeline, view, &orbit, 4, 4, 64, 0, 4, &band);
+    for (band) |v| try std.testing.expectEqual(mandelbrot_mod.interior_sentinel, v);
 }
 
 test "compute: the deep path refuses a view below the GPU precision floor" {

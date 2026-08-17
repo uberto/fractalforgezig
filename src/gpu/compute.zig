@@ -15,8 +15,10 @@
 //! command-buffer watchdog, which would then drop the whole render onto the CPU inside a
 //! single frame.
 //!
-//! On any SDL failure every function logs `std.log.err` (scope `.gpu`) with the
-//! SDL error string and returns a Zig error — never `unreachable`.
+//! On any SDL failure every function logs through `emitErr` (scope `.gpu`, a no-op under test —
+//! see its doc comment) with the SDL error string and returns a Zig error — never `unreachable`.
+//! There are no direct `std.log.err` calls in this file, deliberately: one is enough to make
+//! `zig build test-gpu` exit non-zero while reporting every test as passing.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
@@ -108,12 +110,20 @@ pub const ComputePipeline = struct {
     device: *c.SDL_GPUDevice,
 
     /// Compile the embedded MSL source via SDL_GPU's Metal backend and return
-    /// the pipeline. Logs `std.log.err(.gpu)` and returns `ShaderCompilationFailed`
-    /// on failure — never panics.
+    /// the pipeline. Logs through `emitErr` (scope `.gpu`) and returns
+    /// `ShaderCompilationFailed` on failure — never panics.
     pub fn create(device: *c.SDL_GPUDevice) Error!ComputePipeline {
+        return createFromSource(device, msl_source);
+    }
+
+    /// `create`, with the MSL source given rather than embedded. The app only ever wants
+    /// `create`; this seam exists so a test can drive the `ShaderCompilationFailed` path with a
+    /// deliberately broken shader, which is the only untested exit from pipeline creation and the
+    /// one a future edit of `mandelbrot.metal` is most likely to hit.
+    pub fn createFromSource(device: *c.SDL_GPUDevice, source: [*:0]const u8) Error!ComputePipeline {
         const info = c.SDL_GPUComputePipelineCreateInfo{
-            .code_size = std.mem.len(msl_source),
-            .code = @ptrCast(msl_source),
+            .code_size = std.mem.len(source),
+            .code = @ptrCast(source),
             .entrypoint = "mandelbrot_iterate",
             .format = c.SDL_GPU_SHADERFORMAT_MSL,
             .num_samplers = 0,
@@ -129,7 +139,7 @@ pub const ComputePipeline = struct {
         };
         const handle = c.SDL_CreateGPUComputePipeline(device, &info) orelse {
             const sdl_err = std.mem.span(c.SDL_GetError());
-            log.err("SDL_CreateGPUComputePipeline failed: {s}", .{sdl_err});
+            emitErr("SDL_CreateGPUComputePipeline failed: {s}", .{sdl_err});
             return Error.ShaderCompilationFailed;
         };
 
@@ -138,8 +148,8 @@ pub const ComputePipeline = struct {
         // orbit at buffer(1) and the output at buffer(2). Declaring them in any other
         // combination silently misbinds: the kernel would read zeros, not fail.
         const deep_info = c.SDL_GPUComputePipelineCreateInfo{
-            .code_size = std.mem.len(msl_source),
-            .code = @ptrCast(msl_source),
+            .code_size = std.mem.len(source),
+            .code = @ptrCast(source),
             .entrypoint = "mandelbrot_iterate_deep",
             .format = c.SDL_GPU_SHADERFORMAT_MSL,
             .num_samplers = 0,
@@ -155,7 +165,7 @@ pub const ComputePipeline = struct {
         };
         const deep_handle = c.SDL_CreateGPUComputePipeline(device, &deep_info) orelse {
             const sdl_err = std.mem.span(c.SDL_GetError());
-            log.err("SDL_CreateGPUComputePipeline (deep) failed: {s}", .{sdl_err});
+            emitErr("SDL_CreateGPUComputePipeline (deep) failed: {s}", .{sdl_err});
             c.SDL_ReleaseGPUComputePipeline(device, handle);
             return Error.ShaderCompilationFailed;
         };
