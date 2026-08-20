@@ -181,8 +181,8 @@ The system SHALL warn the user, without refusing the navigation, when the view s
 ### Requirement: Maximum zoom-out
 
 The system SHALL stop the view growing once it is wider than the whole set is: a zoom-out that would
-take the view side past 8.0 SHALL saturate at 8.0 instead, keeping a valid view rather than refusing
-the gesture.
+take the view side past 8.0 SHALL saturate at the greater of 8.0 and the view's current width
+instead, keeping a valid view rather than refusing the gesture.
 
 #### Scenario: Zooming out repeatedly stops at the widest view
 

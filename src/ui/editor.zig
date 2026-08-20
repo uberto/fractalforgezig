@@ -832,22 +832,58 @@ fn magText(ve: *const ViewEditor) []const u8 {
     return sliceUntilNull(&ve.mag_buf);
 }
 
+/// The exponent-form text length of `value`, measured through the same renderer the field
+/// falls back to when the plain decimal spelling will not fit. Paired with `decimalTextLen`
+/// so a test can name the exact index the terminator is REQUIRED to land on.
+fn scientificTextLen(value: f64) usize {
+    var scratch: [f64_decimal_scratch_len]u8 = undefined;
+    const s = std.fmt.float.render(&scratch, value, .{ .mode = .scientific }) catch
+        return f64_decimal_scratch_len;
+    return s.len;
+}
+
+/// The index the terminator must land on for `value` in a `buf_len`-byte field: the plain
+/// decimal spelling's length while that spelling fits BESIDE a terminator, else the exponent
+/// spelling's. Both lengths are measured through the field's own renderer, never quoted.
+fn requiredTerminatorIndex(value: f64, buf_len: usize) usize {
+    const decimal = decimalTextLen(value);
+    return if (decimal <= buf_len - 1) decimal else scientificTextLen(value);
+}
+
+/// Write `value` into a field PRE-FILLED with a non-zero byte, and return where the
+/// terminator ended up (null when `writeF64` left none — the state that aborts ImGui).
+///
+/// The pre-fill is the whole point: `mag_buf` is `std.mem.zeroes`-initialised, so a test that
+/// only asks whether SOME zero byte exists is satisfied by the initialiser and passes against
+/// a `writeF64` that writes nothing at all. Filling with `'x'` first means only a terminator
+/// this code actually wrote can answer.
+fn terminatorIndexAfterWrite(ve: *ViewEditor, value: f64) ?usize {
+    @memset(&ve.mag_buf, 'x');
+    writeF64(&ve.mag_buf, value);
+    return std.mem.indexOfScalar(u8, &ve.mag_buf, 0);
+}
+
 test "the magnification field is terminated when its text exactly fills the buffer" {
     var ve = ViewEditor{};
     const exact = magnificationWithTextLen(ve.mag_buf.len) orelse return error.TestUnexpectedResult;
     // The fixture is the exactly-full case because it was MEASURED to be, not assumed.
     try testing.expectEqual(ve.mag_buf.len, decimalTextLen(exact));
-    writeF64(&ve.mag_buf, exact);
-    // No terminator anywhere in the field is what aborts ImGui's `InputTextEx`.
-    try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+    // Over a non-zero pre-fill, so the terminator has to have been written here, and at the
+    // END OF THE TEXT: no terminator anywhere is what aborts ImGui's `InputTextEx`, and one
+    // in the wrong place truncates or leaks the field's tail into the readout.
+    const idx = terminatorIndexAfterWrite(&ve, exact) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(requiredTerminatorIndex(exact, ve.mag_buf.len), idx);
 }
 
 test "the magnification field is terminated one character either side of exactly full" {
     var ve = ViewEditor{};
+    // `len - 1` is the case the UNCONDITIONAL write exists for: the decimal text exactly
+    // fills `room`, so `buf[s.len]` is the field's last byte and a `s.len < room.len` guard
+    // would skip it. `len + 1` is the first text too long to spell in full.
     for ([_]usize{ ve.mag_buf.len - 1, ve.mag_buf.len + 1 }) |len| {
         const m = magnificationWithTextLen(len) orelse return error.TestUnexpectedResult;
-        writeF64(&ve.mag_buf, m);
-        try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+        const idx = terminatorIndexAfterWrite(&ve, m) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(requiredTerminatorIndex(m, ve.mag_buf.len), idx);
     }
 }
 
