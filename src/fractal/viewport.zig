@@ -348,13 +348,19 @@ pub const ImageRect = struct {
 /// Decimals the coordinate readout shows at the shallowest zoom.
 pub const min_coord_digits: usize = 4;
 
-/// Decimal cap, and THE shared "how many digits does a center need" constant: `f128` carries
-/// 113 mantissa bits ≈ 34 significant decimals, which is also exactly what a lossless decimal
-/// round trip of an `f128` takes (`{d:.34}` → `parseFloat(f128, …)` is exact). Past this the
-/// digits would be noise, and at side 1e-30 near |re| ≈ 1 they are all needed.
+/// Decimal cap, and the shared "how many digits does a center need" constant: `f128` carries
+/// 113 mantissa bits ≈ 34 significant decimals, so past this the digits would be noise, and at
+/// side 1e-30 near |re| ≈ 1 they are all needed.
 ///
-/// The readout (T7) and the save format (T8) MUST both format the center through this one
-/// definition, or a saved location would not match the one on screen.
+/// This cap is NOT a losslessness guarantee. `{d:.34}` fixes 34 decimals AFTER the point, which
+/// is not 34 SIGNIFICANT digits: for |v| < 1 that absolute 1e-34 grid is coarser than the `f128`
+/// ulp (~1.2e-35 near the reference centre), so a fixed-decimal render can drop real digits.
+/// Two distinct contracts came out of that, and they must stay distinct:
+///   * the READ-ONLY readout formats `coordDigits(mag)` decimals, capped here at 34 — a display
+///     budget, enough to separate adjacent pixels at the 1e-30 floor (`formatCoord`);
+///   * the EDITABLE fields and the saved file use the SHORTEST-ROUND-TRIP form via
+///     `std.fmt.float.render`, with a `.scientific` fallback (`ui/editor.zig`, `persist.zig`).
+/// Never cut editable or saved text down to this cap.
 pub const max_coord_digits: usize = 34;
 
 /// Integer digits the readout must fit: the Mandelbrot region lives well inside

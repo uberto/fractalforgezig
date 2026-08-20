@@ -132,7 +132,7 @@ pub const min_json_buf_len = json_fixed_fields_len + 2 * (center_text_max_len + 
 /// bytes (`std/fmt/float.zig:282-288`), which counts every significant digit a second time on top
 /// of the zero run after the point. So a value of `d` significant digits at decimal exponent `-E`
 /// must fit `1 + 2·d + E` into `center_text_max_len` (79) even though its text is far shorter — the
-/// 37-character reference centre already asks for 68. Measured crossovers: a 34-digit mantissa
+/// 36-character reference centre already asks for 68. Measured crossovers: a 34-digit mantissa
 /// takes the exponent form from 1e-11, a 35-digit one from 1e-9. That is a property of THIS call,
 /// not of `f128`, of decimal text, or of how deep a decimal string can name a centre: `src/ui/`'s
 /// `editor.decimalIfExact` renders into a generous scratch and then length-checks the ACTUAL

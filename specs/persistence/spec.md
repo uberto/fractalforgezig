@@ -14,7 +14,8 @@ else. A file that has been damaged must say so and change nothing.
 
 ### Requirement: Saved view fidelity
 
-The system SHALL save and restore the view center and side as JSON numbers, to the precision of a 64-bit float.
+The system SHALL save and restore the view center without loss of precision at any supported depth,
+writing it as a decimal string, and SHALL still load files that carry the center as a JSON number.
 
 #### Scenario: The saved view comes back as it went in
 
@@ -27,6 +28,18 @@ The system SHALL save and restore the view center and side as JSON numbers, to t
 - **WHEN** a saved file is applied to a running app
 - **THEN** the app's view is the one the file was saved from
 - **Test**: `src/fractal/persist.zig::applyToEngine: loaded state matches original engine`
+
+#### Scenario: A deep view saves and reopens exactly
+
+- **WHEN** a view at side 1e-25 with a full-precision center is saved and the file reopened
+- **THEN** the restored center equals the saved center exactly, digit for digit
+- **Test**: `src/fractal/persist.zig::acceptance: a deep center round-trips through JSON exactly`
+
+#### Scenario: A file written before this milestone still opens
+
+- **WHEN** a `.fractal` file whose center is a JSON number is opened
+- **THEN** it loads successfully and the view center is that number
+- **Test**: `src/fractal/persist.zig::acceptance: a legacy numeric center still parses`
 
 ### Requirement: The whole picture is saved
 
@@ -92,4 +105,8 @@ running app's view and palette untouched.
 
 - The Save and Open menu items and the system file dialog they open belong to `app-shell`.
 - The file carries no version field; M5 recorded "no file format versioning / migration" as a
-  deliberate non-goal.
+  deliberate non-goal. Deep zoom kept that non-goal: the centre is now written as a decimal string
+  and **both** spellings — string and JSON number — are accepted on load, instead of a version
+  field being introduced.
+- The precision the centre must survive at comes from `deep-zoom`'s **Full-precision view
+  coordinates**; the side stays a JSON number.

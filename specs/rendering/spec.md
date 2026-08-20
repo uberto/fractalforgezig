@@ -94,7 +94,8 @@ the view was to compute.
 
 ### Requirement: Adaptive iteration count
 
-The system SHALL raise the iteration count automatically as the view is magnified, from 512 at the home view up to a ceiling of 4096 reached at the deepest resolvable zoom.
+The system SHALL raise the iteration count automatically as the view is magnified, from 512 at the
+home view up to a ceiling of 65536 reached at the deepest resolvable zoom.
 
 #### Scenario: The home view keeps its baseline count
 
@@ -116,10 +117,12 @@ The system SHALL raise the iteration count automatically as the view is magnifie
 
 #### Scenario: The ramp spans the whole usable zoom range
 
-- **WHEN** the automatic policy is asked for the count at the deepest resolvable zoom
-- **THEN** it has reached, and stops at, the ceiling — so the ramp climbs across the entire range
-  the user can actually zoom through
-- **Test**: `src/fractal/autoiter.zig::the ramp spans the whole f64-usable zoom range, capping at the precision floor`
+- **WHEN** the automatic policy is asked for the iteration count at the home view, and at the
+  deepest supported side
+- **THEN** it yields 512 at the home view and 65536 at the floor, and never decreases as
+  magnification grows
+- **Test**: `src/fractal/autoiter.zig::acceptance: the auto ramp spans home to the precision floor`
+- **Test**: `src/fractal/autoiter.zig::the ramp spans the whole usable zoom range, capping at the precision floor`
 
 ### Requirement: Pinned iteration count
 
@@ -226,3 +229,12 @@ had, and stay usable.
   the automatic ramp tops out is the same depth `navigation`'s **Zoom depth limit** warns about.
 - Whether iteration runs on the CPU or the GPU is `gpu-acceleration`'s concern; both backends
   satisfy **Reproducible image** and **Colour edits never re-iterate**.
+- How a view below ~1e-13 gets any detail to iterate at all is `deep-zoom`'s concern; the ramp's
+  ceiling is calibrated to that capability's 1e-30 floor. A deep pass is expensive: at the app's
+  window size a 1e-30 view takes minutes of chunks, and the auto ramp deliberately overshoots the
+  minimum count a depth needs.
+- **What "never unresponsive" covers, and what it does not.** During a pass the image, the progress
+  bar and the wheel (which cancels and re-arms) stay live, but the whole data panel is disabled
+  until the pass finishes or is cancelled. So at deep depths a palette edit cannot be *made*
+  through the UI while a pass runs: **Colour edits never re-iterate** is a promise about what the
+  engine does when such an edit arrives, and it is pinned at engine level, not through the panel.

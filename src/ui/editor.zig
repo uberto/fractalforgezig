@@ -222,7 +222,7 @@ const max_f128_digits = 36;
 /// Scratch for the decimal rendering, NOT the field: `std.fmt.float.render`'s decimal mode
 /// rejects a buffer that cannot hold its conservative bound — the leading `0.`, the zero run
 /// after the point AND every significant digit again (`req_bytes` in `std/fmt/float.zig`) — so
-/// the 37-character reference centre demands 68 bytes even though it prints in 37. That bound
+/// the 36-character reference centre demands 68 bytes even though it prints in 36. That bound
 /// exceeds the text by at most the digit count, so this size renders every text that can fit a
 /// coordinate field; whether it FITS is then a plain length check.
 const decimal_scratch_len = viewport.coord_text_buf_len + max_f128_digits;

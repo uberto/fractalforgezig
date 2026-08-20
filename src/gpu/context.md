@@ -33,7 +33,7 @@ BAND CONTRACT (both paths): `iter_out.len == width*band_rows`, band-LOCAL (row `
 index 0); `height` is ALWAYS the FULL image height (image-anchored mapping); a band past
 the last row is REJECTED (`BandOutOfBounds`), never clamped; zero rows = no-op.
 
-### Deep path (M6)
+### Deep path
 
 `mandelbrot_iterate_deep` transliterates `fractal/perturb.iterateDelta` — per-pixel `float`
 DELTAS from the centre, Zhuoran rebasing, same escape test and smoothing tail. Never re-derive
@@ -49,14 +49,14 @@ nothing here may cache it.
 (`side < perturb.gpu_floor_side`) or `OrbitTooLongForGpu` (`> perturb.gpu_max_orbit_len`);
 the engine checks the same rule first (defence in depth).
 `float` deltas hold 24 bits: a few of 256 pixels differ from the CPU by hundreds of iterations
-at 1e-20 — input quantization, NOT kernel error (see the agreement tests).
+at 1e-20—input quantization, NOT kernel error (see the agreement tests).
 
 ### MSL slot order (critical)
 
 SDL_GPU assigns ONE order: uniforms, then READ-ONLY storage, then READ-WRITE last.
 Shallow: uniforms `buffer(0)`, `iter_out` `buffer(1)`. Deep: uniforms `buffer(0)`, `orbit`
 `buffer(1)`, `iter_out` `buffer(2)`. A wrong order does not fail — zeros, flat image.
-`half` is a reserved MSL type; use `side_half`.
+`half` is a reserved MSL type; suffix instead (`w_half`, `h_half`).
 
 ## Gotchas
 

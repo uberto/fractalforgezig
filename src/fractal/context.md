@@ -12,10 +12,10 @@ Decoupling:ITERATE ONCE into a persistent `[]f32`;palette edits rerun ONLY CHEAP
 ## Precision split
 
 `ComplexHi{re,im:f128}`+`.lo()`=where the view IS;`Complex`/`Viewport`=a pixel RELATIVE to
-it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset in f64,added
+it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset f64,added
 ONCE onto the centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
 `mandelbrot.iterateExact`. `Viewport`,`iterbuf`,`mandelbrot`,GPU stay f64
-end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
+end-to-end⇒shallow renders bit-identical to pre-M6.
 
 ## Modules
 
@@ -26,23 +26,23 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
   `degenerateRegionMessage(buf[message_buf_len],what,value)`. `center()`→`ComplexHi`,
   `centerLo()`→`Complex`. `pixelToComplex(px,py,S)`/`complexToPixel(c,S)`,hi twins
   `pixelToComplexHi`/`rectPixelToComplexHi(px,py,w,h)`;
-  `cursorCoord(wx,wy,ImageRect{x,y,side})`→`?ComplexHi`(null on letterbox);
+  `cursorCoord(window_x,window_y,ImageRect{x,y,side})`→`?ComplexHi`(null on letterbox);
   `imageViewport(S)`→`Viewport`. Readout:`coordDigits(mag)`→
   `formatCoord(buf[coord_buf_len],ComplexHi,mag)`,`max_coord_digits`=34;`coord_text_buf_len`=UI
   buffers. Warn-only zoom floor HERE:`precision_floor_side`(1e-30=f128-CENTRE limit,NOT
   f64),`atPrecisionFloor(v)`(strict `<`),
   `precisionFloorMessage(buf[floor_message_buf_len],side)`.
-  RECT render:`rectViewport(w,h)`(scale=`side/min(w,h)`),
+  RECT render:`rectViewport(w,h)`,
   `Viewport.complexToPixel(pt)`+`pixelIndex(pt)→?usize`(null off-image),NOT the square map.
-  ASPECT:`fitImageRect(rx,ry,rw,rh,tex_w,tex_h)`=LETTERBOX fit(`scale=min(rw/tw,rh/th)`);that
+  ASPECT:`fitImageRect(region_x,region_y,region_w,region_h,tex_w,tex_h)`=LETTERBOX fit;that
   centred rect drives drawing+mapping,NEVER a stretch.
-- `navigate.zig`—transforms→a NEW `SquareView`;`factor` scales the SIDE(`<1`=zoom IN).
+- `navigate.zig`—transforms→NEW `SquareView`;`factor` scales the SIDE(`<1`=zoom IN).
   `zoomAbout(v,anchor:ComplexHi,f)` pins `anchor` to its pixel;`zoomCentered(v,point,f)`
   recenters;`panByPixels(v,dpx,dpy,S)` moves the VIEW(pass NEGATED mouse delta);
-  `boxSelect(v,a,b,S)` square-snaps a drag;`reset()`=`defaultView()`.All→`DegenerateRegion` on
+  `boxSelect(v,a,b,S)` square-snaps drags;`reset()`=`defaultView()`.All→`DegenerateRegion` on
   bad input/`S==0`/overflow. RE-EXPORTS viewport's 4 floor names.
 - `refine.zig`—`decidePass(interacting,idle_ns,full_pass_done)`→
-  `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150 ms.
+  `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150ms.
 - `autoiter.zig`—`max_iter` policy;READ,never re-derive. QUADRATIC ramp,
   `d=@max(0,log2(mag/default_magnification))`:`autoMaxIter(mag) !u32`=
   `clamp(base_max_iter(512)+iter_per_doubling_squared·d²,512,auto_max_iter(65536))`
@@ -50,30 +50,31 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
   `iter_per_doubling_squared`=comptime-DERIVED(`floor_doublings`,`floor_magnification`)⇒the
   ceiling hits `viewport.precision_floor_side` EXACTLY;NEVER hard-code it. 65536 caps the RAMP
   only;PINNED reach `max_manual_iter`(2^24,f32-exact). 1e-30 iterates most pixels to
-  `max_iter`:ACCEPTED,never lower the ceiling.
+  `max_iter`:ACCEPTED,never lower it.
   `IterPolicy{auto=true,manual_value=512}`:`manual(v)` demands
   `[min_manual_iter(16),max_manual_iter]`,else `MaxIterOutOfRange`;
   `effective(mag)`=ramp if `auto` else `clampManual(v)`.
   `maxIterRangeMessage(buf,v)`,`policySummary(buf,policy,mag)`.
 - `mandelbrot.zig`—`iterate(c_re,c_im,max_iter) f32`→smooth escape else
   `interior_sentinel`(-1.0). `iterateExact(f128,f128,max_iter)`=the SAME algorithm in f128,
-  TEST-ONLY ground truth,NEVER in a renderer.
+  TEST-ONLY,NEVER in a renderer. TRUST it only to ~1e-20(own drift 514 iterations at
+  1e-25,8175 at 1e-31)—deeper,use the f128 PERTURBATION ladder.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
   (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL it,never restate it.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.
   `ReferenceOrbit.compute(alloc,center:ComplexHi,max_iter)` f128-iterates the CENTRE,stores
-  `Z_0..Z_k` as f64 `re`/`im`;`len()`,`deinit(alloc)`,`capacity`=allocation(slices TRIMMED if
+  `Z_0..Z_k` as f64 `re`/`im`;`len()`,`deinit(alloc)`,`capacity`=allocation(TRIMMED if
   the centre escapes);`re[0]=im[0]=0`(`Z_0`),`re[1]`=C;→`OrbitError.NonFiniteCenter`.
   `iterateDelta(orbit BY VALUE,dc_re,dc_im,max_iter) f32`:`δ←2·Z_m·δ+δ²+δc`,escape on
   `|Z_m+δ|²>4`,f64 THROUGHOUT(NEVER widen),coloured by `smoothEscapeValue`⇒comparable to
   `iterate`. REBASE(Zhuoran) if `|Z_m+δ|<|δ|`/`m+1==len()`:`δ←Z_m+δ`,`m←0`—EXACT(`Z_0=0`);
   ONE orbit/render. `pathSummary(buf,side,used_deep)`/`path_summary_buf_len`.
-  T6:`gpu_floor_side`(1e-20),`gpu_max_orbit_len`(2^17),`FallbackReason`+
+  GPU:`gpu_floor_side`(1e-20),`gpu_max_orbit_len`(2^17),`FallbackReason`+
   `gpuFallbackMessage(buf,reason)`/`fallback_message_buf_len`.
-- `gradient.zig`—`Stop{pos:f32∈[0,1],color:Rgba8}`;ASCENDING fixed-cap array(`max_stops`=32):
+- `gradient.zig`—`Stop{pos:f32∈[0,1],color:Rgba8}`;ASCENDING,cap `max_stops`=32:
   `fromStops`,`stops()`,`bakeLut(g,out:*[lut_size=1024]Rgba8)`,`default()`.
 - `mapping.zig`—`Mode{linear,log,cyclic}`;`Params{mode,period=default_period(32.0)}`
-  (cyclic-only,>0);`mapToUnit(smooth,max_iter,params)` CLAMPED [0,1);bad→0.
+  (cyclic-only,>0);`mapToUnit(smooth,max_iter,params)` CLAMPED[0,1);bad→0.
 - `iterbuf.zig`—ITERATION only. `iterationBufferLen(vp)`=w*h;`iterateInto(buf,vp,max_iter)`
   PURE(pixel centers;bad `buf.len`→`BufferSizeMismatch`);
   `iterateRowsInto(buf,vp,max_iter,y0,rows)` band-only/composable,
@@ -83,23 +84,23 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
   twin:SAME band-local contract/errors,offsets f64 ONLY(NEVER f128),`perturb.iterateDelta` per
   pixel,SAME sample points as `iterateBandInto`(test-pinned).
 - `progressive.zig`—PURE chunk scheduler+upsampler.
-  `Pass{rows_total,rows_done,chunk_rows}`: `fraction()`,`done()`,`nextChunk()`(never 0),
+  `Pass{rows_total,rows_done,chunk_rows}`:`fraction()`,`done()`,`nextChunk()`(never 0),
   `advance(rows,elapsed_ns)`. `adaptChunkRows(rows,elapsed_ns,target_ns)`→
-  `target_chunk_ns`(0.5 s REPAINT budget),≤4×/step,clamped `1..max_chunk_rows`;
+  `target_chunk_ns`(0.5s budget),≤4×/step,clamped `1..max_chunk_rows`;
   `initial_chunk_rows`=4. `progressLabel(buf[progress_label_buf_len],f)`→`"rendering 42%"`.
-  `upsampleInto(dst,dw,dh,src,sw,sh)`=nearest-neighbour BLOCKY preview.
+  `upsampleInto(dst,dst_w,dst_h,src,src_w,src_h)`=nearest-neighbour BLOCKY preview.
 - `colorpass.zig`—`colorInto(rgba,iter,lut,max_iter,params,interior)` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write;sentinel→`interior`;alpha FORCED 255.
 - `engine.zig`—DECOUPLING crux. Owns `view`,`image_side`,`policy`,DERIVED `max_iter`,
   `iter:[]f32`/`rgba:[]u8`,`gradient`+`lut`,`params`,`interior`,`iteration_passes`/`color_passes`.
   `use_gpu`+`gpu_iter_fn:?IterFn(view,w,h,max_iter,y0,rows,band,orbit)`=one BAND/call;
   BOTH backends chunk;a failed band→CPU.`init` does NOT iterate.
-  PATH CHOICE HERE:`usesDeepPath()`(`side<=perturb.threshold_side`);`iterate`+
+  PATH CHOICE HERE:`usesDeepPath()`;`iterate`+
   `stepPassRows` both dispatch via ONE private `cpuIterateBand`.`ensureOrbit` builds ONE
   `ReferenceOrbit` per render(lazy;`orbit_computations` counts),`orbitPtr()` borrows it,
   EVERY boundary(`iterate`,`beginPass`,`cancelPass`,`finishPass`,`deinit`)FREES it—never
-  cache it.A non-null `orbit` obliges a backend to iterate DEEP or RETURN an
-  error(engine warns,CPU finishes that band).
+  cache it.A non-null `orbit` OBLIGES the backend:iterate DEEP or RETURN an
+  error(engine warns,CPU finishes the band).
   `pathSummary(buf)`+`path_summaries`=1/completed render;`IterateError` folds
   `OrbitFailure`→`orbitFailureMessage(buf[orbit_message_buf_len],err,side,max_iter)`.
   `setViewport`/`setPolicy`/`resize` re-iterate(bump BOTH counters);
@@ -114,7 +115,7 @@ end-to-end⇒shallow renders bit-identical to pre-M6. `side` f64.
   `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
   setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
   (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=LOSSY<1).
-  PLAIN or e-notation(deep centres OFTEN e-form);both EXACT,NEVER prune that fallback.
+  PLAIN or e-notation(deep centres CAN take e-form);both EXACT,NEVER prune that fallback.
   NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
   number(pre-M6),RAW digits→f128,NEVER drop that branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.

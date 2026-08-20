@@ -152,7 +152,8 @@ able to say what was wrong with it — never applying a broken view or crashing.
 
 ### Requirement: Zoom depth limit
 
-The system SHALL warn the user, without refusing the navigation, when the view side goes below 1e-13, the depth at which double-precision coordinates stop resolving detail.
+The system SHALL warn the user, without refusing the navigation, when the view side goes below
+1e-30, the depth at which the extended-precision center stops resolving detail.
 
 #### Scenario: Crossing the floor still navigates, and is flagged
 
@@ -160,19 +161,22 @@ The system SHALL warn the user, without refusing the navigation, when the view s
 - **THEN** the zoom succeeds and the view is flagged as past the limit
 - **Test**: `src/fractal/navigate.zig::a zoom that crosses the precision floor still succeeds but is flagged`
 
-#### Scenario: Ordinary depths are not flagged
+#### Scenario: The warning fires only past the new floor
 
-- **WHEN** the view is the home view, or is just above the limit
-- **THEN** it is not flagged, so the warning cannot cry wolf across the usable range
-- **Test**: `src/fractal/navigate.zig::atPrecisionFloor does not flag the default view`
-- **Test**: `src/fractal/navigate.zig::atPrecisionFloor does not flag a side just above the floor`
+- **WHEN** the view side is 1e-20
+- **THEN** no precision-floor warning is raised; and when the side is 1e-31, the warning is
+  raised
+- **Test**: `src/fractal/navigate.zig::acceptance: the precision floor sits at 1e-30`
+- **Test**: `src/fractal/viewport.zig::atPrecisionFloor does not flag the default view`
+- **Test**: `src/fractal/viewport.zig::atPrecisionFloor does not flag a side just above the floor`
 
 #### Scenario: The warning is actionable
 
 - **WHEN** the warning is raised
 - **THEN** it names the offending view extent, the limit crossed, what the user will see, and what
   to do about it
-- **Test**: `src/fractal/navigate.zig::precisionFloorMessage names the offending side, the limit and what to do`
+- **Test**: `src/fractal/viewport.zig::precisionFloorMessage names the offending side, the 1e-30 limit and what to do`
+- **Test**: `src/fractal/navigate.zig::acceptance: past the precision floor the view is still accepted and the warning is actionable`
 
 ## Notes
 
@@ -180,3 +184,6 @@ The system SHALL warn the user, without refusing the navigation, when the view s
   cursor is read through, belong to `view-coordinates`.
 - The depth the **Zoom depth limit** names is the same depth at which `rendering`'s **Adaptive
   iteration count** stops climbing.
+- The limit is a warning only: nothing clamps the side, and a view below it still renders. What
+  makes depths between 1e-13 and 1e-30 usable at all is `deep-zoom`; keeping a gesture's centre
+  exact at those depths is `deep-zoom`'s **Deep navigation keeps its precision**.

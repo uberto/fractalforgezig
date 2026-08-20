@@ -54,6 +54,13 @@ pub fn iterate(c_re: f64, c_im: f64, max_iter: u32) f32 {
 /// wire it to a renderer or a GPU path. Its job is to say what the right answer *is*, so
 /// `perturb.zig`'s deep path can be measured against it (M6/T3). The deep render path is
 /// `perturb.iterateDelta`, which is `f64` throughout.
+///
+/// TRUST IT ONLY TO ~1e-20. Measured at the milestone reference centre, its own drift against the
+/// same algorithm run as an `f128` PERTURBATION ladder is 514 iterations at 1e-25, 1322 at 1e-30
+/// and 8175 at 1e-31, while the shipped `f64`-delta path tracks that ladder to ~1 iteration. So
+/// below ~1e-20 a disagreement is more likely THIS function's error than the renderer's, and the
+/// accuracy budgets in the deep tests are dominated by oracle error. Verify deeper work against
+/// an `f128` perturbation ladder, not against this.
 pub fn iterateExact(c_re: f128, c_im: f128, max_iter: u32) f32 {
     return iterateIn(f128, c_re, c_im, max_iter);
 }

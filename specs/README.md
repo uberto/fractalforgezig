@@ -16,6 +16,7 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 |---|---|
 | [rendering](rendering/spec.md) | Mandelbrot iteration, smooth escape values, the iteration/colour decoupling, the adaptive and pinned iteration counts, progressive refinement. |
 | [navigation](navigation/spec.md) | Cursor-anchored zoom, centered zoom, pan, box-select, reset, refusal of impossible gestures, the zoom depth limit warning. |
+| [deep-zoom](deep-zoom/spec.md) | Perturbation rendering below the double-precision floor down to a side of 1e-30, accuracy against full-precision iteration, GPU deep zoom with logged CPU fallback, 34-digit view coordinates, precision-preserving navigation at depth. |
 | [view-coordinates](view-coordinates/spec.md) | The square view model, the centre/magnification and corner duals, pixel↔complex mapping, aspect-preserving display, the coordinate readout's precision. |
 | [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, the interior colour, opaque output. |
 | [gpu-acceleration](gpu-acceleration/spec.md) | GPU iteration agreeing with the CPU, banded dispatch, CPU fallback on GPU failure, the user's backend choice. |
@@ -31,9 +32,19 @@ omits anything the code does not do. Scenarios marked `_not pinned by a test_` d
 behavior that only a manual smoke run verifies today (the ImGui and file-dialog glue tiers, which
 carry no unit tests by design — see `src/ui/context.md`).
 
+Milestone `m6-deep-zoom` then added the `deep-zoom` capability and rewrote the three requirements
+it changed: `persistence`'s **Saved view fidelity** (the centre is now a decimal string),
+`navigation`'s **Zoom depth limit** (the floor moved seventeen decades deeper, to 1e-30) and
+`rendering`'s **Adaptive iteration count** (the ceiling rose with it, to 65536).
+
 ## Verification
 
-- `zig build test` — the fast pure tier; runs every test cited from `src/fractal/**`,
-  `src/gpu/message.zig`, `src/ui/stats.zig`, `src/ui/editor.zig` and `src/root.zig`.
-- `zig build test-gpu` — the GPU tier; runs every test cited from `src/gpu_headless_test.zig`.
+- `zig build test` — **both** tiers. The pure tier runs every test cited from `src/fractal/**`,
+  `src/gpu/message.zig`, `src/ui/stats.zig`, `src/ui/editor.zig`, `src/root.zig` and
+  `src/deep_zoom_test.zig`; it then runs the GPU tier below.
+- `zig build test-gpu` — the GPU tier alone; runs every test cited from
+  `src/gpu_headless_test.zig`. It needs a real Metal device and skips silently without one, so a
+  skip must not be read as a pass.
 - `zig build run` — the manual smoke run the unpinned scenarios rely on.
+- Read each gate's exit code separately: a test that calls `std.log.err` makes the runner print
+  success while exiting 1.

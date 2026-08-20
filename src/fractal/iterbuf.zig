@@ -549,8 +549,11 @@ test "at the switch threshold every pixel of the deep band is within 1.0 iterati
     // Not a duplicate of `perturb.zig`'s grid test: that one drives `iterateDelta` with
     // hand-written offsets, this one drives the whole BAND — so it is the band's geometry
     // (`pixelOffset`, the `+0.5`, the negated `im`, the shared `scale`) that is being measured
-    // against ground truth. A half-pixel shift or a vertical flip fails here by tens of
-    // iterations; the measured worst case on correct code is 0.0117, ~85× inside the bound.
+    // against ground truth. Know what this canNOT catch: `exactAt` maps its pixel through the
+    // SAME `pixelOffset`, so a CONSISTENT geometry error — a half-pixel shift, a vertical flip —
+    // cancels on both sides and leaves this test green. The bit-exact geometry pin is
+    // `pixelOffset is exactly the offset half of Viewport.pixelToComplex` above; keep it.
+    // The measured worst case here on correct code is 0.0117, ~85× inside the bound.
     var f = try deepFixture(perturb.threshold_side, deep_iter);
     defer f.orbit.deinit(std.testing.allocator);
 
