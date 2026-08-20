@@ -240,10 +240,14 @@ comptime {
 /// else the shortest-round-trip exponent form (`3.7e-33`). Both name the value exactly, so
 /// `parseCoordHi` returns the identical `f128` — which is what a user pasting a coordinate back
 /// depends on. A FIXED number of decimals is what does NOT work: `{d:.34}` prints on an absolute
-/// 1e-34 grid, coarser than the `f128` ulp for |value| < 1 (~1.2e-35 near the reference centre
-/// 0.13), so neighbouring centres collapse onto one text and anything below the grid prints as
-/// `0.0`. `viewport.max_coord_digits` is the READOUT's digit budget (`viewport.formatCoord`,
-/// status bar), not a losslessness guarantee; nothing here cuts the editable text to
+/// 1e-34 grid, coarser than the `f128` ulp for |value| < 1 (measured with `nextAfter`: 2.41e-35 =
+/// 2^-115 at the reference centre's 0.1318…, so the grid is 4.15× coarser there — NOT ~1.2e-35,
+/// which is 2^-116 and would mean 116 significand bits; `f128` has 113, and the ulp changes with
+/// the binade, 9.63e-35 = 2^-113 at the centre's -0.7436…). So neighbouring centres collapse onto
+/// one text — walking 1000 consecutive `f128` values upward from 0.1318…, 759 of them print the
+/// same 34 decimals as their neighbour — and anything below the grid prints as `0.0`.
+/// `viewport.max_coord_digits` is the READOUT's digit budget (`viewport.formatCoord`, status bar),
+/// not a losslessness guarantee; nothing here cuts the editable text to
 /// `coordDigits(magnification)`, which would drop real digits (29 decimals at side 1e-25).
 ///
 /// Rendering goes through `std.fmt.float.render` rather than `{d}`, deliberately. `{d}` renders

@@ -354,7 +354,13 @@ pub const min_coord_digits: usize = 4;
 ///
 /// This cap is NOT a losslessness guarantee. `{d:.34}` fixes 34 decimals AFTER the point, which
 /// is not 34 SIGNIFICANT digits: for |v| < 1 that absolute 1e-34 grid is coarser than the `f128`
-/// ulp (~1.2e-35 near the reference centre), so a fixed-decimal render can drop real digits.
+/// ulp, so a fixed-decimal render can drop real digits. The ulp is PER-BINADE, so there is no one
+/// figure — measured here with `nextAfter` in real `f128`: the reference centre's real part
+/// -0.7436… lies in [2^-1, 2^0) with ulp 2^-113 = 9.63e-35, only 1.04× finer than the grid; its
+/// imaginary part 0.1318… lies in [2^-3, 2^-2) with ulp 2^-115 = 2.41e-35, 4.15× finer. Walking
+/// 1000 consecutive `f128` values upward from each, 37 and 759 of them respectively fail a
+/// `{d:.34}` → `parseFloat(f128, …)` round trip. Do not reinstate a "~1.2e-35 ulp" here: that is
+/// 2^-116, i.e. 116 significand bits, and `f128` has 113. Re-measure, do not copy.
 /// Two distinct contracts came out of that, and they must stay distinct:
 ///   * the READ-ONLY readout formats `coordDigits(mag)` decimals, capped here at 34 — a display
 ///     budget, enough to separate adjacent pixels at the 1e-30 floor (`formatCoord`);

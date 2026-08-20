@@ -134,6 +134,19 @@ box-select gestures, so navigation at depth does not silently snap back to doubl
   and box-select, which carry no approved scenario of their own; they are pinned at unit tier by
   `src/fractal/navigate.zig::panByPixels at depth shifts the center by the documented one-pixel distance`
   and `src/fractal/navigate.zig::boxSelect keeps a deep selection's two corners apart instead of collapsing them`.
+- **Which test discriminates "no glitch artifacts".** Glitches are suppressed by rebasing —
+  re-anchoring a pixel's offset on the start of the reference orbit (mechanism:
+  `src/fractal/context.md`). Of *Perturbation accuracy*'s two scenarios, only the
+  **switch-threshold** one pins it. Measured by disabling rebasing's dominance trigger: at side
+  1e-6 the output moves on 5 of 256 sampled pixels, the worst by 69 iterations, so that scenario's
+  per-pixel 1.0-iteration assertion fails; at side 1e-25 it moves 1 of 256 pixels by 0.12
+  iterations and changes no classification, so both of the extreme-depth assertions — exact
+  classification, mean under 5.0 — still hold and that test stays green. This is NOT because the
+  branch goes unreached at 1e-25: it fires 1457 times across 250 of those 256 pixels (4106 across
+  251 at 1e-6). Rebasing's second trigger, an exhausted reference orbit, fires in neither view and
+  is pinned separately at unit tier. The unit-tier pins for both triggers are
+  `src/fractal/perturb.zig::a pixel whose delta outgrows the reference still matches full precision`
+  and `src/fractal/perturb.zig::an orbit shorter than max_iter still classifies its neighbourhood correctly`.
 - **Ground truth caveat.** The full-precision comparison the accuracy scenarios use is
   `mandelbrot.iterateExact`, which is itself only trustworthy to about 1e-20: below that its own
   drift exceeds the deep path's. The accuracy budgets at 1e-25 are therefore dominated by oracle
