@@ -56,7 +56,7 @@ one `engine.stepPass()` per frame. `engine.pass!=null`→`SDL_PollEvent`; else
 ## Coord panel + ViewEditor
 
 `ViewEditor` (`editor.zig`, PURE, tested): center re/im+corner a/b re/im buffers are
-`coord_buf_bytes` (=`viewport.coord_text_buf_len`, 64 B); `mag_buf` 32 B; `auto_iter`;
+`coord_buf_bytes` (=`viewport.coord_text_buf_len`, 64 B); `mag_buf` SAME (F1); `auto_iter`;
 `manual_iter_buf`. COORDINATES are `f128`. `writeCoordHi`: `std.fmt.float.render`
 `.decimal` into a 100-B scratch, else `.scientific`; keep the decimal
 ONLY if re-parsing returns the identical `f128`. NEVER `{d}` an `f128`: std's float printer
@@ -70,9 +70,9 @@ via `coordFieldWidth()` so 34 decimals SHOW (`data_panel_w` 340).
 `parseAndApplyCenterMag`/`parseAndApplyCorners`→`?SquareView`, `parseIterPolicy`→`?IterPolicy`;
 null on failure. `drawCoordPanel` REQUESTS, never applies: returns `CoordRequest{view,policy}`;
 parse failure logs `.err` and re-syncs.
-KNOWN BUG (pre-M6, UNFIXED): `writeF64`'s terminator is CONDITIONAL and `mag_buf` only 32 B⇒a
-32-character magnification (≈43 zoom-outs, or side 4.31e-32…1.08e-32) is UNTERMINATED and clicking
-that field ABORTS in ImGui's `InputTextEx`.
+`writeF64`(F1) RESERVES the last byte like `writeCoordHi`⇒ALWAYS terminated,`.scientific` when the
+decimal will not fit; a CONDITIONAL terminator once left a 32-char magnification unterminated and
+clicking it ABORTED `InputTextEx`.
 
 ## File dialog: dialog.zig
 

@@ -123,8 +123,8 @@ fn lessByPos(_: void, a: gradient.Stop, b: gradient.Stop) bool {
 /// M6/T2: every COORDINATE buffer is `viewport.coord_text_buf_len` bytes — the one shared
 /// definition of "text long enough for a full-precision center" (a 34-significant-decimal
 /// signed number plus its terminator). Never hand-write a size here; a short buffer would
-/// truncate a deep coordinate on the way to the screen. The magnification is a plain `f64`
-/// and keeps its own smaller buffer.
+/// truncate a deep coordinate on the way to the screen. F1 gave the magnification field the
+/// same width: it is still an `f64`, but a 32-byte buffer could not hold its own readout.
 ///
 /// M6/T7: the NUMBER path through the coordinate buffers is `f128` end to end
 /// (`writeCoordHi` / `parseCoordHi`), so a 34-decimal center typed here reaches the view
@@ -136,7 +136,11 @@ pub const coord_buf_bytes = viewport.coord_text_buf_len;
 pub const ViewEditor = struct {
     center_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     center_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
-    mag_buf: [32]u8 = std.mem.zeroes([32]u8),
+    /// The magnification. Still an `f64` scale rather than a `ComplexHi` position — but the
+    /// same WIDTH as the coordinate fields (F1): its text can be 32 characters at the depths
+    /// this milestone opened and over 60 past them, and a field narrower than its own readout
+    /// is a field the user cannot type back into.
+    mag_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     corner_a_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     corner_a_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     corner_b_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
@@ -227,11 +231,19 @@ const max_f128_digits = 36;
 /// coordinate field; whether it FITS is then a plain length check.
 const decimal_scratch_len = viewport.coord_text_buf_len + max_f128_digits;
 
+/// Scratch for the MAGNIFICATION's decimal rendering (`writeF64`). Not a field size: it is
+/// `std.fmt.float`'s own conservative bound for an `f64` in decimal mode (347 bytes, enough
+/// for `5e-324`'s 326 characters), so the render never fails for want of room and "does the
+/// text fit the field" stays a plain length check on the result.
+const f64_decimal_scratch_len = std.fmt.float.bufferSize(.decimal, f64);
+
 comptime {
     // `writeCoordHi`'s exponent-form fallback must ALWAYS fit, terminator included, so its
     // `catch unreachable` really is unreachable: 53 bytes name any `f128` in scientific mode.
     std.debug.assert(viewport.coord_text_buf_len - 1 >= std.fmt.float.bufferSize(.scientific, f128));
     std.debug.assert(decimal_scratch_len >= std.fmt.float.min_buffer_size);
+    // The same guarantee for `writeF64`'s fallback, on the buffer it is actually handed (F1).
+    std.debug.assert(coord_buf_bytes - 1 >= std.fmt.float.bufferSize(.scientific, f64));
 }
 
 /// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
@@ -302,17 +314,39 @@ fn parseCoordHi(buf: []const u8) ?f128 {
     return std.fmt.parseFloat(f128, s) catch null;
 }
 
-/// Write an f64 value into a null-terminated text buffer using `"{d}"` format. Used for the
-/// MAGNIFICATION only (coordinates go through `writeCoordHi`).
+/// Write an `f64` into a null-terminated text buffer. Used for the MAGNIFICATION only
+/// (coordinates go through `writeCoordHi`, whose reserve-the-last-byte shape this copies).
+///
+/// F1 — TWO defects lived in the old three-line version, both of them reachable by scrolling:
+///   1. It terminated CONDITIONALLY (`if (s.len < buf.len) buf[s.len] = 0`), so a text exactly
+///      as long as the buffer left NO terminator. ImGui's `InputTextEx` asserts on that
+///      (`"Is your input buffer properly zero-terminated?"`) and the process ABORTS — with
+///      asserts compiled out it is an overflowing `memcpy` instead. So the last byte is now
+///      reserved for the terminator and nothing renders into it: unconditional, like
+///      `writeCoordHi`.
+///   2. On overflow it wrote a bare `"0"` — terminated and safe, but a flat lie the user
+///      cannot type back. The fallback is now the shortest EXPONENT form, which names the same
+///      `f64` and always fits (`bufferSize(.scientific, f64)` = 53 < the field), so every
+///      magnification the panel shows is a value `parseF64` returns unchanged.
+///
+/// `buf` must have room for the exponent form plus its terminator; `mag_buf` is
+/// `coord_buf_bytes` (64) and the comptime block above pins that.
 fn writeF64(buf: []u8, value: f64) void {
-    const s = std.fmt.bufPrint(buf, "{d}", .{value}) catch {
-        // If the value somehow doesn't fit (shouldn't happen for f64), write "0".
-        buf[0] = '0';
-        buf[1] = 0;
-        return;
-    };
-    // Null-terminate after the written content.
-    if (s.len < buf.len) buf[s.len] = 0;
+    std.debug.assert(buf.len >= std.fmt.float.bufferSize(.scientific, f64) + 1);
+    // The last byte is the terminator's; nothing may render into it.
+    const room = buf[0 .. buf.len - 1];
+    var scratch: [f64_decimal_scratch_len]u8 = undefined;
+    // Plain decimal while it fits the field — `0.0884` reads better than `8.84e-2`.
+    if (std.fmt.float.render(&scratch, value, .{ .mode = .decimal })) |s| {
+        if (s.len <= room.len) {
+            @memcpy(room[0..s.len], s);
+            buf[s.len] = 0;
+            return;
+        }
+    } else |_| {}
+    // Never errors: `room` is asserted above to hold the scientific form.
+    const e = std.fmt.float.render(room, value, .{ .mode = .scientific }) catch unreachable;
+    buf[e.len] = 0;
 }
 
 /// Parse an f64 from a null-terminated buffer. Returns null on failure.
@@ -761,6 +795,105 @@ test "the magnification field still round-trips at the precision floor" {
     var ve = ViewEditor.initFromView(view);
     const applied = ve.parseAndApplyCenterMag() orelse return error.TestUnexpectedResult;
     try testing.expectEqual(view.magnification(), applied.magnification());
+}
+
+// ─── F1: the magnification field's terminator and its width ───────────────────
+//
+// The defect these pin: `writeF64` terminated CONDITIONALLY, so a magnification whose text
+// was exactly as long as `mag_buf` left the field unterminated — ImGui's `InputTextEx`
+// asserts on that and the process aborts. Every boundary below is MEASURED from the buffer's
+// own length and the formatter's own output, never quoted: a fixture picked by hand is how
+// this bug survived a whole milestone of tests that named `mag_buf`.
+
+/// The plain-decimal text length of `value`, measured through the same renderer the field
+/// uses. The tests derive their fixtures from this rather than counting characters by eye.
+fn decimalTextLen(value: f64) usize {
+    var scratch: [f64_decimal_scratch_len]u8 = undefined;
+    const s = std.fmt.float.render(&scratch, value, .{ .mode = .decimal }) catch
+        return f64_decimal_scratch_len;
+    return s.len;
+}
+
+/// A magnification whose plain-decimal text is EXACTLY `len` characters long, found by
+/// walking the powers of ten and measuring each one. Null when no power of ten in `f64`'s
+/// range renders at that length. Derived, so it follows `mag_buf` if the buffer is ever
+/// resized again.
+fn magnificationWithTextLen(len: usize) ?f64 {
+    var e: i32 = -320;
+    while (e <= 308) : (e += 1) {
+        const m = std.math.pow(f64, 10.0, @as(f64, @floatFromInt(e)));
+        if (decimalTextLen(m) == len) return m;
+    }
+    return null;
+}
+
+/// The magnification text the field currently holds, as the C string ImGui would read.
+fn magText(ve: *const ViewEditor) []const u8 {
+    return sliceUntilNull(&ve.mag_buf);
+}
+
+test "the magnification field is terminated when its text exactly fills the buffer" {
+    var ve = ViewEditor{};
+    const exact = magnificationWithTextLen(ve.mag_buf.len) orelse return error.TestUnexpectedResult;
+    // The fixture is the exactly-full case because it was MEASURED to be, not assumed.
+    try testing.expectEqual(ve.mag_buf.len, decimalTextLen(exact));
+    writeF64(&ve.mag_buf, exact);
+    // No terminator anywhere in the field is what aborts ImGui's `InputTextEx`.
+    try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+}
+
+test "the magnification field is terminated one character either side of exactly full" {
+    var ve = ViewEditor{};
+    for ([_]usize{ ve.mag_buf.len - 1, ve.mag_buf.len + 1 }) |len| {
+        const m = magnificationWithTextLen(len) orelse return error.TestUnexpectedResult;
+        writeF64(&ve.mag_buf, m);
+        try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+    }
+}
+
+test "a magnification too long to spell in full is shown in exponent form, not as a bare zero" {
+    var ve = ViewEditor{};
+    const long = magnificationWithTextLen(ve.mag_buf.len + 1) orelse return error.TestUnexpectedResult;
+    writeF64(&ve.mag_buf, long);
+    // The old fallback wrote "0" — a terminated, safe, flatly wrong readout that also cannot
+    // be typed back. The field must still NAME the magnification it stands for.
+    try testing.expectEqual(long, parseF64(&ve.mag_buf) orelse return error.TestUnexpectedResult);
+}
+
+test "mag_buf is sized from the same shared constant as the coordinate buffers" {
+    const ve = ViewEditor{};
+    try testing.expectEqual(coord_buf_bytes, ve.mag_buf.len);
+}
+
+test "every magnification the zoom ladder can reach stays terminated and re-enterable" {
+    // The whole 2x notch ladder through the real view model, in BOTH directions, from views
+    // 3.5·2^40 wide (past the widest a wheel can now reach, so a typed magnification is
+    // covered too) down to 3.5·2^-300. M1's crash notch — 43 out from home, side 3.0786e13 —
+    // and the zoom-in state at side 1.08e-32 both fall on this ladder by construction.
+    var ve = ViewEditor{};
+    var k: i32 = -300;
+    while (k <= 40) : (k += 1) {
+        const side = std.math.ldexp(@as(f64, 3.5), k);
+        const view = try viewport.SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, side);
+        ve.syncFromView(view);
+        // Terminated inside its own bounds…
+        try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+        // …and what it shows is a name for the magnification it holds, short enough to type
+        // back into the field it came from.
+        try testing.expect(magText(&ve).len < ve.mag_buf.len);
+        try testing.expectEqual(view.magnification(), parseF64(&ve.mag_buf) orelse return error.TestUnexpectedResult);
+    }
+}
+
+test "the magnifications M1 crashed the app with are terminated and re-enterable" {
+    // Typed straight into the field, these are the one-step triggers M1 recorded: the first
+    // reached the unterminated (aborting) state, the second the bare-"0" state.
+    var ve = ViewEditor{};
+    for ([_]f64{ 2.2968209681316936e-14, 1.4355131050823085e-15 }) |mag| {
+        writeF64(&ve.mag_buf, mag);
+        try testing.expect(std.mem.indexOfScalar(u8, &ve.mag_buf, 0) != null);
+        try testing.expectEqual(mag, parseF64(&ve.mag_buf) orelse return error.TestUnexpectedResult);
+    }
 }
 
 test "ViewEditor.parseIterPolicy parses valid number" {

@@ -428,8 +428,8 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
     ig.igSeparatorText("Center / Mag");
     // Center Re / Center Im / Magnification — three spellings of one center+mag commit.
     const center_mag_ids = [_][*:0]const u8{ "re##cre", "im##cim", "mag##mag" };
-    // SLICES, not `*[32]u8`: M6 sized the coordinate buffers from
-    // `viewport.coord_text_buf_len` while the magnification kept its own smaller one.
+    // SLICES, not `*[64]u8`: the three buffers are one shared size since F1, but the loop
+    // reads `buf.len` for ImGui's `buf_size` rather than assuming it.
     const center_mag_bufs = [_][]u8{ &ve.center_re_buf, &ve.center_im_buf, &ve.mag_buf };
     for (center_mag_ids, center_mag_bufs) |label, buf| {
         ig.igSetNextItemWidth(field_w);

@@ -319,6 +319,11 @@ fn applyViewCoarse(
     real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
+    // A gesture that lands on the view already on screen is a no-op: re-installing it would
+    // re-render an identical image and stack up duplicate undo entries. This is the ORDINARY
+    // case at `navigate.max_view_side` (F1), where every further zoom-out notch saturates on
+    // the same view — and it was always true of a zero-delta drag.
+    if (std.meta.eql(new_view, engine.view)) return;
     historyPush(nav, engine.view);
     showViewCoarse(engine, nav, new_view, real_w, real_h, view_editor);
 }

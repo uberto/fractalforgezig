@@ -36,11 +36,12 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `Viewport.complexToPixel(pt)`+`pixelIndex(pt)→?usize`(null off-image),NOT the square map.
   ASPECT:`fitImageRect(region_x,region_y,region_w,region_h,tex_w,tex_h)`=LETTERBOX fit;that
   centred rect drives drawing+mapping,NEVER a stretch.
-- `navigate.zig`—transforms→NEW `SquareView`;`factor` scales the SIDE(`<1`=zoom IN).
+- `navigate.zig`—transforms→NEW `SquareView`;`factor` scales SIDE(`<1`=zoom IN).
   `zoomAbout(v,anchor:ComplexHi,f)` pins `anchor` to its pixel;`zoomCentered(v,point,f)`
   recenters;`panByPixels(v,dpx,dpy,S)` moves the VIEW(pass NEGATED mouse delta);
   `boxSelect(v,a,b,S)` square-snaps drags;`reset()`=`defaultView()`.All→`DegenerateRegion` on
-  bad input/`S==0`/overflow. RE-EXPORTS viewport's 4 floor names.
+  bad input/`S==0`/overflow. RE-EXPORTS viewport's 4 floor names. `max_view_side`(8.0)=WIDEST
+  view;the side-GROWING paths SATURATE,never error.
 - `refine.zig`—`decidePass(interacting,idle_ns,full_pass_done)`→
   `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150ms.
 - `autoiter.zig`—`max_iter` policy;READ,never re-derive. QUADRATIC ramp,
@@ -57,8 +58,7 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `maxIterRangeMessage(buf,v)`,`policySummary(buf,policy,mag)`.
 - `mandelbrot.zig`—`iterate(c_re,c_im,max_iter) f32`→smooth escape else
   `interior_sentinel`(-1.0). `iterateExact(f128,f128,max_iter)`=the SAME algorithm in f128,
-  TEST-ONLY,NEVER in a renderer. TRUST it only to ~1e-20(own drift 514 iterations at
-  1e-25,8175 at 1e-31)—deeper,use the f128 PERTURBATION ladder.
+  TEST-ONLY,NEVER in a renderer. TRUST it only to ~1e-20(drift 514 iter@1e-25,8175@1e-31)—deeper,use the f128 PERTURBATION ladder.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
   (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL it,never restate it.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.

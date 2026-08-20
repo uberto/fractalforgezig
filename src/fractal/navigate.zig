@@ -22,6 +22,10 @@
 //! UNLOGGED — the edge that accepted the gesture (T6) logs them, building the user-facing
 //! text with `viewport.degenerateRegionMessage`; a still-valid-but-unrenderable deep zoom
 //! is a warning instead, via `atPrecisionFloor` + `precisionFloorMessage`.
+//!
+//! THE TWO ENDS OF THE ZOOM RANGE ARE NOT SYMMETRIC, on purpose. Deep: `precision_floor_side`
+//! only WARNS, and the view still renders. Wide: `max_view_side` CLAMPS — every transform that
+//! can grow the side saturates there instead of returning an error (F1).
 const std = @import("std");
 const viewport = @import("viewport.zig");
 
@@ -51,12 +55,20 @@ pub const zoom_step_out: f64 = 2.0;
 /// anchor would make every scroll-zoom a no-op on the center. `factor` stays `f64`. A handful
 /// of `f128` operations per gesture; nothing here runs per pixel.
 pub fn zoomAbout(v: SquareView, anchor: ComplexHi, factor: f64) ViewportError!SquareView {
-    const f: f128 = factor;
+    const new_side = boundedSide(v.side, v.side * factor);
+    // ANCHOR vs BOUND: both hold, because the centre rides the factor the side ACTUALLY moved
+    // by rather than the one that was asked for. The anchor's offset from the centre measured
+    // in view widths — which is exactly its pixel — is preserved by scaling centre offset and
+    // side by the SAME number, so a clamped notch keeps the point under the cursor put and a
+    // notch at the bound (effective factor 1.0) returns the identical view. The bound wins on
+    // the SIDE; nothing has to give on the anchor.
+    const effective: f64 = if (new_side == v.side * factor) factor else new_side / v.side;
+    const f: f128 = effective;
     const new_center = ComplexHi{
         .re = anchor.re - (anchor.re - v.center_re) * f,
         .im = anchor.im - (anchor.im - v.center_im) * f,
     };
-    return SquareView.fromCenterSide(new_center, v.side * factor);
+    return SquareView.fromCenterSide(new_center, new_side);
 }
 
 /// Scale the view's side by `factor` AND recenter on `point` — the right-click "zoom in /
@@ -65,7 +77,7 @@ pub fn zoomAbout(v: SquareView, anchor: ComplexHi, factor: f64) ViewportError!Sq
 /// Takes the new center at full precision (M6), so a point picked one pixel off a deep
 /// view's center really becomes the new center.
 pub fn zoomCentered(v: SquareView, point: ComplexHi, factor: f64) ViewportError!SquareView {
-    return SquareView.fromCenterSide(point, v.side * factor);
+    return SquareView.fromCenterSide(point, boundedSide(v.side, v.side * factor));
 }
 
 /// Translate the view by a PIXEL delta measured on a square image of side `image_side` px,
@@ -105,10 +117,16 @@ pub fn panByPixels(v: SquareView, dpx: f64, dpy: f64, image_side: u32) ViewportE
 /// zero and the selection reads as a degenerate click.
 pub fn boxSelect(v: SquareView, a: Pixel, b: Pixel, image_w: u32, image_h: u32) ViewportError!SquareView {
     if (image_w == 0 or image_h == 0) return ViewportError.DegenerateRegion;
-    return SquareView.fromCorners(
+    const selected = try SquareView.fromCorners(
         v.rectPixelToComplexHi(a.x, a.y, image_w, image_h),
         v.rectPixelToComplexHi(b.x, b.y, image_w, image_h),
     );
+    // A drag can widen the view too: `rectViewport` fits the SHORTER axis to the side, so a
+    // wide window's full width spans several sides. Clamp the EXTENT and keep the selection's
+    // centre — the user's aim survives, only the width is bounded.
+    const bounded = boundedSide(v.side, selected.side);
+    if (bounded == selected.side) return selected;
+    return SquareView.fromCenterSide(selected.center(), bounded);
 }
 
 /// The home view the "Reset" action returns to: T1's `SquareView.defaultView()` (the square
@@ -128,6 +146,43 @@ pub const precision_floor_side = viewport.precision_floor_side;
 pub const atPrecisionFloor = viewport.atPrecisionFloor;
 pub const floor_message_buf_len = viewport.floor_message_buf_len;
 pub const precisionFloorMessage = viewport.precisionFloorMessage;
+
+// ─── The wide end: the maximum side (F1) ─────────────────────────────────────
+
+/// The widest view navigation will produce: zooming out SATURATES here instead of growing
+/// without bound (M1 reached side 3.08e13 — 4e12 times wider than the whole set — with 43
+/// scroll notches, at which point the magnification field's text overran its own buffer).
+///
+/// WHY 8.0, and why a clamp here while the DEEP end only warns:
+///   * The whole set fits inside `Re ∈ [-2.5, 1]`, `Im ∈ [-1.5, 1.5]`. A square of side 8
+///     centred on the home centre covers `Re ∈ [-4.75, 3.25]`, `Im ∈ [-4, 4]` — the set with
+///     better than 2x margin on every side. There is nothing beyond it to see.
+///   * It is strictly WIDER than the home view's 3.5 (so `reset()` is never clamped) with a
+///     full 2x notch of headroom (so the first zoom-out from home is still exactly 7.0), and
+///     it is a power of two, so the side ladder below it stays dyadic and exact.
+///   * The precision floor (`precision_floor_side`) warns and still renders because the user
+///     legitimately wants to go deeper than we can guarantee. This end is the opposite case:
+///     the request is meaningless, so it saturates rather than erroring — a zoom-out at the
+///     bound is a no-op, never a `ViewportError`. Do NOT make the two ends symmetric.
+pub const max_view_side: f64 = 8.0;
+
+/// The side a zoom may actually land on: `proposed`, except that a zoom may not WIDEN the
+/// view past `max_view_side`. Every side-changing transform in this module goes through here,
+/// so no navigation path can escape the bound.
+///
+/// Two deliberate pass-throughs:
+///   * A non-finite `proposed` is returned UNCHANGED, so `SquareView.fromCenterSide` still
+///     refuses a factor that overflows the side to infinity. That refusal is an approved
+///     requirement ("a zoom that would collapse the view is refused"); the bound is about
+///     what there is to LOOK at, not about arithmetic validity, and must not swallow it.
+///   * Only GROWTH is bounded (`proposed > side`). A zoom-IN is never clamped, and a view
+///     that arrived wider than the bound from outside navigation — an old saved file, which
+///     `persist.zig` loads unclamped — is left at its own width by a zoom-out (rather than
+///     being yanked inwards) and walks down normally on a zoom-in.
+fn boundedSide(side: f64, proposed: f64) f64 {
+    if (!std.math.isFinite(proposed) or proposed <= side) return proposed;
+    return @min(proposed, @max(side, max_view_side));
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 //
@@ -601,6 +656,89 @@ test "the newly usable deep range crosses no floor through the re-exported predi
         std.math.ldexp(@as(f64, 1.0), -99),
     );
     try std.testing.expect(!atPrecisionFloor(deep));
+}
+
+// ─── F1: the maximum side (the zoom-OUT bound) ───────────────────────────────
+//
+// The deep end WARNS and still renders (above); the wide end CLAMPS. Deliberate asymmetry:
+// there is legitimately more to see below the precision floor, and nothing at all to see
+// past the whole set. These pin the bound by property — no notch may pass it, from any path
+// that can widen the view — rather than by one convenient number.
+
+test "the maximum side leaves the home view and its first zoom-out notch unclamped" {
+    // Strictly wider than home, or `reset()` would land already clamped…
+    try std.testing.expect(max_view_side > reset().side);
+    // …and at least one 2x notch of headroom, which is what keeps "one zoom-out from home
+    // doubles the side" exactly true.
+    try std.testing.expect(max_view_side >= reset().side * zoom_step_out);
+}
+
+test "repeated zoom-out saturates at the maximum side instead of growing without bound" {
+    // M1 reached side 3.0786e13 — 4e12 times wider than the whole set — in 43 notches from
+    // home. Every notch, not just the last, must respect the bound.
+    var v = reset();
+    var n: usize = 0;
+    while (n < 43) : (n += 1) {
+        v = try zoomCentered(v, v.center(), zoom_step_out);
+        try std.testing.expect(v.side <= max_view_side);
+    }
+    try std.testing.expectEqual(max_view_side, v.side);
+}
+
+test "a zoom-out notch at the maximum side changes nothing at all" {
+    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, max_view_side);
+    // An OFF-CENTRE anchor: at the bound the side wins the tie-break, so the centre must not
+    // creep toward the anchor either. The view is bit-identical, not merely equally wide.
+    const anchor = v.pixelToComplexHi(100.5, 400.5, test_side);
+    try std.testing.expectEqual(v, try zoomAbout(v, anchor, zoom_step_out));
+}
+
+test "a clamped zoom-out still keeps the anchor under its own pixel" {
+    // 6 · 2 = 12 is past the bound, so this notch lands on 8: an EFFECTIVE factor of 4/3.
+    // The centre must ride that factor, not the requested 2, or the point under the cursor
+    // jumps away at the last notch.
+    const v = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.25 }, 6.0);
+    const anchor = v.pixelToComplexHi(96.5, 320.5, test_side);
+    const zoomed = try zoomAbout(v, anchor, zoom_step_out);
+    try std.testing.expectEqual(max_view_side, zoomed.side);
+    const after = zoomed.complexToPixel(anchor.lo(), test_side);
+    try std.testing.expectApproxEqAbs(@as(f64, 96.5), after.x, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 320.5), after.y, 1e-9);
+}
+
+test "boxSelect cannot commit a selection wider than the maximum side" {
+    // `rectViewport` fits the SHORTER axis to the side, so on a 1024x256 image the horizontal
+    // extent is 4 · 3.5 = 14 complex units: a wide drag on a wide window overshoots the bound
+    // even from home.
+    const v = reset();
+    const a = Pixel{ .x = 100.0, .y = 20.0 };
+    const b = Pixel{ .x = 1000.0, .y = 200.0 };
+    const selected = try boxSelect(v, a, b, 1024, 256);
+    try std.testing.expectEqual(max_view_side, selected.side);
+    // Clamped in EXTENT only: still centred on the selection the user dragged.
+    const mid_re = (v.rectPixelToComplexHi(a.x, a.y, 1024, 256).re +
+        v.rectPixelToComplexHi(b.x, b.y, 1024, 256).re) / 2.0;
+    try std.testing.expectApproxEqAbs(mid_re, selected.center_re, 1.0e-30);
+}
+
+test "a view already wider than the bound is not widened further, and still zooms in" {
+    // Wider than the bound can only arrive from OUTSIDE navigation (an old saved file, which
+    // persistence loads unclamped). A zoom-out must not widen it — and must not shrink it
+    // either — while a zoom-in keeps working normally.
+    const wide = try SquareView.fromCenterSide(.{ .re = -0.75, .im = 0.0 }, 100.0);
+    try std.testing.expectEqual(wide, try zoomCentered(wide, wide.center(), zoom_step_out));
+    try std.testing.expectEqual(@as(f64, 50.0), (try zoomCentered(wide, wide.center(), zoom_step_in)).side);
+}
+
+test "the bound clamps the side without clamping a magnification the user typed" {
+    // The panel's magnification field goes through `viewport.fromCenterMag`, NOT through this
+    // module, so the bound is a NAVIGATION policy: it must not silently rewrite a view that
+    // arrives by another route. (Pinned so widening the clamp's reach is a deliberate choice.)
+    const typed = try SquareView.fromCenterMag(.{
+        .center = .{ .re = -0.75, .im = 0.0 },
+        .magnification = 1.0e-3,
+    });
+    try std.testing.expect(typed.side > max_view_side);
 }
 
 // ---------------------------------------------------------------------------

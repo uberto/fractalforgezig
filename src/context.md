@@ -31,8 +31,8 @@ native macOS window with a Dear ImGui shell.
 View coordinates are `f128` (`fractal/viewport.ComplexHi`); per-pixel offsets stay `f64`. Above
 `perturb.threshold_side` (1e-6) pixels iterate directly; below it the engine builds ONE reference
 orbit per render at the centre and iterates `f64` deltas against it (perturbation, Zhuoran
-rebasing), CPU or GPU. `viewport.precision_floor_side` (1e-30) only WARNS — nothing clamps the
-zoom; under `perturb.gpu_floor_side` (1e-20) the GPU hands bands back to the CPU. `autoiter`
+rebasing), CPU or GPU. `viewport.precision_floor_side` (1e-30) only WARNS; the wide end
+(`navigate.max_view_side` 8.0) does CLAMP. Under `perturb.gpu_floor_side` (1e-20) the GPU hands bands back to the CPU. `autoiter`
 ramps `max_iter` quadratically to 65536. Details: `fractal/context.md`.
 
 ## Pure-vs-glue rule

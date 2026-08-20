@@ -178,12 +178,46 @@ The system SHALL warn the user, without refusing the navigation, when the view s
 - **Test**: `src/fractal/viewport.zig::precisionFloorMessage names the offending side, the 1e-30 limit and what to do`
 - **Test**: `src/fractal/navigate.zig::acceptance: past the precision floor the view is still accepted and the warning is actionable`
 
+### Requirement: Maximum zoom-out
+
+The system SHALL stop the view growing once it is wider than the whole set is: a zoom-out that would
+take the view side past 8.0 SHALL saturate at 8.0 instead, keeping a valid view rather than refusing
+the gesture.
+
+#### Scenario: Zooming out repeatedly stops at the widest view
+
+- **WHEN** the user keeps scrolling to zoom out from the home view
+- **THEN** the view stops widening at side 8.0 — a bit over twice the home framing — instead of
+  growing without bound
+- **Test**: `src/fractal/navigate.zig::repeated zoom-out saturates at the maximum side instead of growing without bound`
+
+#### Scenario: A zoom-out at the widest view changes nothing
+
+- **WHEN** the user zooms out again while already at the widest view
+- **THEN** the view is unchanged, and the point under the cursor is still under it
+- **Test**: `src/fractal/navigate.zig::a zoom-out notch at the maximum side changes nothing at all`
+- **Test**: `src/fractal/navigate.zig::a clamped zoom-out still keeps the anchor under its own pixel`
+
+#### Scenario: The bound does not touch the views the user works in
+
+- **WHEN** the user is at the home view, takes their first zoom-out notch from it, or rubber-bands a
+  region
+- **THEN** the home view and its first zoom-out notch are exactly what they always were, and only a
+  selection wider than the bound is narrowed to it
+- **Test**: `src/fractal/navigate.zig::the maximum side leaves the home view and its first zoom-out notch unclamped`
+- **Test**: `src/fractal/navigate.zig::boxSelect cannot commit a selection wider than the maximum side`
+
 ## Notes
 
 - The pixel↔complex mapping every gesture is measured in, and the fitted on-screen rectangle the
   cursor is read through, belong to `view-coordinates`.
 - The depth the **Zoom depth limit** names is the same depth at which `rendering`'s **Adaptive
   iteration count** stops climbing.
-- The limit is a warning only: nothing clamps the side, and a view below it still renders. What
-  makes depths between 1e-13 and 1e-30 usable at all is `deep-zoom`; keeping a gesture's centre
-  exact at those depths is `deep-zoom`'s **Deep navigation keeps its precision**.
+- The two ends of the zoom range are deliberately different. **Zoom depth limit** is a warning
+  only: nothing clamps the side, and a view below it still renders, because the user legitimately
+  wants to go deeper than the app can guarantee. **Maximum zoom-out** clamps, because past the whole
+  set there is nothing further to see. What makes depths between 1e-13 and 1e-30 usable at all is
+  `deep-zoom`; keeping a gesture's centre exact at those depths is `deep-zoom`'s **Deep navigation
+  keeps its precision**.
+- The bound is on *navigation* only: a view wider than 8.0 arriving from outside navigation (a saved
+  file, a typed magnification) is left at its own width, and zooming in from it still works.
