@@ -28,6 +28,8 @@ test {
     _ = @import("fractal/engine.zig");
     _ = @import("ui/stats.zig");
     _ = @import("ui/editor.zig");
+    // M7: pure per-frame gesture reduction (pinch/wheel -> one Intent per frame).
+    _ = @import("ui/gesture.zig");
     _ = @import("fractal/refine.zig");
     _ = @import("fractal/progressive.zig");
     _ = @import("fractal/persist.zig");
