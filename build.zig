@@ -60,6 +60,34 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // `zig build probe` — USER-ONLY input probe (src/probe.zig). Opens a window and
+    // records wheel/pinch/finger events; NO agent may run it (standing rule 2026-08-20).
+    // Its own module so the probe never links into the app, and `configureNativeStack` is
+    // reused rather than a second link configuration hand-rolled (it pulls in the ImGui
+    // C++ the probe does not call, which is harmless).
+    const probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    configureNativeStack(b, probe_mod);
+
+    const probe_exe = b.addExecutable(.{
+        .name = "input-probe",
+        .root_module = probe_mod,
+    });
+
+    const probe_cmd = b.addRunArtifact(probe_exe);
+    const probe_step = b.step("probe", "USER ONLY: run the input probe (opens a window; no agent may run this)");
+    probe_step.dependOn(&probe_cmd.step);
+
+    // COMPILED by `zig build` (so a plain build catches a broken probe) but deliberately
+    // NOT installed into zig-out and NOT reachable from `test`/`test-gpu`: the probe is a
+    // measurement tool, not a shipped artifact, and must not pollute the gates.
+    b.getInstallStep().dependOn(&probe_exe.step);
+
     // `zig build test` — fast, isolated unit-test tier. Runs the PURE core only
     // (src/root.zig aggregates pure modules): no window, no GPU, no C sources.
     const unit_tests = b.addTest(.{

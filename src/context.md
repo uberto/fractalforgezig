@@ -50,12 +50,13 @@ actionable context (what failed + the SDL error string) and a returned Zig error
 
 ## Commands
 
-- `zig build` — compile the executable (installs to `zig-out/`).
-- `zig build run` — build + run the app.
-- `zig build test` — BOTH tiers: the pure unit tier (`src/root.zig`) and the C-linking GPU tier.
-- `zig build test-gpu` — the GPU tier alone (`src/gpu_headless_test.zig`). It SKIPS silently
-  without a real Metal device, so read its output; a skip is not a pass.
-- `zig fmt --check .` — formatting gate; must be clean.
+- `zig build` — compile the app + probe; installs `zig-out/fractalforge`.
+- `zig build run` — run the app (USER ONLY).
+- `zig build probe` — USER ONLY: a window logging wheel/pinch/finger events.
+- `zig build test` — BOTH tiers: pure (`src/root.zig`) + C-linking GPU.
+- `zig build test-gpu` — the GPU tier alone (`src/gpu_headless_test.zig`); it SKIPS with no
+  Metal device, and a skip is not a pass.
+- `zig fmt --check .` — must be clean.
 
 Read each gate's exit code separately — `std.log.err` in a test prints success but exits 1.
 
