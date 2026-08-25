@@ -19,6 +19,7 @@ const texture_mod = @import("gpu/texture.zig");
 const compute_mod = @import("gpu/compute.zig");
 const stats_mod = @import("ui/stats.zig");
 const editor_mod = @import("ui/editor.zig");
+const gesture = @import("ui/gesture.zig");
 const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
 const perturb = @import("fractal/perturb.zig");
@@ -206,6 +207,18 @@ const NavState = struct {
     /// Whether to open the right-click popup this frame.
     open_ctx_menu: bool = false,
 
+    /// One frame's gesture input (trackpad pinch today; `T5` adds the wheel and panning),
+    /// reduced by the pure `ui/gesture.zig` accumulator to AT MOST ONE view change.
+    /// DRAINED EXACTLY ONCE PER FRAME, by the drain step that follows the event-drain loop in
+    /// `runLoop` — so N pinch updates arriving in one frame cost one coarse render and one
+    /// undo entry, not N of each.
+    gestures: gesture.Accumulator = .{},
+    /// Whether the view now on screen is already past `viewport.precision_floor_side`.
+    /// Exists ONLY to make that warning EDGE-TRIGGERED: a continuous pinch installs a view
+    /// every frame, so warning on every install would print ~60 identical lines a second and
+    /// bury everything else. Maintained by `showViewCoarse`, the one place a view is installed.
+    past_floor: bool = false,
+
     /// Whether the full-res pass has been run for the current view. False from startup on:
     /// the first image is a coarse preview (see `main`), promoted by the idle check.
     full_pass_done: bool = false,
@@ -350,13 +363,18 @@ fn showViewCoarse(
         return;
     };
 
-    // Warn if the new view crossed the precision floor.
-    if (navigate.atPrecisionFloor(new_view)) {
+    // Warn on the CROSSING of the precision floor, not on every view that sits past it.
+    // A continuous pinch (M7) comes through here once per frame, so an unconditional warn is
+    // a ~60 lines/second flood; `nav.past_floor` makes it one line per crossing, and one more
+    // if the user zooms back out over the floor and in again.
+    const now_past_floor = navigate.atPrecisionFloor(new_view);
+    if (now_past_floor and !nav.past_floor) {
         var floor_buf: [navigate.floor_message_buf_len]u8 = undefined;
         if (navigate.precisionFloorMessage(&floor_buf, new_view.side)) |msg| {
             app_log.warn("{s}", .{msg});
         } else |_| {}
     }
+    nav.past_floor = now_past_floor;
 
     renderCoarse(engine, nav, real_w, real_h);
     view_editor.syncFromView(engine.view);
@@ -547,6 +565,45 @@ fn runLoop(
                             }
                         }
                     },
+                    // ── Trackpad pinch (M7). These three only FEED the accumulator; the
+                    // view changes once per frame in the drain step after this loop, which is
+                    // what keeps a 60-updates-a-second gesture at one coarse render a frame.
+                    // The `windowID` guard matches SDL_EVENT_WINDOW_CLOSE_REQUESTED above:
+                    // an event for another window is not ours to act on.
+                    c.SDL_EVENT_PINCH_BEGIN => {
+                        if (event.pinch.windowID == c.SDL_GetWindowID(window)) {
+                            // Force a FRESH gesture run: a new pinch must not inherit the
+                            // previous one's, or its first frame would not report `began` and
+                            // the whole gesture would cost no undo entry.
+                            nav.gestures.endPinch();
+                        }
+                    },
+                    c.SDL_EVENT_PINCH_UPDATE => {
+                        if (event.pinch.windowID == c.SDL_GetWindowID(window)) {
+                            // ── THE INCREMENTAL-SCALE SEAM. Read this before changing either
+                            // side of it. `Accumulator.addPinch` MULTIPLIES a frame's scales
+                            // together, so it requires the ratio SINCE THE PREVIOUS UPDATE,
+                            // and an IMMUTABLE acceptance test pins that product
+                            // (1.25 · 1.6 · 2.0 = 4.0). SDL documents `event.pinch.scale` as
+                            // "the scale change since the last SDL_EVENT_PINCH_UPDATE"
+                            // (`SDL_events.h:804`) — i.e. ALREADY INCREMENTAL — so this
+                            // pass-through is correct AS DOCUMENTED. It is also UNMEASURED:
+                            // if `T8`'s probe log shows the value is really ABSOLUTE (a total
+                            // scale since PINCH_BEGIN), the fix belongs RIGHT HERE — divide by
+                            // the previous absolute value before calling `addPinch` — and NOT
+                            // in `ui/gesture.zig`, whose product semantics that immutable test
+                            // pins. Nothing else about the reduction (the scale→side-factor
+                            // inversion in particular) belongs at this call site.
+                            nav.gestures.addPinch(event.pinch.scale);
+                        }
+                    },
+                    c.SDL_EVENT_PINCH_END => {
+                        if (event.pinch.windowID == c.SDL_GetWindowID(window)) {
+                            // Fingers lifted: close the run, so the NEXT pinch reports `began`
+                            // and gets its own undo entry.
+                            nav.gestures.endPinch();
+                        }
+                    },
                     // Right mouse button down: stash the cursor point for the context menu.
                     c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
                         if (event.button.button == c.SDL_BUTTON_RIGHT) {
@@ -572,6 +629,53 @@ fn runLoop(
                     else => {},
                 }
                 if (!c.SDL_PollEvent(&event)) break;
+            }
+        }
+
+        // ── Drain the gesture accumulator — EXACTLY ONCE PER FRAME ────────────
+        // Runs after the event drain and before the frame is built, so however many pinch
+        // updates the trackpad delivered this frame, they become ONE view change. `take()`
+        // returning null means no gesture input arrived: do NOTHING at all (no view change, no
+        // history entry, no log line).
+        //
+        // The applyViewCoarse-vs-showViewCoarse choice below IS THE UNDO MECHANISM. Do not
+        // "simplify" it to `applyViewCoarse` everywhere: that one pushes history, this one does
+        // not, so `intent.began` (the FIRST frame of a gesture run) records the PRE-GESTURE
+        // view and every later frame of the same run only shows its result. That is what makes
+        // one Ctrl+Z after a long pinch return to where the pinch started instead of to its
+        // second-to-last frame — one undo entry per GESTURE, not per frame. `historyPush` is
+        // not called from here; `applyViewCoarse` owns it, including its no-op guard (which is
+        // what stops a pinch-out saturated at `navigate.max_view_side` stacking entries).
+        //
+        // `intent.pan_dx` / `pan_dy` are left UNREAD on purpose: `T5` owns panning, and with it
+        // the order in which a frame carrying both a zoom and a pan applies them.
+        if (nav.gestures.take()) |intent| {
+            if (intent.zoom_factor) |factor| {
+                // `SDL_PinchFingerEvent` carries no position (`SDL_events.h:799-806`), so the
+                // anchor is the live cursor — the same lookup the wheel handler above does.
+                var pinch_x: f32 = 0.0;
+                var pinch_y: f32 = 0.0;
+                _ = c.SDL_GetMouseState(&pinch_x, &pinch_y);
+                const anchor = engine.view.cursorCoord(@floatCast(pinch_x), @floatCast(pinch_y), image_rect.*);
+                // A null anchor means the cursor is outside the fitted image rect — over the
+                // data panel or on a letterbox bar — and the gesture is simply IGNORED: a
+                // pinch over the panels must not move the view.
+                if (anchor) |pt| {
+                    if (navigate.zoomAbout(engine.view, pt, factor)) |v| {
+                        if (intent.began)
+                            applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor)
+                        else
+                            showViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+                    } else |err| {
+                        // Refused: keep the previous view up, exactly as the wheel path's
+                        // `catch null` does. AT MOST ONE LINE PER DRAINED FRAME — never one per
+                        // event — because a continuous gesture would otherwise flood the log.
+                        app_log.err(
+                            "pinch zoom by side factor {d} refused ({s}); keeping the view at side {d}",
+                            .{ factor, @errorName(err), engine.view.side },
+                        );
+                    }
+                }
             }
         }
 
