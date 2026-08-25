@@ -207,12 +207,17 @@ const NavState = struct {
     /// Whether to open the right-click popup this frame.
     open_ctx_menu: bool = false,
 
-    /// One frame's gesture input (trackpad pinch today; `T5` adds the wheel and panning),
-    /// reduced by the pure `ui/gesture.zig` accumulator to AT MOST ONE view change.
+    /// One frame's gesture input — trackpad pinch AND every `SDL_EVENT_MOUSE_WHEEL` — reduced
+    /// by the pure `ui/gesture.zig` accumulator to AT MOST ONE view change.
     /// DRAINED EXACTLY ONCE PER FRAME, by the drain step that follows the event-drain loop in
-    /// `runLoop` — so N pinch updates arriving in one frame cost one coarse render and one
-    /// undo entry, not N of each.
+    /// `runLoop` — so N pinch updates or N swipe deltas arriving in one frame cost one coarse
+    /// render and one undo entry, not N of each.
     gestures: gesture.Accumulator = .{},
+    /// Which pointing device the wheel events are coming from. `.auto` detects (a whole tick
+    /// with no horizontal component is a mouse notch and zooms; anything else is a two-finger
+    /// swipe and pans); `T6` adds the control that lets the user overrule the detection, and
+    /// this task only READS the field, defaulted.
+    input_mode: gesture.InputMode = .auto,
     /// Whether the view now on screen is already past `viewport.precision_floor_side`.
     /// Exists ONLY to make that warning EDGE-TRIGGERED: a continuous pinch installs a view
     /// every frame, so warning on every install would print ~60 identical lines a second and
@@ -547,23 +552,23 @@ fn runLoop(
                     // `render_w/render_h` next frame, cancels any in-flight pass and re-arms
                     // the full pass — which, because the size keeps changing while the mouse
                     // drags the window edge, only runs once the resize SETTLES.
-                    // Scroll-zoom: zoom toward the cursor point (plan A4).
+                    // ── The wheel (M7). PURE PLUMBING, no navigation: reduce the event to
+                    // plain data and hand it to the accumulator. What it MEANS is
+                    // `gesture.classifyWheel`'s decision (a mouse notch zooms exactly as it
+                    // always has; a trackpad two-finger swipe pans), and the view changes at
+                    // the ONE drain site after this loop — never here, so a frame carrying
+                    // several notches or several swipe deltas costs one coarse render and one
+                    // undo entry instead of one of each per event.
+                    //
+                    // THE THREE FIELDS ARE COPIED WITH THEIR SIGNS UNTOUCHED, and
+                    // `event.wheel.direction` is deliberately NOT read — the pre-M7 handler
+                    // ignored it too, and `gesture.wheelSample` says why reacting to it would
+                    // invert the existing wheel zoom on a default macOS setup, invisibly.
                     c.SDL_EVENT_MOUSE_WHEEL => {
-                        if (event.wheel.y != 0.0) {
-                            var mx: f32 = 0.0;
-                            var my: f32 = 0.0;
-                            _ = c.SDL_GetMouseState(&mx, &my);
-                            const cursor = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
-                            if (cursor) |pt| {
-                                const factor = if (event.wheel.y > 0.0)
-                                    navigate.zoom_step_in
-                                else
-                                    navigate.zoom_step_out;
-                                const new_view = navigate.zoomAbout(engine.view, pt, factor) catch null;
-                                if (new_view) |v|
-                                    applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
-                            }
-                        }
+                        nav.gestures.addWheel(
+                            gesture.wheelSample(event.wheel.x, event.wheel.y, event.wheel.integer_y),
+                            nav.input_mode,
+                        );
                     },
                     // ── Trackpad pinch (M7). These three only FEED the accumulator; the
                     // view changes once per frame in the drain step after this loop, which is
@@ -634,9 +639,9 @@ fn runLoop(
 
         // ── Drain the gesture accumulator — EXACTLY ONCE PER FRAME ────────────
         // Runs after the event drain and before the frame is built, so however many pinch
-        // updates the trackpad delivered this frame, they become ONE view change. `take()`
-        // returning null means no gesture input arrived: do NOTHING at all (no view change, no
-        // history entry, no log line).
+        // updates, wheel notches and swipe deltas arrived this frame, they become ONE view
+        // change. `take()` returning null means no gesture input arrived: do NOTHING at all (no
+        // view change, no history entry, no log line).
         //
         // The applyViewCoarse-vs-showViewCoarse choice below IS THE UNDO MECHANISM. Do not
         // "simplify" it to `applyViewCoarse` everywhere: that one pushes history, this one does
@@ -646,36 +651,92 @@ fn runLoop(
         // second-to-last frame — one undo entry per GESTURE, not per frame. `historyPush` is
         // not called from here; `applyViewCoarse` owns it, including its no-op guard (which is
         // what stops a pinch-out saturated at `navigate.max_view_side` stacking entries).
-        //
-        // `intent.pan_dx` / `pan_dy` are left UNREAD on purpose: `T5` owns panning, and with it
-        // the order in which a frame carrying both a zoom and a pan applies them.
+        // Which frames report `began` is the accumulator's business and depends on the event
+        // SOURCE (`gesture.RunSource`): one wheel notch is one run and so one undo entry, as it
+        // has always been, while a whole pinch or a whole swipe is one.
         if (nav.gestures.take()) |intent| {
+            // ONE cursor read for the whole drained frame — the same `SDL_GetMouseState` the
+            // hover readout uses a few lines below. Neither the pinch event
+            // (`SDL_PinchFingerEvent` has no position, `SDL_events.h:799-806`) nor the reduced
+            // wheel sample carries a position, so the live cursor is the only anchor there is.
+            var gesture_x: f32 = 0.0;
+            var gesture_y: f32 = 0.0;
+            _ = c.SDL_GetMouseState(&gesture_x, &gesture_y);
+            const cursor_x: f64 = @floatCast(gesture_x);
+            const cursor_y: f64 = @floatCast(gesture_y);
+
+            // ONE candidate view for the frame, installed ONCE at the end: the zoom first, then
+            // the pan ON ITS RESULT. Installing each half separately would cost two coarse
+            // renders for one frame and — on the frame a gesture begins — TWO history entries,
+            // so one Ctrl+Z would only undo half of it. NOTE FOR THE REVIEWER: the mixed
+            // zoom+pan case is UNTESTED BY DESIGN — no approved acceptance test feeds a zoom and
+            // a pan together (`acceptance-tests.md`, "What these tests do not pin", item 4), and
+            // dropping the pan half here leaves all 16 green. It is reachable: a trackpad can
+            // deliver a pinch and a swipe in the same frame. Read this block, do not trust the
+            // suite.
+            var next_view: ?viewport.SquareView = null;
+            // AT MOST ONE LOG LINE PER DRAINED FRAME (never one per event, or a continuous
+            // gesture floods the log): the first refusal speaks for the frame.
+            var refusal_logged = false;
+
             if (intent.zoom_factor) |factor| {
-                // `SDL_PinchFingerEvent` carries no position (`SDL_events.h:799-806`), so the
-                // anchor is the live cursor — the same lookup the wheel handler above does.
-                var pinch_x: f32 = 0.0;
-                var pinch_y: f32 = 0.0;
-                _ = c.SDL_GetMouseState(&pinch_x, &pinch_y);
-                const anchor = engine.view.cursorCoord(@floatCast(pinch_x), @floatCast(pinch_y), image_rect.*);
+                const anchor = engine.view.cursorCoord(cursor_x, cursor_y, image_rect.*);
                 // A null anchor means the cursor is outside the fitted image rect — over the
-                // data panel or on a letterbox bar — and the gesture is simply IGNORED: a
-                // pinch over the panels must not move the view.
+                // data panel or on a letterbox bar — and the zoom is simply IGNORED: a gesture
+                // over the panels must not move the view. A zoom NEEDS the anchor: it is the
+                // point that has to stay under the cursor.
                 if (anchor) |pt| {
                     if (navigate.zoomAbout(engine.view, pt, factor)) |v| {
-                        if (intent.began)
-                            applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor)
-                        else
-                            showViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+                        next_view = v;
                     } else |err| {
-                        // Refused: keep the previous view up, exactly as the wheel path's
-                        // `catch null` does. AT MOST ONE LINE PER DRAINED FRAME — never one per
-                        // event — because a continuous gesture would otherwise flood the log.
+                        // Refused: keep the previous view up, exactly as the pre-M7 wheel path's
+                        // `catch null` did.
                         app_log.err(
-                            "pinch zoom by side factor {d} refused ({s}); keeping the view at side {d}",
+                            "gesture zoom by side factor {d} refused ({s}); keeping the view at side {d}",
                             .{ factor, @errorName(err), engine.view.side },
                         );
+                        refusal_logged = true;
                     }
                 }
+            }
+
+            if (intent.pan_dx != 0.0 or intent.pan_dy != 0.0) {
+                // GATED ON THE IMAGE RECT CONTAINING THE CURSOR, not on `cursorCoord` returning
+                // a point. A pan has no anchor — it is a translation by a pixel delta — so it
+                // must not depend on the anchor mapping succeeding, and asking for a complex
+                // coordinate it never uses would be a lie about the requirement. It still has to
+                // be gated, or a two-finger scroll over the data panel would move the picture.
+                if (image_rect.toImagePixel(cursor_x, cursor_y) != null) {
+                    // `real_s` — the navigation square side, `min(real_w, real_h)` — is EXACTLY
+                    // what the middle-drag pan passes (`handleNavInput`, "pass the NEGATED mouse
+                    // delta"). Any other side (e.g. `engine.image_w`, which is the coarse
+                    // preview width mid-gesture) would make a swipe and a drag of the same pixel
+                    // distance move the plane by different amounts on a non-square window.
+                    const base = next_view orelse engine.view;
+                    if (navigate.panByPixels(base, intent.pan_dx, intent.pan_dy, real_s)) |v| {
+                        next_view = v;
+                    } else |err| {
+                        // `panByPixels` REFUSES a zero image side (a minimized window) and a
+                        // delta that overflows the centre, rather than asserting — so this is a
+                        // live-state error, not a bug: keep the view as it is and say so once.
+                        if (!refusal_logged) {
+                            app_log.err(
+                                "gesture pan by ({d}, {d}) px refused ({s}); image side {d}, keeping the view",
+                                .{ intent.pan_dx, intent.pan_dy, @errorName(err), real_s },
+                            );
+                            refusal_logged = true;
+                        }
+                    }
+                }
+            }
+
+            // The single install. `next_view` is null when the gesture was ignored (cursor off
+            // the image) or refused, and then the view is left exactly as it was.
+            if (next_view) |v| {
+                if (intent.began)
+                    applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor)
+                else
+                    showViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
             }
         }
 

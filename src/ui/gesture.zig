@@ -21,6 +21,12 @@
 //! handed out is the RECIPROCAL of the accumulated pinch scale. Two updates of 2.0 therefore
 //! produce a factor of 1/4, not 4.
 //!
+//! RUN BOUNDARIES ARE PER EVENT SOURCE, and that is a decision, not an oversight: a pinch is
+//! bounded by the fingers landing and lifting (`endPinch`), a two-finger swipe arrives as wheel
+//! events that have no end marker at all, and a wheel notch is a complete gesture on its own. One
+//! rule for all three cannot be right, and getting it wrong costs the user undo entries. See
+//! `RunSource` for the three rules and the tests that pin them.
+//!
 //! REFUSAL, NOT CORRECTION. A pinch scale that is not finite and positive, and a wheel sample
 //! with a non-finite delta, contribute NOTHING instead of being clamped or passed on: handing
 //! `navigate` a bad factor only produces a rejected view one layer down, and this module's job
@@ -38,6 +44,22 @@ pub const InputMode = enum { auto, mouse, trackpad };
 /// One SDL_EVENT_MOUSE_WHEEL, reduced to plain data. `integer_y` is SDL's whole-tick
 /// accumulation (`event.wheel.integer_y`, SDL >= 3.2.12).
 pub const WheelSample = struct { x: f64 = 0, y: f64 = 0, integer_y: i32 = 0 };
+
+/// Reduce one `SDL_EVENT_MOUSE_WHEEL` to plain data: `event.wheel.x` → `x`, `event.wheel.y` → `y`,
+/// `event.wheel.integer_y` → `integer_y`. A STRAIGHT COPY — the three signs are SDL's and are
+/// passed through untouched.
+///
+/// WHY THIS TRIVIAL FUNCTION EXISTS AT ALL: it puts the mapping in the pure tier, where a test can
+/// pin it, instead of inline in `main.zig`, which has no test tier. What it pins is precisely the
+/// mistake that would be invisible otherwise — a sign flip. `event.wheel.direction` is DELIBERATELY
+/// not a parameter and is not read: the pre-M7 handler ignored it too, and on macOS the flipped
+/// reading it reports is what "natural scrolling" — the DEFAULT setting — produces, so negating x
+/// and y for it would invert the existing wheel zoom. That is a regression no test in this tier
+/// could catch, since only SDL supplies the sign. Whether `direction` needs honouring at all is a
+/// question for `T8`, which has the measured probe log and owns every sign in this milestone.
+pub fn wheelSample(x: f64, y: f64, integer_y: i32) WheelSample {
+    return .{ .x = x, .y = y, .integer_y = integer_y };
+}
 
 /// What a wheel event means: today's discrete zoom, or a two-finger swipe pan.
 pub const WheelAction = enum { zoom, pan };
@@ -88,12 +110,17 @@ pub fn classifyWheel(sample: WheelSample, mode: InputMode) WheelAction {
 /// delta `navigate.panByPixels` takes (which moves the view, so the content moves the other
 /// way — hence the axes do not agree, `panByPixels` also flipping pixel-y against `im`).
 ///
-/// UNVERIFIED, AND ON PURPOSE. What macOS reports for a two-finger swipe — and how the user's
-/// natural-scrolling setting flips it — is measured by `T1`'s probe, not knowable from the
-/// headers; `T8` sets these two constants from `pilot/input-probe.log` and the user confirms
-/// the direction on screen. The MAGNITUDE is contract (a swipe pans by exactly its pixel
-/// distance) and is what the tests assert; the sign lives here, in one place, so `T8` flips a
-/// constant instead of an immutable test.
+/// UNVERIFIED, AND ON PURPOSE — PROVISIONAL UNTIL `T8`. What macOS reports for a two-finger
+/// swipe — and how the user's natural-scrolling setting flips it — is measured by `T1`'s probe,
+/// not knowable from the headers; `T8` sets these two constants from `pilot/input-probe.log` and
+/// the user confirms the direction on screen. The MAGNITUDE is contract (a swipe pans by exactly
+/// its pixel distance) and is what the tests assert; the sign lives here, in one place, so `T8`
+/// flips a constant instead of an immutable test.
+///
+/// The intent is CONTENT-FOLLOWS-THE-FINGERS (the Google-Maps feel the user asked for). If the
+/// gesture comes out backwards on screen, negating the offending constant here is the WHOLE fix —
+/// there is no second place a swipe's direction is decided, and nothing downstream needs to
+/// change.
 const pan_x_sign: f64 = -1.0;
 const pan_y_sign: f64 = 1.0;
 
@@ -107,6 +134,24 @@ pub const Intent = struct {
     began: bool = false,
 };
 
+/// What is keeping the current gesture run open — and so WHAT IS ALLOWED TO CLOSE IT.
+///
+/// RUN BOUNDARIES ARE PER EVENT SOURCE, deliberately, because the three sources bound their
+/// gestures in three different ways and no single rule is right for all of them. The next
+/// reader's instinct will be to collapse these into one rule; the tests *an idle frame ends a
+/// wheel-pan run but never a pinch run* and *a wheel notch arriving during a pinch does not
+/// split the pinch run* exist to stop that.
+///   - `.pinch` — closed ONLY by `endPinch` (the fingers leaving the trackpad). An idle frame
+///     must NOT close it: fingers held still send no updates, and splitting there would cost a
+///     second undo entry for one gesture. `T2`'s reviewer mutation-verified this.
+///   - `.wheel_pan` — a two-finger swipe arrives as wheel events, which have NO end event, so
+///     the first frame that drains with no pan input is the boundary. Without that, the second
+///     swipe of a session would push no undo entry and could not be undone.
+///   - a wheel NOTCH opens no run at all: it is discrete and self-contained, so its run closes
+///     with the very frame that delivered it — one notch, one undo entry, exactly as before
+///     M7. That is why there is no `.wheel_zoom` member.
+const RunSource = enum { none, pinch, wheel_pan };
+
 /// Collects one frame's gesture input. Zero-initialized (`Accumulator{}`) and owned by the
 /// event loop; `add*` during the event drain, `take()` once per frame.
 pub const Accumulator = struct {
@@ -115,15 +160,18 @@ pub const Accumulator = struct {
     pinch_scale: f64 = 1.0,
     /// Product of this frame's discrete wheel steps, already SIDE factors.
     wheel_factor: f64 = 1.0,
-    /// A zoom contribution arrived this frame. Not derivable from the two products above: a
-    /// frame with no zoom and a frame whose scales multiply back to 1.0 must differ.
-    has_zoom: bool = false,
+    /// A PINCH update arrived this frame. Not derivable from `pinch_scale`: a frame with no
+    /// pinch and a frame whose scales multiply back to 1.0 must differ. Kept apart from
+    /// `has_wheel_zoom` because the two open different kinds of run (see `RunSource`).
+    has_pinch: bool = false,
+    /// A wheel event READ AS A ZOOM arrived this frame — a discrete notch.
+    has_wheel_zoom: bool = false,
     pan_dx: f64 = 0,
     pan_dy: f64 = 0,
     /// A pan contribution arrived this frame — likewise not derivable, since deltas cancel.
     has_pan: bool = false,
-    /// A gesture run is open: the next intent is a continuation, not a beginning.
-    in_run: bool = false,
+    /// Which source is keeping a run open, `.none` when the next intent begins one.
+    run: RunSource = .none,
     /// `endPinch` fired while this frame already held input, so the run closes at the frame
     /// boundary — AFTER that input is delivered as part of the run that is ending.
     end_after_take: bool = false,
@@ -145,7 +193,7 @@ pub const Accumulator = struct {
     pub fn addPinch(a: *Accumulator, scale: f64) void {
         if (!positiveFinite(scale)) return;
         a.pinch_scale *= scale;
-        a.has_zoom = true;
+        a.has_pinch = true;
     }
 
     /// Fold in one wheel event: ask `classifyWheel` what it means, then either compose a zoom
@@ -161,7 +209,7 @@ pub const Accumulator = struct {
                 // (`main.zig`'s SDL_EVENT_MOUSE_WHEEL handler), 2x per notch.
                 if (sample.y == 0) return;
                 a.wheel_factor *= if (sample.y > 0) navigate.zoom_step_in else navigate.zoom_step_out;
-                a.has_zoom = true;
+                a.has_wheel_zoom = true;
             },
             .pan => {
                 if (sample.x == 0 and sample.y == 0) return;
@@ -176,84 +224,112 @@ pub const Accumulator = struct {
     /// reports `began` again and the event loop pushes a second undo entry. Input that already
     /// arrived this frame still belongs to the run that is ending.
     pub fn endPinch(a: *Accumulator) void {
-        if (a.has_zoom or a.has_pan) {
+        if (a.hasInput()) {
             // Deliver this frame first, then close: the last update of a pinch is part of that
             // pinch, so it must not be reported as the beginning of a new run.
             a.end_after_take = true;
         } else {
-            a.in_run = false;
+            a.run = .none;
             a.end_after_take = false;
         }
     }
 
     /// Drain the frame. Null when no gesture input arrived since the last call.
     ///
-    /// ONLY `endPinch` MAY END A GESTURE RUN. An input-less frame returns null and leaves the
-    /// run EXACTLY as it was, so the next update after an idle frame still reports
-    /// `began = false`. This is not what the milestone's acceptance suite pins — plan review
-    /// proved that ending the run here on any input-less frame leaves all 16 of them green —
-    /// but the two readings differ where it matters: a slow pinch that happens to deliver
-    /// nothing for one frame would start a NEW run mid-gesture, and so a second undo entry,
-    /// which is exactly what the requirement *One whole gesture is one undo step* forbids. A
-    /// run is a run of consecutive frames CARRYING INPUT, with `endPinch` forcing the boundary.
-    /// (The unit test *an idle frame does not end a gesture run* below does pin it; the
-    /// acceptance suite cannot.)
+    /// WHERE A RUN ENDS, AND WHY IT DEPENDS ON THE SOURCE (`RunSource`). A `.pinch` run is
+    /// closed by `endPinch` ALONE: an input-less frame leaves it exactly as it was, so a slow
+    /// pinch that delivers nothing for one frame does NOT start a new run mid-gesture and cost
+    /// a second undo entry — the bug the requirement *One whole gesture is one undo step*
+    /// exists to prevent (the acceptance suite cannot see it; the unit tests *an idle frame
+    /// ends a wheel-pan run but never a pinch run* and *a wheel notch arriving during a pinch
+    /// does not split the pinch run* do). The wheel has no end event, so it cannot rely on
+    /// `endPinch`: a `.wheel_pan` run is closed by the first frame that DRAINS WITH NO PAN
+    /// INPUT (otherwise the second swipe of a session would push no undo entry at all), and a
+    /// wheel notch — discrete and self-contained — closes its run with the frame that carries
+    /// it, so N notches are N undo entries exactly as before M7.
     ///
     /// A frame is delivered at most once: the accumulation is reset here, so a second call in
     /// the same frame is null and the frame's input is never applied twice.
     pub fn take(a: *Accumulator) ?Intent {
-        // An input-less frame: null, and the run is left EXACTLY as it was (see above).
-        if (!a.has_zoom and !a.has_pan) {
-            a.closeIfEnding();
+        // An input-less frame delivers nothing and ends only what a missing frame can end.
+        if (!a.hasInput()) {
+            a.closeUndelivered();
             return null;
         }
         // The reciprocal of the pinch-scale product, composed with the wheel's own side steps.
         // Dividing once — rather than inverting each update — keeps a wheel-only frame's factor
         // bit-identical to the constant it came from.
-        const factor: ?f64 = if (a.has_zoom) blk: {
+        const factor: ?f64 = if (a.hasZoom()) blk: {
             const f = a.wheel_factor / a.pinch_scale;
             break :blk if (positiveFinite(f)) f else null;
         } else null;
         if (factor == null and !a.has_pan) {
             // The only zoom this frame asked for is unusable (the product left the f64 range),
             // so there is nothing to apply: refuse the frame rather than hand on a bad factor
-            // or an intent that does nothing.
+            // or an intent that does nothing. Nothing was delivered, so the run boundaries are
+            // the input-less frame's.
             a.resetFrame();
-            a.closeIfEnding();
+            a.closeUndelivered();
             return null;
         }
         const intent = Intent{
             .zoom_factor = factor,
             .pan_dx = a.pan_dx,
             .pan_dy = a.pan_dy,
-            .began = !a.in_run,
+            .began = a.run == .none,
         };
+        const had_pinch = a.has_pinch;
+        const had_pan = a.has_pan;
         a.resetFrame();
         if (a.end_after_take) {
-            a.in_run = false;
+            // The fingers lifted: this frame was the run's last, whatever opened it.
+            a.run = .none;
             a.end_after_take = false;
+        } else if (had_pinch or a.run == .pinch) {
+            // A pinch run outlives frames that carry no pinch update (a swipe-only frame is,
+            // for the pinch, an idle frame) — `endPinch` is the only thing that ends it.
+            a.run = .pinch;
+        } else if (had_pan) {
+            a.run = .wheel_pan;
         } else {
-            a.in_run = true;
+            // Wheel notches only: a discrete gesture is over the moment it is delivered, so
+            // the NEXT notch reports `began` again and gets its own undo entry.
+            a.run = .none;
         }
         return intent;
     }
 
-    /// Drop this frame's accumulation. Touches NO run state: `in_run` and `end_after_take`
+    /// A zoom contribution — from either source — arrived this frame.
+    fn hasZoom(a: Accumulator) bool {
+        return a.has_pinch or a.has_wheel_zoom;
+    }
+
+    /// Any gesture contribution at all arrived this frame.
+    fn hasInput(a: Accumulator) bool {
+        return a.hasZoom() or a.has_pan;
+    }
+
+    /// Drop this frame's accumulation. Touches NO run state: `run` and `end_after_take`
     /// outlive a frame by design.
     fn resetFrame(a: *Accumulator) void {
         a.pinch_scale = 1.0;
         a.wheel_factor = 1.0;
-        a.has_zoom = false;
+        a.has_pinch = false;
+        a.has_wheel_zoom = false;
         a.pan_dx = 0;
         a.pan_dy = 0;
         a.has_pan = false;
     }
 
-    /// Apply a pending `endPinch` on a frame that delivered nothing, so a run cannot stay half
-    /// closed and leak the boundary into a later frame.
-    fn closeIfEnding(a: *Accumulator) void {
+    /// A frame that delivered no intent: it ends a `.wheel_pan` run — no pan input arrived, so
+    /// the swipe is over and the next one deserves its own undo entry — and leaves a `.pinch`
+    /// run open, because fingers held still on a trackpad send no updates. It also applies a
+    /// pending `endPinch`, so a run cannot stay half closed and leak the boundary into a later
+    /// frame.
+    fn closeUndelivered(a: *Accumulator) void {
+        if (a.run == .wheel_pan) a.run = .none;
         if (a.end_after_take) {
-            a.in_run = false;
+            a.run = .none;
             a.end_after_take = false;
         }
     }
@@ -569,4 +645,137 @@ test "a wheel event with no motion does not start a gesture run in any mode" {
         acc.addPinch(1.25);
         try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
     }
+}
+
+// ─── T5: the SDL reduction, and the per-source run boundaries ────────────────
+
+test "wheelSample copies SDL's three wheel fields through with their signs unchanged" {
+    // The reduction is a STRAIGHT COPY. It must not negate, clamp or reorder anything: a sign
+    // flip here would invert the existing wheel zoom, and no test in this tier could see it
+    // because the sign comes from SDL.
+    const sample = wheelSample(-12.5, 7.25, -3);
+    try testing.expectEqual(WheelSample{ .x = -12.5, .y = 7.25, .integer_y = -3 }, sample);
+}
+
+test "wheelSample keeps a scroll-down notch negative, as SDL delivered it" {
+    // Negating x and y for SDL's flipped wheel reading — a plausible-looking "fix" — would turn
+    // this sample into +1.0 and invert every zoom on a macOS trackpad's default setting.
+    const notch = wheelSample(0.0, -1.0, -1);
+    try testing.expectEqual(@as(f64, -1.0), notch.y);
+    try testing.expectEqual(@as(i32, -1), notch.integer_y);
+}
+
+test "an SDL notch reduced through wheelSample still zooms out by the existing step" {
+    // The whole regression seam, end to end: wheelSample → classifyWheel → addWheel → Intent.
+    const notch = wheelSample(0.0, -1.0, -1);
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(notch, .auto));
+    var acc = Accumulator{};
+    acc.addWheel(notch, .auto);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(navigate.zoom_step_out, intent.zoom_factor orelse return error.TestUnexpectedNull);
+    try testing.expectEqual(@as(f64, 0.0), intent.pan_dx);
+    try testing.expectEqual(@as(f64, 0.0), intent.pan_dy);
+}
+
+test "an SDL notch up reduced through wheelSample still zooms in by the existing step" {
+    const notch = wheelSample(0.0, 1.0, 1);
+    var acc = Accumulator{};
+    acc.addWheel(notch, .auto);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(navigate.zoom_step_in, intent.zoom_factor orelse return error.TestUnexpectedNull);
+}
+
+test "every mouse wheel notch is its own gesture run, so every notch is one undo entry" {
+    // THE REGRESSION THIS MILESTONE ALMOST SHIPPED: with a run that only `endPinch` could
+    // close, the first notch of a session pushed a history entry and no later notch ever did,
+    // so one Ctrl+Z after ten notches jumped back to the pre-FIRST-notch view.
+    var acc = Accumulator{};
+    for (0..4) |_| {
+        acc.addWheel(wheelSample(0.0, -1.0, -1), .auto);
+        try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    }
+}
+
+test "a notch leaves no run open, so a pinch right after it is its own undo entry" {
+    var acc = Accumulator{};
+    acc.addWheel(wheelSample(0.0, -1.0, -1), .auto);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addPinch(1.25);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "a swipe spread over consecutive frames is one gesture run" {
+    var acc = Accumulator{};
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "two swipes separated by an idle frame are two gesture runs" {
+    // A wheel-pan gesture has no end event, so the frame that drains WITHOUT pan input is its
+    // boundary — otherwise the second swipe of a session could not be undone.
+    var acc = Accumulator{};
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    try testing.expect(acc.take() == null);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "an idle frame ends a wheel-pan run but never a pinch run" {
+    // RUN BOUNDARIES ARE PER SOURCE, and this is the test that stops a future reader
+    // collapsing them into one rule: the SAME idle frame must end the swipe's run and leave
+    // the pinch's open, because fingers held still on a pinch send no updates.
+    var swiping = Accumulator{};
+    swiping.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    _ = swiping.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(swiping.take() == null);
+    swiping.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((swiping.take() orelse return error.TestUnexpectedNull).began);
+
+    var pinching = Accumulator{};
+    pinching.addPinch(1.1);
+    _ = pinching.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(pinching.take() == null);
+    pinching.addPinch(1.1);
+    try testing.expect(!(pinching.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "a wheel notch arriving during a pinch does not split the pinch run" {
+    // The notch is a complete gesture, but it must not END somebody else's: a pinch run is
+    // closed by `endPinch` alone, so the frames after the notch are still continuations.
+    var acc = Accumulator{};
+    acc.addPinch(1.1);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addPinch(1.1);
+    acc.addWheel(wheelSample(0.0, -1.0, -1), .auto);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addPinch(1.1);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "a swipe frame in the middle of a pinch leaves the pinch run open" {
+    // A trackpad can deliver a swipe and a pinch in the same gesture; a frame carrying only
+    // the swipe is, for the PINCH, an idle frame — and must not cost a second undo entry.
+    var acc = Accumulator{};
+    acc.addPinch(1.1);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addPinch(1.1);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "endPinch still ends a run that a wheel swipe is keeping open" {
+    var acc = Accumulator{};
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    acc.endPinch();
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
 }

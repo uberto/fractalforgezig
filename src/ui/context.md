@@ -43,7 +43,8 @@ pass→`renderDrawData(cmd,pass)`. Init order:
 ## Navigation + progressive render (main.zig)
 
 `NavState` holds drag/right-click/pass/idle state. Left-drag→`navigate.boxSelect` on release;
-middle/Space+left→`panByPixels`, reset delta after; scroll→`cursorCoord`+`zoomAbout`;
+middle/Space+left→`panByPixels`, reset delta after; wheel/pinch→`nav.gestures`(pure`ui/gesture.zig`):CLASSIFY→
+zoom-about-`cursorCoord`|pan-by-`real_s`,drained+installed-ONCE/frame,`began`⇒history;
 right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord` in the STATUS
 BAR (no tooltip). EVERY view/policy change goes through
 `applyViewCoarse`/`showViewCoarse`/`showPolicyCoarse`:
