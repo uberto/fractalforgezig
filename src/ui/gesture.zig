@@ -45,16 +45,43 @@ pub const WheelAction = enum { zoom, pan };
 /// Decide what one wheel event means. The user's declaration wins: `.mouse` always zooms and
 /// `.trackpad` always pans, whatever the deltas look like.
 ///
-/// PLACEHOLDER (T2): `.auto` currently answers `.zoom`, which is only right for a real mouse
-/// notch. **`T3` owns the `auto` discriminator** (horizontal component, then whole-tick vs
-/// fractional `integer_y`) and the approved classification scenarios are checked against `T3`,
-/// not against this line. The two declared modes below are final.
+/// `.auto` is a HEURISTIC, tried in this precedence (one early return per rule, because the
+/// rules are measured separately and `T8` may have to change exactly one of them):
+///   1. a non-zero horizontal component is a two-finger swipe, because a plain wheel has no
+///      horizontal axis at all. This is the STRONG signal: it wins even when the vertical
+///      part has accumulated a whole tick.
+///   2. otherwise a vertical delta that is not a whole tick is a swipe, trackpads reporting
+///      continuous motion where a wheel reports notches. The test is against `integer_y`,
+///      SDL's OWN tick accumulation (`SDL_events.h:504-505`), and not `@floor(y) == y` or a
+///      threshold picked here: a trackpad can deliver an exactly integral delta by
+///      coincidence (`y = -1.0`, `integer_y = 0` — a swipe) and a fast wheel can deliver
+///      several notches at once (`y = -3.0`, `integer_y = -3` — a zoom). Only `integer_y`
+///      separates those two.
+///   3. otherwise it is a mouse notch: a whole-tick vertical delta with no horizontal
+///      component, which zooms exactly as it has always done.
+///
+/// WHERE `.auto` IS KNOWN TO BE WRONG: a Magic Mouse scrolls with precise fractional deltas,
+/// indistinguishable from a trackpad's, so `.auto` reads its scroll as a swipe and pans. The
+/// cure is the user declaring `.mouse`, which is why that declaration exists. `.auto` is a
+/// convenience for the common cases, never a promise.
 pub fn classifyWheel(sample: WheelSample, mode: InputMode) WheelAction {
-    _ = sample;
-    return switch (mode) {
-        .trackpad => .pan,
-        .mouse, .auto => .zoom,
-    };
+    switch (mode) {
+        // A declaration is a fact, not evidence. No delta can outvote it.
+        .mouse => return .zoom,
+        .trackpad => return .pan,
+        .auto => {},
+    }
+
+    // Rule 1: any horizontal motion at all means fingers, not a wheel.
+    if (sample.x != 0) return .pan;
+
+    // Rule 2: continuous vertical motion means fingers. `y` disagreeing with the whole ticks
+    // SDL counted is exactly "this delta is not a notch".
+    if (sample.y != @as(f64, @floatFromInt(sample.integer_y))) return .pan;
+
+    // Rule 3: a whole tick and nothing sideways — a wheel notch, zooming as it always has.
+    // (A motionless event lands here too; `addWheel` then contributes nothing for it.)
+    return .zoom;
 }
 
 /// The sign SDL's horizontal / vertical wheel delta is multiplied by to become the VIEW pixel
@@ -450,4 +477,96 @@ test "classifyWheel reads every wheel event as a zoom when the user has declared
     // `.auto` is deliberately NOT asserted here: `T3` owns that branch.
     try testing.expectEqual(WheelAction.zoom, classifyWheel(.{ .x = 0.0, .y = -1.0, .integer_y = -1 }, .mouse));
     try testing.expectEqual(WheelAction.zoom, classifyWheel(.{ .x = 4.5, .y = -0.317, .integer_y = 0 }, .mouse));
+}
+
+// ── T3: the `.auto` discriminator ──────────────────────────────────────────────────────
+
+test "the input mode a caller gets without choosing one is auto" {
+    // The declaration order is load-bearing, not cosmetic: `.auto` is the zero value, so a
+    // zero-initialized settings field (`T6`) means "work it out", never a wrong declaration.
+    try testing.expectEqual(InputMode.auto, @as(InputMode, @enumFromInt(0)));
+}
+
+test "auto reads a whole-tick vertical delta with no horizontal component as a mouse notch" {
+    // Today's behaviour, preserved exactly: this is what a plain wheel delivers, both ways.
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(.{ .x = 0.0, .y = -1.0, .integer_y = -1 }, .auto));
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(.{ .x = 0.0, .y = 1.0, .integer_y = 1 }, .auto));
+}
+
+test "auto reads a fractional vertical delta as a two-finger swipe" {
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = 0.0, .y = -0.317, .integer_y = 0 }, .auto));
+}
+
+test "auto reads any horizontal component as a swipe even when the vertical part is a whole tick" {
+    // A plain wheel has no horizontal axis, so horizontal motion is the STRONG signal and it
+    // beats the whole tick sitting next to it.
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = 4.5, .y = -1.0, .integer_y = -1 }, .auto));
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = -6.0, .y = 0.0, .integer_y = 0 }, .auto));
+}
+
+test "auto reads a vertical delta that overshoots its whole tick as a swipe" {
+    // The cases an `@floor(y) == y` test gets wrong, and why the comparison is against SDL's
+    // own tick accumulation: a swipe whose delta happens to have just crossed a tick
+    // boundary (`y` fractional, `integer_y` non-zero) and one that ran past it.
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = 0.0, .y = 0.3, .integer_y = 1 }, .auto));
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = 0.0, .y = -1.5, .integer_y = -1 }, .auto));
+}
+
+test "auto reads a coincidentally integral delta that carries no tick as a swipe" {
+    // A trackpad can deliver exactly -1.0 without SDL calling it a notch. `integer_y` is the
+    // discriminator, so this pans; a threshold or floor test on `y` would zoom.
+    try testing.expectEqual(WheelAction.pan, classifyWheel(.{ .x = 0.0, .y = -1.0, .integer_y = 0 }, .auto));
+}
+
+test "auto reads several whole ticks arriving at once as a fast mouse wheel" {
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(.{ .x = 0.0, .y = -3.0, .integer_y = -3 }, .auto));
+}
+
+test "a declared mouse zooms the fractional sample auto reads as a swipe" {
+    const fractional = WheelSample{ .x = 0.0, .y = -0.317, .integer_y = 0 };
+    try testing.expectEqual(WheelAction.pan, classifyWheel(fractional, .auto));
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(fractional, .mouse));
+}
+
+test "a declared mouse zooms the diagonal sample auto reads as a swipe" {
+    const diagonal = WheelSample{ .x = 4.5, .y = -1.0, .integer_y = -1 };
+    try testing.expectEqual(WheelAction.pan, classifyWheel(diagonal, .auto));
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(diagonal, .mouse));
+}
+
+test "a declared trackpad pans the whole-tick sample auto reads as a notch" {
+    const notch = WheelSample{ .x = 0.0, .y = -1.0, .integer_y = -1 };
+    try testing.expectEqual(WheelAction.zoom, classifyWheel(notch, .auto));
+    try testing.expectEqual(WheelAction.pan, classifyWheel(notch, .trackpad));
+}
+
+test "a sample auto classifies as a zoom asks for a zoom and no pan" {
+    // The seam `T5` applies: a zoom intent must not also move the view sideways.
+    var acc = Accumulator{};
+    acc.addWheel(.{ .x = 0.0, .y = -1.0, .integer_y = -1 }, .auto);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(navigate.zoom_step_out, intent.zoom_factor orelse return error.TestUnexpectedNull);
+    try testing.expectEqual(@as(f64, 0.0), intent.pan_dx);
+    try testing.expectEqual(@as(f64, 0.0), intent.pan_dy);
+}
+
+test "a sample auto classifies as a pan asks for a pan and no zoom" {
+    var acc = Accumulator{};
+    acc.addWheel(.{ .x = 4.5, .y = -0.317, .integer_y = 0 }, .auto);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(intent.zoom_factor == null);
+    try testing.expect(intent.pan_dx != 0.0);
+    try testing.expect(intent.pan_dy != 0.0);
+}
+
+test "a wheel event with no motion does not start a gesture run in any mode" {
+    // A motionless wheel event must cost nothing at all — starting a run would spend an undo
+    // entry on it, so the pinch that follows must still report `began`.
+    for ([_]InputMode{ .auto, .mouse, .trackpad }) |mode| {
+        var acc = Accumulator{};
+        acc.addWheel(.{ .x = 0.0, .y = 0.0, .integer_y = 0 }, mode);
+        try testing.expect(acc.take() == null);
+        acc.addPinch(1.25);
+        try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    }
 }
