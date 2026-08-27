@@ -335,6 +335,55 @@ pub const Accumulator = struct {
     }
 };
 
+/// Whose turn it is to push an undo entry: ONE per gesture run, and OWED UNTIL A VIEW IS
+/// ACTUALLY INSTALLED — not merely until a frame reporting `began` has been delivered.
+///
+/// WHY THIS EXISTS, i.e. the bug it was extracted out of `main.zig` to make testable. The
+/// accumulator reports `began` exactly ONCE per run and never re-offers it, so an edge that reads
+/// `began` itself as "push history now" LOSES the run's entry whenever that first frame happens
+/// to install nothing — and a frame can install nothing for three ordinary reasons: the new view
+/// is bit-identical to the one on screen (a pinch closed while already saturated at
+/// `navigate.max_view_side`, which the install path refuses as a no-op), `navigate` refused the
+/// transform, or the cursor was off the image rect so the gesture was ignored. Reverse the same
+/// pinch without lifting the fingers and the zoom then lands with NO history entry at all, so one
+/// Ctrl+Z jumps to a view from BEFORE the gesture — exactly what the requirement *one whole pinch
+/// gesture is a single step for undo* forbids. Keeping the entry OWED until one was really pushed
+/// makes it survive any number of dropped frames while still costing exactly one.
+///
+/// THE DEBT IS DELIBERATELY NOT CLEARED WHEN A RUN ENDS. A run that installed nothing at all
+/// leaves it standing, and the next run's first install pays it — which is the same single entry
+/// that run wanted anyway. So there is no `endRun` here: one entry per run follows from `settle`
+/// being the ONLY writer that clears the debt, not from tracking run boundaries a second time
+/// (the accumulator already owns those, see `RunSource`).
+///
+/// Owned by the event loop next to the `Accumulator`, and living HERE rather than as a flag in
+/// `main.zig` because `main.zig` has no test tier (`src/context.md`) — the decision above is the
+/// whole content of the bug, so it has to be somewhere a test can fail.
+pub const HistoryDebt = struct {
+    /// The current run's undo entry has not been pushed yet.
+    owed: bool = false,
+
+    /// Note a drained intent: call once per `take()` that returned one, with `Intent.began`. The
+    /// frame that BEGINS a run owes that run's entry; a continuation frame changes nothing — in
+    /// particular it does NOT clear a debt the begin frame failed to pay.
+    pub fn owe(d: *HistoryDebt, began: bool) void {
+        if (began) d.owed = true;
+    }
+
+    /// Whether the install about to happen must PUSH the undo entry (`applyViewCoarse`) rather
+    /// than merely show the view (`showViewCoarse`). A query: asking does not pay.
+    pub fn owes(d: HistoryDebt) bool {
+        return d.owed;
+    }
+
+    /// An undo entry was ACTUALLY pushed. The only thing that clears the debt, and it must be
+    /// called on that outcome alone — never on "the pushing path was chosen", which is the
+    /// distinction this entire type exists to draw.
+    pub fn settle(d: *HistoryDebt) void {
+        d.owed = false;
+    }
+};
+
 /// The predicate both a pinch scale and a resulting zoom factor must satisfy: `navigate` needs
 /// a finite, positive side multiplier, and anything else is refused rather than corrected.
 fn positiveFinite(x: f64) bool {
@@ -798,4 +847,81 @@ test "endPinch still ends a run that a wheel swipe is keeping open" {
     try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
     acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
     try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+// ── T4 rework: the undo entry a gesture run OWES until a view is installed ──────────────
+
+test "a frame in the middle of a run with no debt outstanding owes no undo entry" {
+    var debt = HistoryDebt{};
+    debt.owe(false);
+    try testing.expect(!debt.owes());
+}
+
+test "the frame that begins a run owes that run's undo entry" {
+    var debt = HistoryDebt{};
+    debt.owe(true);
+    try testing.expect(debt.owes());
+}
+
+test "a began frame that installed nothing leaves the undo entry still owed" {
+    // THE REGRESSION this type exists for. `began` is reported once per run and never again, so
+    // a begin frame whose view change the edge DROPPED — bit-identical at
+    // `navigate.max_view_side`, refused by `navigate`, or ignored because the cursor was off the
+    // image rect — must not carry the run's entry away with it.
+    var debt = HistoryDebt{};
+    debt.owe(true); // frame 1: the run begins, and the edge installs nothing — so no settle.
+    debt.owe(false); // frame 2: same run, and this one does change the view.
+    try testing.expect(debt.owes());
+}
+
+test "the install that pushed the entry pays the debt for the rest of the run" {
+    var debt = HistoryDebt{};
+    debt.owe(true);
+    debt.settle();
+    debt.owe(false);
+    try testing.expect(!debt.owes());
+}
+
+test "each gesture run owes its own undo entry" {
+    var debt = HistoryDebt{};
+    debt.owe(true);
+    debt.settle();
+    debt.owe(true);
+    try testing.expect(debt.owes());
+}
+
+test "a pinch reversed after a dropped first frame still owes exactly one undo entry" {
+    // The whole reachable case, in the pure tier: at `navigate.max_view_side` a pinch CLOSED
+    // produces a bit-identical view, so the edge installs nothing on the run's ONLY `began`
+    // frame; reversing to pinch OPEN without lifting the fingers is still the same run.
+    var acc = Accumulator{};
+    var debt = HistoryDebt{};
+
+    acc.addPinch(0.8); // fingers closing at the wide bound: nothing gets installed.
+    debt.owe((acc.take() orelse return error.TestUnexpectedNull).began);
+
+    acc.addPinch(1.25); // fingers opening: this frame really does change the view.
+    const reversed = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(!reversed.began); // premise: `began` is never re-offered.
+    debt.owe(reversed.began);
+    try testing.expect(debt.owes()); // ...so the DEBT is what makes this install push the entry.
+
+    debt.settle();
+    acc.addPinch(1.25);
+    debt.owe((acc.take() orelse return error.TestUnexpectedNull).began);
+    try testing.expect(!debt.owes()); // and no later frame of the run pushes a second entry.
+}
+
+test "every wheel notch pays its own undo entry" {
+    // One notch, one undo entry — the pre-M7 behaviour, now routed through the debt. A notch
+    // closes its own run (`RunSource`), so every one of them reports `began` and owes again.
+    var acc = Accumulator{};
+    var debt = HistoryDebt{};
+    var notches: usize = 0;
+    while (notches < 3) : (notches += 1) {
+        acc.addWheel(wheelSample(0.0, -1.0, -1), .auto);
+        debt.owe((acc.take() orelse return error.TestUnexpectedNull).began);
+        try testing.expect(debt.owes());
+        debt.settle(); // the edge installed the notch's view and pushed its entry.
+    }
 }

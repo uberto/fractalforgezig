@@ -46,7 +46,7 @@ pass→`renderDrawData(cmd,pass)`. Init order:
 middle/Space+left→`panByPixels`, reset delta after;
 wheel/pinch→`nav.gestures`(pure`ui/gesture.zig`):CLASSIFY-by-`nav.input_mode`(Input→device
 combo REQUESTS,`CoordRequest.input_mode`;session-only)→
-zoom-about-`cursorCoord`|pan-by-`real_s`,drained+installed-ONCE/frame,`began`⇒history;
+zoom-about-`cursorCoord`|pan-by-`real_s`,drained+installed-ONCE/frame,`began`⇒`HistoryDebt`(1-undo-entry/run,owed-till-a-view-installs);
 right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord` in the STATUS
 BAR (no tooltip). EVERY view/policy change goes through
 `applyViewCoarse`/`showViewCoarse`/`showPolicyCoarse`:

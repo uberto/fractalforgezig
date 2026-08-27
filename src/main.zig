@@ -213,6 +213,12 @@ const NavState = struct {
     /// `runLoop` — so N pinch updates or N swipe deltas arriving in one frame cost one coarse
     /// render and one undo entry, not N of each.
     gestures: gesture.Accumulator = .{},
+    /// The undo entry the CURRENT gesture run still owes — the pure latch that makes one whole
+    /// gesture one undo step even when the run's first frame changes nothing on screen. Read
+    /// instead of `Intent.began` at the drain's install (see there, and `gesture.HistoryDebt`
+    /// for the bug it exists to prevent). Not in `main.zig` as a bare `bool` on purpose: the
+    /// decision it encodes is the whole content of that bug and this file has no test tier.
+    history_debt: gesture.HistoryDebt = .{},
     /// Which pointing device the wheel events are coming from, and the ONE place that answer
     /// lives. `.auto` detects (a whole tick with no horizontal component is a mouse notch and
     /// zooms; anything else is a two-finger swipe and pans); the data panel's Input → device
@@ -332,6 +338,11 @@ fn syncTexture(device: gpu.Device, texture: *texture_mod.Texture, engine: *engin
 /// Apply a new view: push the old one on the undo stack, then show it (see `showViewCoarse`).
 /// Every USER navigation (gesture, context menu, coord panel) comes through here; undo/redo
 /// and file-load skip the history push and call `showViewCoarse` directly.
+///
+/// RETURNS whether an undo entry was actually pushed, which is false exactly when the no-op
+/// guard below refused the view. Only the gesture drain reads it — a gesture run owes ONE entry
+/// and must keep owing it until one is really pushed (`gesture.HistoryDebt`); every other caller
+/// is a single discrete navigation and discards the answer.
 fn applyViewCoarse(
     engine: *engine_mod.Engine,
     nav: *NavState,
@@ -339,14 +350,15 @@ fn applyViewCoarse(
     real_w: u32,
     real_h: u32,
     view_editor: *editor_mod.ViewEditor,
-) void {
+) bool {
     // A gesture that lands on the view already on screen is a no-op: re-installing it would
     // re-render an identical image and stack up duplicate undo entries. This is the ORDINARY
     // case at `navigate.max_view_side` (F1), where every further zoom-out notch saturates on
     // the same view — and it was always true of a zero-delta drag.
-    if (std.meta.eql(new_view, engine.view)) return;
+    if (std.meta.eql(new_view, engine.view)) return false;
     historyPush(nav, engine.view);
     showViewCoarse(engine, nav, new_view, real_w, real_h, view_editor);
+    return true;
 }
 
 /// Install `new_view` and render it COARSE right away, then arm the full-resolution pass.
@@ -652,16 +664,28 @@ fn runLoop(
         //
         // The applyViewCoarse-vs-showViewCoarse choice below IS THE UNDO MECHANISM. Do not
         // "simplify" it to `applyViewCoarse` everywhere: that one pushes history, this one does
-        // not, so `intent.began` (the FIRST frame of a gesture run) records the PRE-GESTURE
-        // view and every later frame of the same run only shows its result. That is what makes
-        // one Ctrl+Z after a long pinch return to where the pinch started instead of to its
-        // second-to-last frame — one undo entry per GESTURE, not per frame. `historyPush` is
-        // not called from here; `applyViewCoarse` owns it, including its no-op guard (which is
-        // what stops a pinch-out saturated at `navigate.max_view_side` stacking entries).
+        // not, so the FIRST INSTALL of a gesture run records the PRE-GESTURE view and every later
+        // frame of the same run only shows its result. That is what makes one Ctrl+Z after a long
+        // pinch return to where the pinch started instead of to its second-to-last frame — one
+        // undo entry per GESTURE, not per frame. `historyPush` is not called from here;
+        // `applyViewCoarse` owns it, including its no-op guard (which is what stops a pinch-out
+        // saturated at `navigate.max_view_side` stacking entries).
+        //
+        // WHICH INSTALL IS THE FIRST ONE IS `nav.history_debt`'S ANSWER, NOT `intent.began`'S.
+        // `began` is reported once per run and never re-offered, so reading it directly loses the
+        // run's entry whenever the begin frame installs nothing — the saturated-then-reversed
+        // pinch, a refused `zoomAbout`, a cursor off the image rect. The debt stays owed until an
+        // entry is really pushed; `gesture.HistoryDebt` documents the case and its tests pin it,
+        // which is why the latch is a pure type and not a `bool` here.
         // Which frames report `began` is the accumulator's business and depends on the event
         // SOURCE (`gesture.RunSource`): one wheel notch is one run and so one undo entry, as it
         // has always been, while a whole pinch or a whole swipe is one.
         if (nav.gestures.take()) |intent| {
+            // A run that has just begun OWES its one undo entry from here on. Noted BEFORE any
+            // of the work below, because every reason that work can install nothing must leave
+            // the debt standing rather than spend it.
+            nav.history_debt.owe(intent.began);
+
             // ONE cursor read for the whole drained frame — the same `SDL_GetMouseState` the
             // hover readout uses a few lines below. Neither the pinch event
             // (`SDL_PinchFingerEvent` has no position, `SDL_events.h:799-806`) nor the reduced
@@ -738,12 +762,17 @@ fn runLoop(
             }
 
             // The single install. `next_view` is null when the gesture was ignored (cursor off
-            // the image) or refused, and then the view is left exactly as it was.
+            // the image) or refused, and then the view is left exactly as it was — and the run's
+            // undo entry stays OWED, so the first later frame that does move the view pushes it.
             if (next_view) |v| {
-                if (intent.began)
-                    applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor)
-                else
+                if (nav.history_debt.owes()) {
+                    // Settle ONLY on the answer, never on the choice: `applyViewCoarse` returns
+                    // false when its no-op guard refused the view (bit-identical to what is on
+                    // screen), and that frame pushed nothing, so the entry is still owed.
+                    if (applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor)) nav.history_debt.settle();
+                } else {
                     showViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+                }
             }
         }
 
@@ -836,13 +865,13 @@ fn runLoop(
                 .center_here => viewport.SquareView.fromCenterSide(pt, engine.view.side) catch null,
                 .none => null,
             };
-            if (new_view) |v| applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+            if (new_view) |v| _ = applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
         }
 
         // Coord-panel commits. The panel only PARSES and asks (see `panels.CoordRequest`);
         // installing a view or policy is a re-render, and it goes through the same coarse →
         // progressive path as a gesture so the window keeps drawing.
-        if (draw_result.coord.view) |v| applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
+        if (draw_result.coord.view) |v| _ = applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
         if (draw_result.coord.policy) |p| showPolicyCoarse(engine, &nav, p, real_w, real_h, view_editor);
 
         // The declared pointing device (M7/T6). The ONLY request from the panel that installs
@@ -1030,7 +1059,7 @@ fn handleNavInput(
                 break :blk null;
             };
             if (new_view) |v| {
-                applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
+                _ = applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
                 ig.igResetMouseDragDelta(btn);
             }
         }
@@ -1100,7 +1129,7 @@ fn handleNavInput(
                 app_log.warn("box-select rejected ({s})", .{@errorName(err)});
                 break :blk null;
             };
-            if (new_view) |v| applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
+            if (new_view) |v| _ = applyViewCoarse(engine, nav, v, real_w, real_h, view_editor);
             nav.drag_state = .none;
             ig.igResetMouseDragDelta(ig.mouse_button_left);
         }
