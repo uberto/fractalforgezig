@@ -213,10 +213,13 @@ const NavState = struct {
     /// `runLoop` — so N pinch updates or N swipe deltas arriving in one frame cost one coarse
     /// render and one undo entry, not N of each.
     gestures: gesture.Accumulator = .{},
-    /// Which pointing device the wheel events are coming from. `.auto` detects (a whole tick
-    /// with no horizontal component is a mouse notch and zooms; anything else is a two-finger
-    /// swipe and pans); `T6` adds the control that lets the user overrule the detection, and
-    /// this task only READS the field, defaulted.
+    /// Which pointing device the wheel events are coming from, and the ONE place that answer
+    /// lives. `.auto` detects (a whole tick with no horizontal component is a mouse notch and
+    /// zooms; anything else is a two-finger swipe and pans); the data panel's Input → device
+    /// control overrules the detection by asking for a new value here
+    /// (`panels.CoordRequest.input_mode`, installed after the frame). The panel keeps no copy: it
+    /// DISPLAYS this field, so the two cannot disagree. Session-only by design — a milestone
+    /// non-goal — so it is not saved to a `.fractal` file and starts at `.auto` every run.
     input_mode: gesture.InputMode = .auto,
     /// Whether the view now on screen is already past `viewport.precision_floor_side`.
     /// Exists ONLY to make that warning EDGE-TRIGGERED: a continuous pinch installs a view
@@ -762,6 +765,7 @@ fn runLoop(
             nav.open_ctx_menu,
             nav.right_click_pt,
             hover_pt,
+            nav.input_mode,
             nav.rendering,
             engine.passFraction(),
             &quit_requested,
@@ -829,6 +833,13 @@ fn runLoop(
         // progressive path as a gesture so the window keeps drawing.
         if (draw_result.coord.view) |v| applyViewCoarse(engine, &nav, v, real_w, real_h, view_editor);
         if (draw_result.coord.policy) |p| showPolicyCoarse(engine, &nav, p, real_w, real_h, view_editor);
+
+        // The declared pointing device (M7/T6). The ONLY request from the panel that installs
+        // without a re-render: it changes what the NEXT wheel event means, not what is on screen,
+        // so there is no coarse preview, no history entry and — deliberately — no log line. It is
+        // a preference the user can see the effect of by scrolling once; announcing it would be
+        // noise, and a failure is impossible: the field write cannot fail.
+        if (draw_result.coord.input_mode) |m| nav.input_mode = m;
 
         // Navigation ImGui input: box-select and pan.
         handleNavInput(engine, &nav, image_rect.*, real_w, real_h, real_s, view_editor);

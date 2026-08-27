@@ -12,6 +12,7 @@ const c = @import("../c.zig").c;
 const ig = @import("../cimgui.zig");
 const stats = @import("stats.zig");
 const editor_mod = @import("editor.zig");
+const gesture = @import("gesture.zig");
 const viewport = @import("../fractal/viewport.zig");
 const engine_mod = @import("../fractal/engine.zig");
 const texture_mod = @import("../gpu/texture.zig");
@@ -104,6 +105,12 @@ pub const DrawResult = struct {
 pub const CoordRequest = struct {
     view: ?viewport.SquareView = null,
     policy: ?autoiter.IterPolicy = null,
+    /// The pointing device the user just declared (M7/T6), null when they did not touch the
+    /// control this frame. Installing it is a plain `NavState.input_mode` write — unlike its two
+    /// siblings it re-renders NOTHING, because it only changes what the NEXT wheel event means.
+    /// It is still a request rather than a direct write: the panel is drawn inside the ImGui
+    /// frame and does not own engine or navigation state (see this struct's rule above).
+    input_mode: ?gesture.InputMode = null,
 };
 
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
@@ -113,6 +120,10 @@ pub const CoordRequest = struct {
 /// `open_ctx_menu` / `right_click_pt` / `hover_pt` come from the navigation layer in
 /// `main.zig`; the popup and status bar are rendered here, inside the ImGui window,
 /// so they share the correct ID stack.
+///
+/// `input_mode` is the device declaration in force right now (`NavState.input_mode`): it is what
+/// the input control DISPLAYS. The control does not keep its own copy — a new choice comes back in
+/// `CoordRequest.input_mode` for main.zig to install, so there is no second copy to drift.
 ///
 /// `rendering` freezes the edit panels (a value edited against a half-rendered image would be
 /// applied to the next pass anyway); `progress` is the in-flight pass's completion, which
@@ -128,6 +139,7 @@ pub fn draw(
     open_ctx_menu: bool,
     right_click_pt: viewport.ComplexHi,
     hover_pt: ?viewport.ComplexHi,
+    input_mode: gesture.InputMode,
     rendering: bool,
     progress: ?f32,
     quit_requested: *bool,
@@ -199,6 +211,8 @@ pub fn draw(
         if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
         ig.igSpacing();
         coord_request = drawCoordPanel(engine, view_editor);
+        ig.igSpacing();
+        coord_request.input_mode = drawInputPanel(input_mode);
         ig.igSpacing();
         if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
             drawPalettePanel(device, texture, engine, editor);
@@ -497,6 +511,60 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
     ig.igEndDisabled();
 
     return req;
+}
+
+/// The input-device item labels as null-terminated C pointers, derived at comptime from the pure
+/// `editor.input_mode_items` — same construction as `mode_items_c` below, same reason.
+const input_mode_items_c = blk: {
+    var arr: [editor_mod.input_mode_items.len][*:0]const u8 = undefined;
+    for (editor_mod.input_mode_items, 0..) |s, i| arr[i] = s.ptr;
+    break :blk arr;
+};
+
+/// Hover text for the input-device control. States the problem before the setting, because a user
+/// who has not read the spec has no reason to expect a "device" question from a fractal viewer.
+///
+/// HARD-WRAPPED on purpose: ImGui sizes a tooltip to its longest line and never wraps it for you,
+/// so one long line would be a tooltip wider than the window.
+const input_mode_help =
+    "A trackpad two-finger swipe and a mouse wheel notch reach\n" ++
+    "the app as the SAME event, so it has to guess which one\n" ++
+    "you are using. Auto guesses from the event, and gets a\n" ++
+    "Magic Mouse wrong. If scrolling pans when you meant to\n" ++
+    "zoom, or zooms when you meant to pan, name your device.";
+
+/// The input-device control (M7/T6): which pointing device the mouse-wheel events are coming from,
+/// so the user can overrule detection when `Auto` gets it wrong.
+///
+/// REQUESTS, NEVER APPLIES — like `drawCoordPanel`. Returns the newly chosen mode, or null when the
+/// user did not touch the control this frame; main.zig installs it into `NavState.input_mode` after
+/// the frame. `current` is that same field, so what the control shows is always the mode actually
+/// in force: `index` below is a FRAME-LOCAL derived from it, not stored widget state. ImGui reads
+/// the selection through that pointer and writes the click back into it in the same call, so a
+/// local is sufficient — and it means a request that never got installed snaps visibly back
+/// instead of leaving the panel disagreeing with the wheel.
+///
+/// A combo rather than a radio row: the widget itself needed no new `../cimgui.zig` decl
+/// (`igCombo_Str_arr` is already there for the palette mapping — only the tooltip added one), and
+/// its width comes from ImGui's default item width, which is a fraction of the panel's own content
+/// region. So it cannot push the data panel past `data_panel_w` and squeeze the coordinate fields.
+fn drawInputPanel(current: gesture.InputMode) ?gesture.InputMode {
+    ig.igSeparatorText("Input");
+    var index: c_int = editor_mod.inputModeToIndex(current);
+    const clicked = ig.igCombo_Str_arr("device", &index, &input_mode_items_c, input_mode_items_c.len, -1);
+    // Tooltip on the combo itself, hence immediately after it: `igBeginItemTooltip` attaches to the
+    // LAST item submitted. `igEndTooltip` ONLY when it returned true — pairing it unconditionally
+    // would end a scope that was never begun.
+    if (ig.igBeginItemTooltip()) {
+        ig.igTextUnformatted(input_mode_help, null);
+        ig.igEndTooltip();
+    }
+    if (!clicked) return null;
+    const chosen = editor_mod.indexToInputMode(index);
+    // Re-picking the item already active is not a change to install; `NavState.input_mode` would
+    // end up the same either way, but returning null keeps "a request means something changed".
+    if (chosen == current) return null;
+    return chosen;
 }
 
 /// The mapping-mode combo labels as null-terminated C pointers, derived at comptime from

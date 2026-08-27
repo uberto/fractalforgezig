@@ -26,7 +26,7 @@ save_requested,open_requested,coord}`: `image_rect`=fitted ON-SCREEN rect (mappi
 must be short LITERALS, never the `undefined` buffer. Left: image; right:
 data+coord+palette. Menu: File→Save…/Open…/Quit, Help→About. Palette widgets edit
 stops/mode/period/interior; `applyEdits`→setter→re-upload, NEVER re-iterates. `editor.zig` (PURE):
-`Editor`+`toGradient`+`addStop`/`removeStop`. `stats.zig` (PURE):
+`Editor`+`toGradient`+`addStop`/`removeStop`+`indexToInputMode`. `stats.zig` (PURE):
 `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
 
 ## Stack, bridge, `Ui` (imgui.zig)
@@ -43,7 +43,9 @@ pass→`renderDrawData(cmd,pass)`. Init order:
 ## Navigation + progressive render (main.zig)
 
 `NavState` holds drag/right-click/pass/idle state. Left-drag→`navigate.boxSelect` on release;
-middle/Space+left→`panByPixels`, reset delta after; wheel/pinch→`nav.gestures`(pure`ui/gesture.zig`):CLASSIFY→
+middle/Space+left→`panByPixels`, reset delta after;
+wheel/pinch→`nav.gestures`(pure`ui/gesture.zig`):CLASSIFY-by-`nav.input_mode`(Input→device
+combo REQUESTS,`CoordRequest.input_mode`;session-only)→
 zoom-about-`cursorCoord`|pan-by-`real_s`,drained+installed-ONCE/frame,`began`⇒history;
 right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord` in the STATUS
 BAR (no tooltip). EVERY view/policy change goes through

@@ -20,6 +20,7 @@ const mapping = @import("../fractal/mapping.zig");
 const color = @import("../fractal/color.zig");
 const viewport = @import("../fractal/viewport.zig");
 const autoiter = @import("../fractal/autoiter.zig");
+const gesture = @import("gesture.zig");
 
 /// Reused verbatim from `color.zig` (M0). Channel order R, G, B, A. Do not redefine.
 pub const Rgba8 = color.Rgba8;
@@ -27,6 +28,12 @@ pub const Rgba8 = color.Rgba8;
 /// Combo item labels, indexed by the `Editor.mode_index` (see `indexToMode`). The order
 /// here IS the combo order the UI shows and MUST match `modeToIndex`.
 pub const mode_items = [_][:0]const u8{ "linear", "log", "cyclic" };
+
+/// Item labels for the INPUT-DEVICE control (M7/T6), indexed by `inputModeToIndex`. The order
+/// here IS the order the control shows, so `Auto` first is what a fresh session displays
+/// (`gesture.InputMode.auto` is also the default `NavState.input_mode`). Title case, unlike
+/// `mode_items`: these read as three named devices rather than three formulae.
+pub const input_mode_items = [_][:0]const u8{ "Auto", "Mouse", "Trackpad" };
 
 /// The color a freshly-added stop gets: a neutral mid-gray at the palette's midpoint, so
 /// a new stop is immediately visible and editable without reading undefined memory.
@@ -385,6 +392,32 @@ pub fn indexToMode(i: c_int) mapping.Mode {
     };
 }
 
+/// Map a `gesture.InputMode` to its index in `input_mode_items`. Inverse of `indexToInputMode`.
+///
+/// This exists because the control DERIVES what it shows from the mode actually in force
+/// (`NavState.input_mode`) every frame instead of keeping a second copy of it: there is no
+/// widget state to drift, and a request main.zig did not install snaps visibly back.
+pub fn inputModeToIndex(m: gesture.InputMode) c_int {
+    return switch (m) {
+        .auto => 0,
+        .mouse => 1,
+        .trackpad => 2,
+    };
+}
+
+/// Map an item index back to a `gesture.InputMode`. Any out-of-range index falls back to
+/// `.auto` — the detection default — rather than trapping, exactly as `indexToMode` falls back
+/// to `linear`: a stray widget value must not be able to crash the UI, and `.auto` is the one
+/// answer that is never a lie about the user's intent.
+pub fn indexToInputMode(i: c_int) gesture.InputMode {
+    return switch (i) {
+        0 => .auto,
+        1 => .mouse,
+        2 => .trackpad,
+        else => .auto,
+    };
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -482,6 +515,77 @@ test "mode_items order matches the combo index mapping" {
     try testing.expectEqualStrings("linear", mode_items[@intCast(modeToIndex(.linear))]);
     try testing.expectEqualStrings("log", mode_items[@intCast(modeToIndex(.log))]);
     try testing.expectEqualStrings("cyclic", mode_items[@intCast(modeToIndex(.cyclic))]);
+}
+
+// ─── Input-device control tests (M7/T6) ───────────────────────────────────────
+//
+// The panel's control is untestable (`panels.zig` imports `c.zig`), so what these pin is the
+// only part of it that CAN be wrong silently: the item the user clicks and the `InputMode` that
+// reaches `gesture.classifyWheel`. A label table one place out of step with the mapping would
+// hand the classifier the wrong device and leave every gesture test green.
+
+/// Index of the item whose LABEL is `label` — what the user actually clicks. Test-only: the
+/// widget code goes the other way (mode → index), so a test that started from the index could
+/// not tell an off-by-one label order from a correct one.
+fn indexOfInputModeLabel(label: []const u8) c_int {
+    for (input_mode_items, 0..) |item, i| {
+        if (std.mem.eql(u8, item, label)) return @intCast(i);
+    }
+    return -1;
+}
+
+test "each input-device label sits at the index its mode maps to" {
+    try testing.expectEqualStrings("Auto", input_mode_items[@intCast(inputModeToIndex(.auto))]);
+    try testing.expectEqualStrings("Mouse", input_mode_items[@intCast(inputModeToIndex(.mouse))]);
+    try testing.expectEqualStrings("Trackpad", input_mode_items[@intCast(inputModeToIndex(.trackpad))]);
+}
+
+test "the input-device list offers exactly one item per input mode" {
+    try testing.expectEqual(@typeInfo(gesture.InputMode).@"enum".fields.len, input_mode_items.len);
+}
+
+test "the item the control shows before the user picks anything is Auto" {
+    try testing.expectEqual(gesture.InputMode.auto, indexToInputMode(0));
+    try testing.expectEqualStrings("Auto", input_mode_items[0]);
+}
+
+test "every input mode round-trips through its item index" {
+    for ([_]gesture.InputMode{ .auto, .mouse, .trackpad }) |m| {
+        try testing.expectEqual(m, indexToInputMode(inputModeToIndex(m)));
+    }
+}
+
+test "an out-of-range input-device index falls back to auto rather than trapping" {
+    for ([_]c_int{ -1, 3, 99 }) |i| {
+        try testing.expectEqual(gesture.InputMode.auto, indexToInputMode(i));
+    }
+}
+
+test "picking the Mouse item makes a fractional wheel event zoom" {
+    const fractional = gesture.WheelSample{ .x = 0.0, .y = -0.317, .integer_y = 0 };
+    // Left to detect for itself the app would read this as a trackpad swipe...
+    try testing.expectEqual(gesture.WheelAction.pan, gesture.classifyWheel(fractional, .auto));
+
+    // ...but the item labelled "Mouse" declares a mouse, and the declaration wins.
+    const declared = indexToInputMode(indexOfInputModeLabel("Mouse"));
+    var acc = gesture.Accumulator{};
+    acc.addWheel(fractional, declared);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(intent.zoom_factor != null);
+}
+
+test "picking the Trackpad item makes a whole-tick wheel event pan" {
+    const notch = gesture.WheelSample{ .x = 0.0, .y = -1.0, .integer_y = -1 };
+    // Left to detect for itself the app would read this as a mouse notch...
+    try testing.expectEqual(gesture.WheelAction.zoom, gesture.classifyWheel(notch, .auto));
+
+    // ...but the item labelled "Trackpad" declares a trackpad, and the declaration wins.
+    const declared = indexToInputMode(indexOfInputModeLabel("Trackpad"));
+    var acc = gesture.Accumulator{};
+    acc.addWheel(notch, declared);
+    const intent = acc.take() orelse return error.TestUnexpectedNull;
+    try testing.expect(intent.zoom_factor == null);
+    try testing.expect(intent.pan_dy != 0.0);
 }
 
 // ─── ViewEditor tests ─────────────────────────────────────────────────────────

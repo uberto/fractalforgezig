@@ -154,6 +154,17 @@ pub extern fn igGetForegroundDrawList_ViewportPtr(viewport: ?*anyopaque) ?*ImDra
 pub extern fn igBeginTooltip() bool;
 pub extern fn igEndTooltip() void;
 
+/// Open a tooltip for the item just submitted, when it is hovered long enough (M7/T6: the
+/// input-device control's explanation). Returns false when no tooltip is wanted this frame, in
+/// which case NOTHING may be drawn and `igEndTooltip` must NOT be called.
+///
+/// Pair it with `igTextUnformatted`, not with cimgui's `igSetItemTooltip`: that one is variadic, so
+/// a `%` in the text would be read as a format specifier, and its non-variadic `igSetItemTooltip0`
+/// wrapper is compiled out unless `CIMGUI_VARGS0` is defined (`vendor/cimgui/cimgui.cpp:1286`) —
+/// it links only after a build.zig change. ImGui does NOT wrap tooltip text, so pre-wrap it with
+/// `\n` or the tooltip window grows as wide as the longest line.
+pub extern fn igBeginItemTooltip() bool;
+
 // Coordinate panel widgets (T7): text input, checkbox, button.
 pub const InputTextFlags = c_int;
 /// `ImGuiInputTextFlags_EnterReturnsTrue` — confirm the field on Enter.
