@@ -765,6 +765,26 @@ test "a swipe frame in the middle of a pinch leaves the pinch run open" {
     try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
     acc.addWheel(.{ .x = 3.0, .y = 1.5, .integer_y = 0 }, .trackpad);
     try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    // The input-less drain is what makes this test able to fail. `began == false` above is
+    // true of a `.pinch` run AND of the `.wheel_pan` run the swipe would open if the pinch
+    // run were not sticky; only an idle frame tells them apart, because it closes a
+    // `.wheel_pan` run and leaves a `.pinch` one open. Without it the assertions below pass
+    // with the stickiness deleted.
+    try testing.expect(acc.take() == null);
+    acc.addPinch(1.1);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+}
+
+test "a notch-only frame in the middle of a pinch leaves the pinch run open" {
+    // Same sticky run as the swipe-only frame, reached by the other source: a notch is a
+    // self-contained gesture that closes ITS run, and must not close a pinch's. The idle
+    // frame after it is again the probe — it may not end the pinch.
+    var acc = Accumulator{};
+    acc.addPinch(1.1);
+    try testing.expect((acc.take() orelse return error.TestUnexpectedNull).began);
+    acc.addWheel(wheelSample(0.0, -1.0, -1), .auto);
+    try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
+    try testing.expect(acc.take() == null);
     acc.addPinch(1.1);
     try testing.expect(!(acc.take() orelse return error.TestUnexpectedNull).began);
 }
