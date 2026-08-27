@@ -402,11 +402,15 @@ fn showPolicyCoarse(
     engine.cancelPass();
     engine.installPolicy(policy) catch |err| {
         app_log.err("max_iter policy rejected ({s}); keeping the previous one", .{@errorName(err)});
-        view_editor.syncFromPolicy(engine.policy);
+        // Rejected: the engine kept its previous policy AND its previous count, so this restores
+        // the field to what the pixels on screen were computed with.
+        view_editor.syncFromPolicy(engine.policy, engine.max_iter);
         return;
     };
     renderCoarse(engine, nav, real_w, real_h);
-    view_editor.syncFromPolicy(engine.policy);
+    // After the coarse render `engine.max_iter` is the count the new policy actually resolved to —
+    // the ramp's value under Auto, the pin under a manual policy. Never re-derive it here.
+    view_editor.syncFromPolicy(engine.policy, engine.max_iter);
     armFullPass(nav);
 }
 
@@ -752,6 +756,13 @@ fn runLoop(
         _ = c.SDL_GetMouseState(&mx, &my);
         const hover_pt = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
 
+        // While Auto is on, the iteration field is a READOUT of `engine.max_iter`, and the ramp
+        // moves that on every zoom — so refresh it from the engine once per frame, before the panel
+        // draws it. One site, and it covers every path that can change the count. Guarded on
+        // `iterFieldReadOnly`: overwriting the buffer while the pin is manual would fight the
+        // user's own half-typed text.
+        if (view_editor.iterFieldReadOnly()) view_editor.syncFromPolicy(engine.policy, engine.max_iter);
+
         var quit_requested = false;
         // open_ctx_menu and right_click_pt are consumed inside draw (popup lives there).
         const draw_result = panels.draw(
@@ -975,7 +986,7 @@ fn handleDialogResult(
 
             syncTexture(device, texture, engine);
             view_editor.syncFromView(engine.view);
-            view_editor.syncFromPolicy(engine.policy);
+            view_editor.syncFromPolicy(engine.policy, engine.max_iter);
             nav.needs_upload = true;
             armFullPass(nav);
             app_log.info("state loaded from '{s}'", .{path});

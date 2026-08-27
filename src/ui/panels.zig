@@ -484,33 +484,69 @@ fn drawCoordPanel(engine: *const engine_mod.Engine, ve: *editor_mod.ViewEditor) 
         if (req.view == null) req.view = navigate.reset();
     }
 
-    // max_iter control: Auto checkbox + manual field
+    // max_iter control: Auto checkbox + the field showing the count in use
     ig.igSeparatorText("max_iter");
     if (ig.igCheckbox("Auto", &ve.auto_iter)) {
-        req.policy = if (ve.auto_iter)
-            .{ .auto = true }
-        else
-            // Leaving auto: pin the field's value, falling back to the engine's when the
-            // text is blank or garbage.
-            ve.parseIterPolicy() orelse
-                autoiter.IterPolicy{ .auto = false, .manual_value = engine.policy.manual_value };
+        // Leaving auto pins the count ON DISPLAY (`ViewEditor.leaveAuto`, which is total), so the
+        // user edits on from whatever the ramp chose — not from the number they last typed, which
+        // is what the pre-M7 `parseIterPolicy() orelse engine.policy.manual_value` handed back.
+        req.policy = if (ve.auto_iter) .{ .auto = true } else ve.leaveAuto();
     }
-    // Manual field is disabled when auto is on.
-    ig.igBeginDisabled(ve.auto_iter);
-    if (ig.igInputText("iter##iter", &ve.manual_iter_buf, ve.manual_iter_buf.len, ig.input_text_flags_enter_returns_true, null, null)) {
+    // Under Auto the field is a READOUT of `engine.max_iter`, so it must reject edits and must
+    // still be readable. Two mechanisms, two jobs, both deliberate:
+    //   * `input_text_flags_read_only` is what REJECTS the edit — ImGui keeps drawing, selecting
+    //     and copying the text, which is the point for a value the user wants to read.
+    //   * `igBeginDisabled` is what GREYS it. The read-only flag alone does NOT: ImGui draws
+    //     read-only text in the normal `ImGuiCol_Text`
+    //     (`vendor/cimgui/imgui/imgui_widgets.cpp:5528` picks `ImGuiCol_TextDisabled` only for a
+    //     HINT), and grey is what the user asked for.
+    // Neither is load-bearing alone; removing either loses one of the two properties.
+    const iter_read_only = ve.iterFieldReadOnly();
+    const iter_flags: ig.InputTextFlags = ig.input_text_flags_enter_returns_true |
+        if (iter_read_only) ig.input_text_flags_read_only else 0;
+    ig.igBeginDisabled(iter_read_only);
+    if (ig.igInputText("iter##iter", &ve.manual_iter_buf, ve.manual_iter_buf.len, iter_flags, null, null)) {
         if (req.policy == null) {
             if (ve.parseIterPolicy()) |policy| {
                 req.policy = policy;
             } else {
-                ui_log.err("invalid max_iter — enter an integer between {d} and {d}", .{ autoiter.min_manual_iter, autoiter.max_manual_iter });
-                // Restore the buffer to the engine's current policy value.
-                ve.syncFromPolicy(engine.policy);
+                logRejectedIter(ve);
+                // Restore the buffer from the engine's COMMITTED state: its policy and the count
+                // the pixels on screen were computed with.
+                ve.syncFromPolicy(engine.policy, engine.max_iter);
             }
         }
     }
     ig.igEndDisabled();
 
     return req;
+}
+
+/// Log a rejected `max_iter` entry on `.ui`, naming what the user typed.
+///
+/// The RANGE wording lives in exactly ONE place — `autoiter.maxIterRangeMessage`, which names the
+/// offending value, the bounds and the two ways out — and is reused verbatim for the case it was
+/// written for: a number outside the bounds. Text that is not a number at all has no `u32` to hand
+/// it, so that branch names the offending text and stops, rather than restating the bounds in a
+/// second wording that could drift from the first. Which branch applies is decided by the pure,
+/// unit-tested `ViewEditor.iterRejection`, so the only untested part left here is the formatting.
+fn logRejectedIter(ve: *const editor_mod.ViewEditor) void {
+    switch (ve.iterRejection()) {
+        .out_of_range => |value| {
+            var buf: [autoiter.range_message_buf_len]u8 = undefined;
+            if (autoiter.maxIterRangeMessage(&buf, value)) |msg| {
+                ui_log.err("{s}", .{msg});
+            } else |err| {
+                // `range_message_buf_len` is the exact worst case, so this cannot happen; still
+                // say something actionable rather than swallowing the rejection.
+                ui_log.err("rejected max_iter {d} ({s})", .{ value, @errorName(err) });
+            }
+        },
+        .not_a_number => |text| ui_log.err(
+            "rejected max_iter: '{s}' is not a whole number; type one, or switch max_iter back to auto",
+            .{text},
+        ),
+    }
 }
 
 /// The input-device item labels as null-terminated C pointers, derived at comptime from the pure

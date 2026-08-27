@@ -69,7 +69,7 @@ show EXPONENT form (past ~1e-27)—exact; `parseCoordHi` reads it back, never tr
 `max_coord_digits`/`coordDigits` budget the READ-ONLY readout (`viewport.formatCoord(buf,pt,mag)`); NEVER cut editable text to them.
 Magnification/`manual_iter_buf` stay f64/u32 (`writeF64`/`parseF64`). `panels.zig` sizes fields
 via `coordFieldWidth()` so 34 decimals SHOW (`data_panel_w` 340).
-`initFromView`/`syncFromView` fill all 7; `syncFromPolicy` inverts `parseIterPolicy`.
+`initFromView`/`syncFromView` fill all 7; `syncFromPolicy` shows `engine.max_iter`.
 `parseAndApplyCenterMag`/`parseAndApplyCorners`→`?SquareView`, `parseIterPolicy`→`?IterPolicy`;
 null on failure. `drawCoordPanel` REQUESTS, never applies: returns `CoordRequest{view,policy}`;
 parse failure logs `.err` and re-syncs.

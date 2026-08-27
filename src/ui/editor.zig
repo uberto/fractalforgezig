@@ -153,7 +153,7 @@ pub const ViewEditor = struct {
     corner_b_re_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     corner_b_im_buf: [coord_buf_bytes]u8 = std.mem.zeroes([coord_buf_bytes]u8),
     auto_iter: bool = true,
-    manual_iter_buf: [16]u8 = std.mem.zeroes([16]u8),
+    manual_iter_buf: [manual_iter_buf_bytes]u8 = std.mem.zeroes([manual_iter_buf_bytes]u8),
 
     /// Build a `ViewEditor` pre-loaded from `view`. All text buffers are populated and
     /// null-terminated. Cannot fail — `defaultView()` is always representable.
@@ -204,17 +204,36 @@ pub const ViewEditor = struct {
         return viewport.SquareView.fromCorners(a, b) catch null;
     }
 
-    /// Write `policy` into the max_iter widgets: `auto_iter` mirrors `policy.auto` and
-    /// `manual_iter_buf` gets its `manual_value`. The inverse of `parseIterPolicy`; called
-    /// after a policy commit (or a rejected one) so the panel shows the engine's truth.
-    pub fn syncFromPolicy(ve: *ViewEditor, policy: autoiter.IterPolicy) void {
+    /// Write the max_iter widgets from the engine's truth: `auto_iter` mirrors `policy.auto`, and
+    /// `manual_iter_buf` gets `effective_iter` — the count the CURRENT buffer was actually computed
+    /// with (`engine.max_iter`), NOT `policy.manual_value`.
+    ///
+    /// Those two differ exactly where it matters. Under Auto, `manual_value` is the number the user
+    /// last pinned — stale and misleading — while `effective_iter` is what the ramp chose for this
+    /// magnification, and that is the number the user must see (M7 "Visible iteration count").
+    /// Under a manual pin the engine's effective count IS the pin, so the field reads back the
+    /// same. Do not re-derive the ramp here: `engine.max_iter` is the single source of truth and
+    /// the engine recomputes it on every iteration path.
+    ///
+    /// Called after a policy commit, after a REJECTED one (to restore the field), and once a frame
+    /// while the field is a read-only readout, so the panel never shows a count the image was not
+    /// rendered with. Cannot fail.
+    pub fn syncFromPolicy(ve: *ViewEditor, policy: autoiter.IterPolicy, effective_iter: u32) void {
         ve.auto_iter = policy.auto;
-        const s = std.fmt.bufPrint(&ve.manual_iter_buf, "{d}", .{policy.manual_value}) catch {
+        // Print into all but the LAST byte and terminate UNCONDITIONALLY. F1's lesson: a
+        // terminator written only `if (s.len < buf.len)` left a full buffer unterminated, and
+        // ImGui then read past the field and aborted the app. Reserving the byte makes the
+        // write below always in bounds.
+        const room = ve.manual_iter_buf[0 .. manual_iter_buf_bytes - 1];
+        const s = std.fmt.bufPrint(room, "{d}", .{effective_iter}) catch {
+            // Unreachable as sized: `room` holds the widest `u32` (asserted at comptime below).
+            // Kept as a fallback rather than `unreachable` so shrinking the buffer would show a
+            // wrong number instead of aborting.
             ve.manual_iter_buf[0] = '0';
             ve.manual_iter_buf[1] = 0;
             return;
         };
-        if (s.len < ve.manual_iter_buf.len) ve.manual_iter_buf[s.len] = 0;
+        ve.manual_iter_buf[s.len] = 0;
     }
 
     /// Parse `manual_iter_buf` as a `u32` and return a manual `IterPolicy`. Returns null if
@@ -224,6 +243,61 @@ pub const ViewEditor = struct {
         const v = std.fmt.parseInt(u32, s, 10) catch return null;
         return autoiter.IterPolicy.manual(v) catch null;
     }
+
+    /// True while the iteration field must be shown read-only: the count on display is Auto's, so
+    /// it is a readout, not an input (M7 "The shown count is not editable while it is automatic").
+    ///
+    /// Reads the CHECKBOX (`auto_iter`), not a policy, and deliberately: the checkbox is what the
+    /// user just clicked, and `syncFromPolicy` keeps it mirroring the engine's policy, so within
+    /// one frame the checkbox is the fresher of the two.
+    pub fn iterFieldReadOnly(ve: ViewEditor) bool {
+        return ve.auto_iter;
+    }
+
+    /// The policy to install when the user unchecks Auto: the count ON DISPLAY, pinned, so editing
+    /// continues from whatever the ramp chose rather than from the number last typed (M7 "Turning
+    /// automatic off pins what was on display").
+    ///
+    /// TOTAL — it cannot fail. The checkbox has already flipped by the time this runs, so there is
+    /// nobody left to hand an error to. Text that names no valid count (blank, garbage, or outside
+    /// `[min_manual_iter, max_manual_iter]`) falls back to `auto_exit_fallback` =
+    /// `autoiter.base_max_iter` (512): the engine's own default pin AND the bottom of the auto
+    /// ramp, so the user lands on a count that certainly renders instead of on a rejected policy or
+    /// a zero. Unreachable through the shipped UI — the field is read-only while Auto is on, so its
+    /// text is exactly what `syncFromPolicy` wrote, and the ramp's range
+    /// [`base_max_iter`, `auto_max_iter`] sits inside the manual range.
+    pub fn leaveAuto(ve: ViewEditor) autoiter.IterPolicy {
+        return ve.parseIterPolicy() orelse auto_exit_fallback;
+    }
+
+    /// Classify what is in `manual_iter_buf` so the ImGui edge can log the right rejection without
+    /// re-parsing it. Only meaningful after `parseIterPolicy` returned null; a valid entry reports
+    /// `out_of_range` of its own value, which no caller asks for.
+    ///
+    /// Takes `ve` by POINTER because `not_a_number` borrows the buffer: use the slice before the
+    /// next edit of the field.
+    pub fn iterRejection(ve: *const ViewEditor) IterRejection {
+        const s = sliceUntilNull(&ve.manual_iter_buf);
+        const v = std.fmt.parseInt(u32, s, 10) catch return .{ .not_a_number = s };
+        return .{ .out_of_range = v };
+    }
+};
+
+/// Bytes in `ViewEditor.manual_iter_buf`. Sized so the widest `u32` fits WITH its terminator,
+/// which is what makes `syncFromPolicy` total (asserted in the `comptime` block below).
+pub const manual_iter_buf_bytes = 16;
+
+/// What `leaveAuto` pins when the displayed text names no valid count. Built through the
+/// validating constructor at comptime so it can never drift out of range.
+const auto_exit_fallback: autoiter.IterPolicy = autoiter.IterPolicy.manual(autoiter.base_max_iter) catch
+    @compileError("base_max_iter must itself be a valid manual pin");
+
+/// Why an iteration entry was rejected, so the edge logs the right message. `out_of_range` carries
+/// the number the user typed — exactly what `autoiter.maxIterRangeMessage` needs; `not_a_number`
+/// carries the text, which is the only thing there is to name when no number was typed at all.
+pub const IterRejection = union(enum) {
+    not_a_number: []const u8,
+    out_of_range: u32,
 };
 
 /// Significant decimal digits a shortest-round-trip `f128` can need (`viewport.max_coord_digits`
@@ -251,6 +325,10 @@ comptime {
     std.debug.assert(decimal_scratch_len >= std.fmt.float.min_buffer_size);
     // The same guarantee for `writeF64`'s fallback, on the buffer it is actually handed (F1).
     std.debug.assert(coord_buf_bytes - 1 >= std.fmt.float.bufferSize(.scientific, f64));
+    // `syncFromPolicy` prints into all but the last byte so its terminator is unconditional; that
+    // reserved byte is only affordable because the rest already holds the widest `u32`.
+    std.debug.assert(manual_iter_buf_bytes - 1 >=
+        std.fmt.comptimePrint("{d}", .{std.math.maxInt(u32)}).len);
 }
 
 /// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
@@ -1054,14 +1132,14 @@ test "ViewEditor.parseIterPolicy returns null on invalid text" {
 
 test "ViewEditor.syncFromPolicy round-trips a manual policy through parseIterPolicy" {
     var ve = ViewEditor{};
-    ve.syncFromPolicy(try autoiter.IterPolicy.manual(512));
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(512), 512);
     const parsed = ve.parseIterPolicy() orelse return error.TestUnexpectedNull;
     try testing.expectEqual(@as(u32, 512), parsed.manual_value);
 }
 
 test "ViewEditor.syncFromPolicy mirrors the auto flag" {
     var ve = ViewEditor{ .auto_iter = false };
-    ve.syncFromPolicy(.{ .auto = true });
+    ve.syncFromPolicy(.{ .auto = true }, autoiter.base_max_iter);
     try testing.expect(ve.auto_iter);
 }
 
@@ -1069,7 +1147,95 @@ test "ViewEditor.syncFromPolicy overwrites garbage text with the policy value" {
     var ve = ViewEditor{};
     @memcpy(ve.manual_iter_buf[0..3], "abc");
     ve.manual_iter_buf[3] = 0;
-    ve.syncFromPolicy(try autoiter.IterPolicy.manual(64));
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(64), 64);
     const parsed = ve.parseIterPolicy() orelse return error.TestUnexpectedNull;
     try testing.expectEqual(@as(u32, 64), parsed.manual_value);
+}
+
+// ── M7: the iteration count on display is the one in use ───────────────────────────────
+
+test "ViewEditor.syncFromPolicy displays the count in use, not the value the user last pinned" {
+    var ve = ViewEditor{};
+    // The user pinned 256 earlier in the session, then switched back to Auto at a depth whose
+    // ramp value is 4096.
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(256), 256);
+    ve.syncFromPolicy(.{ .auto = true }, 4096);
+    try testing.expectEqualStrings("4096", sliceUntilNull(&ve.manual_iter_buf));
+}
+
+test "ViewEditor.syncFromPolicy shows the effective count even when the policy names another" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(256), 4096);
+    try testing.expectEqualStrings("4096", sliceUntilNull(&ve.manual_iter_buf));
+}
+
+test "ViewEditor.syncFromPolicy always leaves manual_iter_buf null-terminated" {
+    var ve = ViewEditor{};
+    // Widest first, so every later (shorter) write has stale digits behind its terminator.
+    const counts = [_]u32{
+        std.math.maxInt(u32),
+        autoiter.max_manual_iter,
+        autoiter.auto_max_iter,
+        autoiter.base_max_iter,
+        autoiter.min_manual_iter,
+        1,
+        0,
+    };
+    for (counts) |count| {
+        ve.syncFromPolicy(.{ .auto = true }, count);
+        try testing.expect(std.mem.indexOfScalar(u8, &ve.manual_iter_buf, 0) != null);
+        var expected: [manual_iter_buf_bytes]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected, "{d}", .{count}),
+            sliceUntilNull(&ve.manual_iter_buf),
+        );
+    }
+}
+
+test "ViewEditor.iterFieldReadOnly is true under an auto policy and false under a manual pin" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(.{ .auto = true }, 8192);
+    try testing.expect(ve.iterFieldReadOnly());
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(1024), 1024);
+    try testing.expect(!ve.iterFieldReadOnly());
+}
+
+test "ViewEditor.leaveAuto pins the count the field was displaying" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(.{ .auto = true }, 16384);
+    try testing.expectEqual(@as(u32, 16384), ve.leaveAuto().manual_value);
+}
+
+test "ViewEditor.leaveAuto returns a manual policy, never an auto one" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(.{ .auto = true }, 16384);
+    try testing.expect(!ve.leaveAuto().auto);
+}
+
+test "ViewEditor.leaveAuto falls back to the base count when the text names no valid count" {
+    // Blank, garbage, below `min_manual_iter`, above `max_manual_iter`, and too wide for a u32.
+    for ([_][]const u8{ "", "abc", "15", "16777217", "99999999999" }) |text| {
+        var ve = ViewEditor{};
+        @memcpy(ve.manual_iter_buf[0..text.len], text);
+        ve.manual_iter_buf[text.len] = 0;
+        const pinned = ve.leaveAuto();
+        try testing.expect(!pinned.auto);
+        try testing.expectEqual(autoiter.base_max_iter, pinned.manual_value);
+        // In range by construction: the validating constructor accepts what we fell back to.
+        _ = try autoiter.IterPolicy.manual(pinned.manual_value);
+    }
+}
+
+test "ViewEditor.iterRejection reports the number the user typed when it is out of range" {
+    var ve = ViewEditor{};
+    @memcpy(ve.manual_iter_buf[0..2], "15");
+    ve.manual_iter_buf[2] = 0;
+    try testing.expectEqual(@as(u32, 15), ve.iterRejection().out_of_range);
+}
+
+test "ViewEditor.iterRejection reports the offending text when it is not a number at all" {
+    var ve = ViewEditor{};
+    @memcpy(ve.manual_iter_buf[0..4], "12x4");
+    ve.manual_iter_buf[4] = 0;
+    try testing.expectEqualStrings("12x4", ve.iterRejection().not_a_number);
 }
