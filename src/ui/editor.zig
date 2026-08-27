@@ -1154,15 +1154,6 @@ test "ViewEditor.syncFromPolicy overwrites garbage text with the policy value" {
 
 // ── M7: the iteration count on display is the one in use ───────────────────────────────
 
-test "ViewEditor.syncFromPolicy displays the count in use, not the value the user last pinned" {
-    var ve = ViewEditor{};
-    // The user pinned 256 earlier in the session, then switched back to Auto at a depth whose
-    // ramp value is 4096.
-    ve.syncFromPolicy(try autoiter.IterPolicy.manual(256), 256);
-    ve.syncFromPolicy(.{ .auto = true }, 4096);
-    try testing.expectEqualStrings("4096", sliceUntilNull(&ve.manual_iter_buf));
-}
-
 test "ViewEditor.syncFromPolicy shows the effective count even when the policy names another" {
     var ve = ViewEditor{};
     ve.syncFromPolicy(try autoiter.IterPolicy.manual(256), 4096);
@@ -1192,26 +1183,6 @@ test "ViewEditor.syncFromPolicy always leaves manual_iter_buf null-terminated" {
     }
 }
 
-test "ViewEditor.iterFieldReadOnly is true under an auto policy and false under a manual pin" {
-    var ve = ViewEditor{};
-    ve.syncFromPolicy(.{ .auto = true }, 8192);
-    try testing.expect(ve.iterFieldReadOnly());
-    ve.syncFromPolicy(try autoiter.IterPolicy.manual(1024), 1024);
-    try testing.expect(!ve.iterFieldReadOnly());
-}
-
-test "ViewEditor.leaveAuto pins the count the field was displaying" {
-    var ve = ViewEditor{};
-    ve.syncFromPolicy(.{ .auto = true }, 16384);
-    try testing.expectEqual(@as(u32, 16384), ve.leaveAuto().manual_value);
-}
-
-test "ViewEditor.leaveAuto returns a manual policy, never an auto one" {
-    var ve = ViewEditor{};
-    ve.syncFromPolicy(.{ .auto = true }, 16384);
-    try testing.expect(!ve.leaveAuto().auto);
-}
-
 test "ViewEditor.leaveAuto falls back to the base count when the text names no valid count" {
     // Blank, garbage, below `min_manual_iter`, above `max_manual_iter`, and too wide for a u32.
     for ([_][]const u8{ "", "abc", "15", "16777217", "99999999999" }) |text| {
@@ -1238,4 +1209,41 @@ test "ViewEditor.iterRejection reports the offending text when it is not a numbe
     @memcpy(ve.manual_iter_buf[0..4], "12x4");
     ve.manual_iter_buf[4] = 0;
     try testing.expectEqualStrings("12x4", ve.iterRejection().not_a_number);
+}
+
+// ── Requirement: Visible iteration count (M7) ─────────────────────────────────────────
+
+test "acceptance: the auto policy displays the ramp's count, not the last pinned one" {
+    var ve = ViewEditor{};
+    // The user pinned 256 earlier in the session.
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(256), 256);
+    try testing.expectEqualStrings("256", sliceUntilNull(&ve.manual_iter_buf));
+
+    // They switch back to Auto at a depth whose ramp value is 4096. The field shows the
+    // count the image is ACTUALLY computed with, not the number they last typed.
+    ve.syncFromPolicy(.{ .auto = true }, 4096);
+    try testing.expectEqualStrings("4096", sliceUntilNull(&ve.manual_iter_buf));
+}
+
+test "acceptance: the iteration count is read-only while the policy is automatic" {
+    var ve = ViewEditor{};
+    ve.syncFromPolicy(.{ .auto = true }, 8192);
+    try testing.expect(ve.iterFieldReadOnly());
+
+    ve.syncFromPolicy(try autoiter.IterPolicy.manual(1024), 1024);
+    try testing.expect(!ve.iterFieldReadOnly());
+}
+
+test "acceptance: leaving auto pins the count that was on display" {
+    var ve = ViewEditor{};
+    // Auto at depth is showing 16384.
+    ve.syncFromPolicy(.{ .auto = true }, 16384);
+    try testing.expectEqualStrings("16384", sliceUntilNull(&ve.manual_iter_buf));
+
+    // Unchecking Auto pins exactly that, so editing continues from what auto chose.
+    ve.auto_iter = false;
+    const pinned = ve.leaveAuto();
+    try testing.expect(!pinned.auto);
+    try testing.expectEqual(@as(u32, 16384), pinned.manual_value);
+    try testing.expect(!ve.iterFieldReadOnly());
 }
