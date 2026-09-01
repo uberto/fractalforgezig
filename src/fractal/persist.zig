@@ -52,6 +52,10 @@ pub const AppState = struct {
     /// Tag name of `mapping_mod.Mode`: "linear" | "log" | "cyclic".
     mapping_mode: []const u8,
     mapping_period: f32,
+    /// Whether iteration bands are shown (M8). Defaults to `false` (smooth), mirroring
+    /// `mapping_mod.Params.banded`: a `.fractal` file written before this field existed carries no
+    /// `banded` key and loads as smooth (see `Wire.banded` and `fromJson`).
+    banded: bool = false,
     interior_r: u8,
     interior_g: u8,
     interior_b: u8,
@@ -202,6 +206,9 @@ const Wire = struct {
     stops: ?[]const WireStop = null,
     mapping_mode: ?[]const u8 = null,
     mapping_period: ?f32 = null,
+    /// Optional so a pre-M8 file (no `banded` key) is NOT a `MissingField`: absent means smooth.
+    /// This is the whole of the field's backwards compatibility — there is no version field.
+    banded: ?bool = null,
     interior_r: ?u8 = null,
     interior_g: ?u8 = null,
     interior_b: ?u8 = null,
@@ -238,6 +245,7 @@ pub fn toJson(state: AppState, buf: []u8) WriteError![]u8 {
         .stops = wire_stops_buf[0..state.stops.len],
         .mapping_mode = state.mapping_mode,
         .mapping_period = state.mapping_period,
+        .banded = state.banded,
         .interior_r = state.interior_r,
         .interior_g = state.interior_g,
         .interior_b = state.interior_b,
@@ -270,6 +278,8 @@ pub fn fromJson(json: []const u8, alloc: std.mem.Allocator) ParseError!AppState 
     const wire_stops = w.stops orelse return ParseError.MissingField;
     const mapping_mode_str = w.mapping_mode orelse return ParseError.MissingField;
     const mapping_period = w.mapping_period orelse return ParseError.MissingField;
+    // Optional, never MissingField: a pre-M8 file with no `banded` key loads as smooth.
+    const banded = w.banded orelse false;
     const interior_r = w.interior_r orelse return ParseError.MissingField;
     const interior_g = w.interior_g orelse return ParseError.MissingField;
     const interior_b = w.interior_b orelse return ParseError.MissingField;
@@ -319,6 +329,7 @@ pub fn fromJson(json: []const u8, alloc: std.mem.Allocator) ParseError!AppState 
         .stops = stops,
         .mapping_mode = mode_copy,
         .mapping_period = mapping_period,
+        .banded = banded,
         .interior_r = interior_r,
         .interior_g = interior_g,
         .interior_b = interior_b,
@@ -355,6 +366,7 @@ pub fn fromEngine(engine: *const engine_mod.Engine, alloc: std.mem.Allocator) er
         .stops = stops,
         .mapping_mode = mode_copy,
         .mapping_period = engine.params.period,
+        .banded = engine.params.banded,
         .interior_r = engine.interior[0],
         .interior_g = engine.interior[1],
         .interior_b = engine.interior[2],
@@ -378,7 +390,7 @@ pub fn applyToEngine(state: AppState, engine: *engine_mod.Engine) ApplyError!voi
 
     // Mapping.
     const mode = std.meta.stringToEnum(mapping_mod.Mode, state.mapping_mode) orelse mapping_mod.Mode.linear;
-    const params = mapping_mod.Params{ .mode = mode, .period = state.mapping_period };
+    const params = mapping_mod.Params{ .mode = mode, .period = state.mapping_period, .banded = state.banded };
     engine.setMapping(params) catch |err| return err;
 
     // Interior color.
@@ -886,6 +898,7 @@ test "the saved bytes differ from the base format ONLY in the centre's two lines
         \\  ],
         \\  "mapping_mode": "cyclic",
         \\  "mapping_period": 16,
+        \\  "banded": false,
         \\  "interior_r": 1,
         \\  "interior_g": 2,
         \\  "interior_b": 3,
@@ -1015,4 +1028,92 @@ test "acceptance: a legacy numeric center still parses" {
 
     try testing.expectEqual(@as(f128, -0.75), loaded.center_re);
     try testing.expectEqual(@as(f128, 0.1), loaded.center_im);
+}
+
+// ---------------------------------------------------------------------------
+// M8 acceptance tests — materialized verbatim from
+// `.inception/m8-coloring-schemes/acceptance-tests.md` (`src/fractal/persist.zig`
+// section). Immutable: do not weaken.
+// ---------------------------------------------------------------------------
+
+test "acceptance: every stop and every interior channel survives a round-trip" {
+    const alloc = testing.allocator;
+    var stops = [_]SerialStop{
+        .{ .pos = 0.0, .r = 1, .g = 2, .b = 3, .a = 255 },
+        .{ .pos = 0.5, .r = 40, .g = 50, .b = 60, .a = 200 },
+        .{ .pos = 1.0, .r = 250, .g = 240, .b = 230, .a = 255 },
+    };
+    const state = AppState{
+        .center_re = -0.5,
+        .center_im = 0.25,
+        .side = 1.0,
+        .policy_auto = true,
+        .policy_manual_value = 512,
+        .stops = &stops,
+        .mapping_mode = "cyclic",
+        .mapping_period = 17.0,
+        .banded = true,
+        .interior_r = 11,
+        .interior_g = 22,
+        .interior_b = 33,
+        .interior_a = 210,
+    };
+
+    var buf: [4096]u8 = undefined;
+    const json = try toJson(state, &buf);
+    const loaded = try fromJson(json, alloc);
+    defer freeState(loaded, alloc);
+
+    try testing.expectEqual(state.stops.len, loaded.stops.len);
+    for (state.stops, loaded.stops) |a, b| {
+        try testing.expectApproxEqAbs(a.pos, b.pos, 1e-6);
+        try testing.expectEqual(a.r, b.r);
+        try testing.expectEqual(a.g, b.g);
+        try testing.expectEqual(a.b, b.b);
+        try testing.expectEqual(a.a, b.a);
+    }
+    try testing.expectEqualStrings(state.mapping_mode, loaded.mapping_mode);
+    try testing.expectApproxEqAbs(state.mapping_period, loaded.mapping_period, 1e-6);
+    try testing.expectEqual(state.banded, loaded.banded);
+    try testing.expectEqual(state.interior_r, loaded.interior_r);
+    try testing.expectEqual(state.interior_g, loaded.interior_g);
+    try testing.expectEqual(state.interior_b, loaded.interior_b);
+    try testing.expectEqual(state.interior_a, loaded.interior_a);
+}
+
+test "acceptance: applying a loaded picture restores the whole colouring" {
+    const alloc = testing.allocator;
+    var engine = try engine_mod.Engine.init(alloc, try viewport.SquareView.fromCenterSide(
+        .{ .re = 0.0, .im = 0.0 },
+        2.0,
+    ), 32, .{});
+    defer engine.deinit();
+
+    var stops = [_]SerialStop{
+        .{ .pos = 0.0, .r = 1, .g = 2, .b = 3, .a = 255 },
+        .{ .pos = 1.0, .r = 250, .g = 240, .b = 230, .a = 255 },
+    };
+    const state = AppState{
+        .center_re = 0.0,
+        .center_im = 0.0,
+        .side = 2.0,
+        .policy_auto = true,
+        .policy_manual_value = 512,
+        .stops = &stops,
+        .mapping_mode = "cyclic",
+        .mapping_period = 17.0,
+        .banded = true,
+        .interior_r = 11,
+        .interior_g = 22,
+        .interior_b = 33,
+        .interior_a = 210,
+    };
+    try applyToEngine(state, &engine);
+
+    try testing.expectEqual(state.stops.len, engine.gradient.stops().len);
+    try testing.expectEqual(@as(u8, 1), engine.gradient.stops()[0].color[0]);
+    try testing.expectEqual(mapping_mod.Mode.cyclic, engine.params.mode);
+    try testing.expectApproxEqAbs(@as(f32, 17.0), engine.params.period, 1e-6);
+    try testing.expectEqual(true, engine.params.banded);
+    try testing.expectEqual(@as(u8, 11), engine.interior[0]);
 }
