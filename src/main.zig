@@ -679,7 +679,10 @@ fn runLoop(
         // which is why the latch is a pure type and not a `bool` here.
         // Which frames report `began` is the accumulator's business and depends on the event
         // SOURCE (`gesture.RunSource`): one wheel notch is one run and so one undo entry, as it
-        // has always been, while a whole pinch or a whole swipe is one.
+        // has always been, and a whole pinch is one run — only `endPinch` ends it. A swipe is one
+        // run only for as long as pan input keeps arriving: a frame that drains with no pan input
+        // (or a zoom-only frame) closes the `.wheel_pan` run in `gesture.closeUndelivered`, so a
+        // PAUSED swipe is two runs and two undo entries.
         if (nav.gestures.take()) |intent| {
             // A run that has just begun OWES its one undo entry from here on. Noted BEFORE any
             // of the work below, because every reason that work can install nothing must leave

@@ -14,8 +14,8 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 
 | capability | what it covers |
 |---|---|
-| [rendering](rendering/spec.md) | Mandelbrot iteration, smooth escape values, the iteration/colour decoupling, the adaptive and pinned iteration counts, progressive refinement. |
-| [navigation](navigation/spec.md) | Cursor-anchored zoom, centered zoom, pan, box-select, reset, refusal of impossible gestures, the zoom depth limit warning, the maximum zoom-out clamp. |
+| [rendering](rendering/spec.md) | Mandelbrot iteration, smooth escape values, the iteration/colour decoupling, the adaptive and pinned iteration counts, the always-visible iteration count, progressive refinement. |
+| [navigation](navigation/spec.md) | Cursor-anchored zoom, centered zoom, pan, box-select, reset, trackpad pinch zoom and two-finger pan, the per-frame gesture coalescing, the pointing-device wheel discriminator, refusal of impossible gestures, the zoom depth limit warning, the maximum zoom-out clamp. |
 | [deep-zoom](deep-zoom/spec.md) | Perturbation rendering below the double-precision floor down to a side of 1e-30, accuracy against full-precision iteration, GPU deep zoom with logged CPU fallback, 34-digit view coordinates, precision-preserving navigation at depth. |
 | [view-coordinates](view-coordinates/spec.md) | The square view model, the centre/magnification and corner duals, pixel↔complex mapping, aspect-preserving display, the coordinate readout's precision. |
 | [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, the interior colour, opaque output. |
@@ -36,6 +36,15 @@ Milestone `m6-deep-zoom` then added the `deep-zoom` capability and rewrote the t
 it changed: `persistence`'s **Saved view fidelity** (the centre is now a decimal string),
 `navigation`'s **Zoom depth limit** (the floor moved seventeen decades deeper, to 1e-30) and
 `rendering`'s **Adaptive iteration count** (the ceiling rose with it, to 65536).
+
+Milestone `m7-trackpad-gestures` added four `navigation` requirements — **Trackpad pinch zoom**,
+**Trackpad two-finger pan**, **One view change per frame per gesture** and **The pointing device
+decides what the wheel does** — and one `rendering` requirement, **Visible iteration count**. It
+rewrote nothing: the mouse wheel's behaviour is unchanged, so pinch and swipe are additions. Two
+folded parts are `_not pinned by a test_`: the two-finger swipe's direction and pixel scale (the
+platform-reported values were never measured — the probe was not run — so they ship provisional and
+are on the user's walkthrough checklist), and the event loop's per-gesture history push (glue with
+no test tier). The pure logic behind every requirement is test-pinned.
 
 ## Verification
 

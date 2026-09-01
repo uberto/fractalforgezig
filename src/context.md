@@ -11,8 +11,8 @@ native macOS window with a Dear ImGui shell.
 
 - `main.zig` — executable entry: one window, SDL_GPU device + ImGui, event loop, clean teardown.
   Keep it thin: push logic into pure modules. The loop NEVER blocks on a full-res render — input
-  shows a blocky coarse preview, then `engine.stepPass()` refines one self-timed row band per
-  frame; the data panel stays disabled meanwhile. See `ui/context.md`.
+  shows a coarse preview, then `engine.stepPass()` refines one self-timed row band per
+  frame; the data panel stays disabled meanwhile.
 - `root.zig` — library/test root. Its top-level `test { ... }` block aggregates PURE submodule
   tests via `_ = @import("...");` (never C edges). Also hosts small pure helpers
   (e.g. `startupLine`).
@@ -23,8 +23,10 @@ native macOS window with a Dear ImGui shell.
 - `fractal/` — pure fractal core (viewport mapping, Mandelbrot iteration, perturbation, color,
   progressive chunk scheduling, JSON persistence). No SDL/GPU imports.
 - `gpu/` — SDL3 GPU device, RGBA→texture upload, Metal compute iteration.
-- `ui/` — SDL3 window + cimgui/Dear ImGui shell (menu bar, fractal image, data panel).
-- `deep_zoom_test.zig` — the deep-zoom acceptance tests; IMMUTABLE, never weaken one.
+- `ui/` — SDL3 window + cimgui/Dear ImGui shell; pure `gesture.zig` reduces trackpad/wheel
+  events to view changes.
+- `deep_zoom_test.zig`, `gesture_test.zig` — the deep-zoom and trackpad-gesture acceptance tests;
+  IMMUTABLE, never weaken one.
 
 ## Precision model
 
@@ -50,7 +52,7 @@ actionable context (what failed + the SDL error string) and a returned Zig error
 
 ## Commands
 
-- `zig build` — compile the app + probe; installs `zig-out/fractalforge`.
+- `zig build` — compile the app + probe; installs `zig-out/bin/fractalforge`.
 - `zig build run` — run the app (USER ONLY).
 - `zig build probe` — USER ONLY: a window logging wheel/pinch/finger events.
 - `zig build test` — BOTH tiers: pure (`src/root.zig`) + C-linking GPU.

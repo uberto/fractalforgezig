@@ -154,6 +154,39 @@ the range and the ways out.
 - **THEN** the message names the offending value, the supported range, and both ways out
 - **Test**: `src/fractal/autoiter.zig::maxIterRangeMessage names the offending value, the range and what to do`
 
+#### Scenario: Leaving the automatic choice pins the displayed count
+
+- **WHEN** the user turns the automatic choice off
+- **THEN** the count is pinned to the value that was on display, so the user edits on from what the
+  ramp had chosen rather than from a stale earlier value — the shared promise with **Visible
+  iteration count**'s *Turning automatic off pins what was on display*
+- **Test**: `src/ui/editor.zig::acceptance: leaving auto pins the count that was on display`
+
+### Requirement: Visible iteration count
+
+The system SHALL always show the iteration count the image was computed with; while the count is
+chosen automatically it SHALL be shown read-only, and turning the automatic choice off SHALL pin
+the value being shown so the user edits on from it.
+
+#### Scenario: The automatic count is shown, not the last pinned one
+
+- **WHEN** the count is chosen automatically at a magnification whose ramp value differs from the
+  last value the user pinned
+- **THEN** the count on display is the one the ramp chose
+- **Test**: `src/ui/editor.zig::acceptance: the auto policy displays the ramp's count, not the last pinned one`
+
+#### Scenario: The shown count is not editable while it is automatic
+
+- **WHEN** the count is chosen automatically
+- **THEN** the count is displayed read-only
+- **Test**: `src/ui/editor.zig::acceptance: the iteration count is read-only while the policy is automatic`
+
+#### Scenario: Turning automatic off pins what was on display
+
+- **WHEN** the user turns the automatic choice off
+- **THEN** the count is pinned to the value that was being displayed, and becomes editable
+- **Test**: `src/ui/editor.zig::acceptance: leaving auto pins the count that was on display`
+
 ### Requirement: Progressive refinement
 
 The system SHALL answer every view change with an immediate coarse image and then refine it to
@@ -227,6 +260,10 @@ had, and stay usable.
 
 - The iteration limit chosen for a view is shown to the user by `app-shell`; the depth at which
   the automatic ramp tops out is the same depth `navigation`'s **Zoom depth limit** warns about.
+- **Visible iteration count** and **Pinned iteration count** share one promise: unchecking Auto pins
+  the value that was on display. Its logic is pinned by the three `src/ui/editor.zig` acceptance
+  tests, which drive the pure editor state; that the data panel renders the field read-only while
+  Auto is on and refreshes it each frame is ImGui glue and only a manual smoke run verifies it.
 - Whether iteration runs on the CPU or the GPU is `gpu-acceleration`'s concern; both backends
   satisfy **Reproducible image** and **Colour edits never re-iterate**.
 - How a view below ~1e-13 gets any detail to iterate at all is `deep-zoom`'s concern; the ramp's

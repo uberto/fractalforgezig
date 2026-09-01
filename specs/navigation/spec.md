@@ -207,6 +207,115 @@ instead, keeping a valid view rather than refusing the gesture.
 - **Test**: `src/fractal/navigate.zig::the maximum side leaves the home view and its first zoom-out notch unclamped`
 - **Test**: `src/fractal/navigate.zig::boxSelect cannot commit a selection wider than the maximum side`
 
+### Requirement: Trackpad pinch zoom
+
+The system SHALL zoom continuously while the user pinches on a trackpad — in as the fingers open,
+out as they close — keeping the point under the cursor fixed on screen, and SHALL treat one whole
+pinch gesture as a single step for undo.
+
+#### Scenario: Pinching open zooms in about the cursor
+
+- **WHEN** the user pinches open by a scale factor while the cursor is over a point away from the
+  image centre
+- **THEN** the view side shrinks by exactly that factor and that point still lands on the same pixel
+- **Test**: `src/gesture_test.zig::acceptance: pinching open zooms in about the cursor`
+
+#### Scenario: Pinching closed zooms out
+
+- **WHEN** the user pinches closed by a scale factor
+- **THEN** the view side grows by exactly that factor and the magnification falls correspondingly
+- **Test**: `src/gesture_test.zig::acceptance: pinching closed zooms out`
+
+#### Scenario: A pinch and its reverse leave the view where it started
+
+- **WHEN** the user pinches open by a factor and then closed by the same factor about the same point
+- **THEN** the view is the one they started from
+- **Test**: `src/gesture_test.zig::acceptance: a pinch and its reverse restore the view`
+
+#### Scenario: One whole gesture is one undo step
+
+- **WHEN** a pinch delivers many updates and the user then undoes once
+- **THEN** the view returned to is the one from before the gesture began, not an intermediate one
+- **Test**: `src/gesture_test.zig::acceptance: one whole gesture is one undo step` — pins that a
+  gesture run reports its begin exactly once, so the event loop pushes one undo entry per gesture;
+  that the loop actually pushes on that frame is glue and is `_not pinned by a test_`, confirmed by
+  the user by hand at the walkthrough gate (see Notes).
+
+#### Scenario: Pinching out cannot grow the view past the widest framing
+
+- **WHEN** the user keeps pinching closed from the home view
+- **THEN** the view stops widening at the maximum side rather than growing without bound
+- **Test**: `src/gesture_test.zig::acceptance: pinching out saturates at the maximum side`
+
+### Requirement: Trackpad two-finger pan
+
+The system SHALL translate the view when the user swipes with two fingers on a trackpad, moving the
+image content with the fingers and leaving the magnification untouched.
+
+#### Scenario: The content follows the fingers
+
+- **WHEN** the user swipes two fingers by a pixel delta
+- **THEN** the content shifts by exactly that many pixels in the direction the fingers moved
+- **Test**: `src/gesture_test.zig::acceptance: a two-finger swipe moves the content with the fingers`
+  — pins the pan *magnitude* on each axis and that it is a real translation of the plane; the swipe
+  *direction* and its pixel *scale* are `_not pinned by a test_` and are confirmed by the user by
+  hand at the walkthrough gate (see Notes).
+
+#### Scenario: A swipe does not change the zoom
+
+- **WHEN** the user swipes with two fingers
+- **THEN** the view's extent, and so its magnification, is unchanged
+- **Test**: `src/gesture_test.zig::acceptance: a two-finger swipe leaves the magnification untouched`
+
+### Requirement: One view change per frame per gesture
+
+The system SHALL combine all the gesture input that arrives before a frame into a single view
+change, so a fast gesture costs one view change per frame rather than one per event.
+
+#### Scenario: Several pinch updates in one frame make one zoom
+
+- **WHEN** three pinch updates arrive before the next frame
+- **THEN** the view changes once, by the product of their scales
+- **Test**: `src/gesture_test.zig::acceptance: pinch updates in one frame coalesce into one zoom`
+
+#### Scenario: Several swipe deltas in one frame make one pan
+
+- **WHEN** several two-finger swipe deltas arrive before the next frame
+- **THEN** the view is panned once, by their sum
+- **Test**: `src/gesture_test.zig::acceptance: swipe deltas in one frame coalesce into one pan`
+
+### Requirement: The pointing device decides what the wheel does
+
+The system SHALL keep the mouse wheel zooming exactly as it always has, SHALL read a trackpad
+two-finger swipe as a pan, and — because the two arrive as the same kind of event — SHALL let the
+user say which device they are using when the two cannot be told apart automatically.
+
+#### Scenario: A mouse wheel notch still zooms
+
+- **WHEN** a wheel notch arrives with a whole-tick vertical delta and no horizontal component
+- **THEN** it zooms, exactly as it does today, and does not pan
+- **Test**: `src/gesture_test.zig::acceptance: a mouse wheel notch still zooms`
+
+#### Scenario: Declaring a mouse makes every wheel event zoom
+
+- **WHEN** the user has declared their device a mouse and a wheel event arrives with a fractional
+  delta
+- **THEN** it zooms rather than pans
+- **Test**: `src/gesture_test.zig::acceptance: declaring a mouse makes a fractional wheel event zoom`
+
+#### Scenario: Declaring a trackpad makes every wheel event pan
+
+- **WHEN** the user has declared their device a trackpad and a wheel event arrives with a whole-tick
+  delta
+- **THEN** it pans rather than zooms
+- **Test**: `src/gesture_test.zig::acceptance: declaring a trackpad makes a whole-tick wheel event pan`
+
+#### Scenario: Left to decide for itself, a horizontal component means a swipe
+
+- **WHEN** the device is left to be detected and a wheel event carries a horizontal component
+- **THEN** it is read as a two-finger swipe and pans
+- **Test**: `src/gesture_test.zig::acceptance: an auto-detected horizontal wheel component pans`
+
 ## Notes
 
 - The pixel↔complex mapping every gesture is measured in, and the fitted on-screen rectangle the
@@ -221,3 +330,22 @@ instead, keeping a valid view rather than refusing the gesture.
   keeps its precision**.
 - The bound is on *navigation* only: a view wider than 8.0 arriving from outside navigation (a saved
   file, a typed magnification) is left at its own width, and zooming in from it still works.
+- **The mouse wheel's behaviour is unchanged.** **The pointing device decides what the wheel does**
+  is an addition, not a rewrite of **Cursor-anchored zoom**: a plain wheel notch still zooms towards
+  the cursor exactly as before. A trackpad two-finger swipe reaches the app as the *same* kind of
+  event as a wheel notch, so the two cannot always be told apart from the event alone; when they
+  cannot, the user picks their device by hand, and that choice lives in memory for the session only.
+- **The swipe's direction and scale are user-confirmed, not test-pinned.** *Trackpad two-finger
+  pan*'s **The content follows the fingers** is pinned only for pan *magnitude* and that a swipe is a
+  real translation. Which sign means "with the fingers" depends on what macOS reports for a
+  two-finger swipe under natural scrolling, and whether one swipe unit is one screen pixel depends on
+  the unit the platform reports — neither is knowable without running the app, which no agent may do.
+  Both ship provisional and are on the user's walkthrough checklist; a wrong direction is a
+  one-character fix and a wrong scale is a separate follow-up (see `deep-zoom`'s sibling docs and the
+  milestone's open questions).
+- **One pinch gesture is one undo step; one wheel notch is one undo step.** A held pinch that spans
+  many frames pushes a single entry, and a mouse notch stays exactly one entry as it always was. A
+  two-finger swipe is one entry only while its input keeps arriving: a frame that drains with no pan
+  input ends the swipe, so a paused swipe is two entries. This granularity is a property of the pure
+  gesture accumulator; that the event loop pushes on the reported begin frame is glue, verified by
+  hand.
