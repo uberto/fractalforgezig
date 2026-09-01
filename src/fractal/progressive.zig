@@ -115,6 +115,27 @@ pub fn progressLabel(buf: []u8, f: f32) ![:0]u8 {
     return std.fmt.bufPrintZ(buf, "rendering {d}%", .{pct});
 }
 
+/// Which control the progress area offers beside the percentage, given the render state.
+pub const StatusControl = enum {
+    /// A full-resolution render is in flight: offer to stop it.
+    cancel,
+    /// A render was cancelled and not restarted: offer to render the same view again.
+    render,
+    /// Nothing to offer — no render in flight and none cancelled.
+    none,
+};
+
+/// The control the status area should show: `.cancel` while a render is in flight, `.render`
+/// once one has been cancelled and not restarted, and `.none` otherwise. `rendering` wins over
+/// `cancelled` (a fresh render supersedes a stale cancel), so the pure edge in `main.zig` can
+/// pick the button and its action from one call. Beside `progressLabel` because both turn the
+/// same render state into the progress area's UI.
+pub fn statusControl(rendering: bool, cancelled: bool) StatusControl {
+    if (rendering) return .cancel;
+    if (cancelled) return .render;
+    return .none;
+}
+
 /// Nearest-neighbour resample of a smooth-value buffer: fill `dst` (`dst_w × dst_h`) by
 /// sampling `src` (`src_w × src_h`) proportionally. Used to seed a new render buffer with
 /// the previous (usually coarse) image so the pass starts from a BLOCKY preview of the same
@@ -230,6 +251,16 @@ test "progressLabel renders the completion percentage" {
 test "progressLabel clamps an out-of-range fraction to 100%" {
     var buf: [progress_label_buf_len]u8 = undefined;
     try std.testing.expectEqualStrings("rendering 100%", try progressLabel(&buf, 1.7));
+}
+
+test "statusControl offers cancel while rendering, render after a cancel, none otherwise" {
+    // A render in flight always offers Cancel — even if a stale cancel flag lingers.
+    try std.testing.expectEqual(StatusControl.cancel, statusControl(true, false));
+    try std.testing.expectEqual(StatusControl.cancel, statusControl(true, true));
+    // A cancelled, not-yet-restarted render offers Render instead.
+    try std.testing.expectEqual(StatusControl.render, statusControl(false, true));
+    // Neither in flight nor cancelled: the progress area offers nothing.
+    try std.testing.expectEqual(StatusControl.none, statusControl(false, false));
 }
 
 test "upsampleInto replicates each source value over its destination block" {

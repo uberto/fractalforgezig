@@ -42,8 +42,8 @@ end-to-end⇒shallow renders match pre-M6.
   `boxSelect(v,a,b,S)` square-snaps drags;`reset()`=`defaultView()`.All→`DegenerateRegion` on
   bad input/`S==0`/overflow. RE-EXPORTS viewport's 4 floor names. `max_view_side`(8.0)=WIDEST
   view;side-GROWING paths SATURATE.
-- `refine.zig`—`decidePass(interacting,idle_ns,full_pass_done)`→
-  `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150ms.
+- `refine.zig`—`decidePass(interacting,idle_ns,full_pass_done,cancelled)`→
+  `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150ms;`cancelled`→`.none`=NEVER-re-arm-a-cancelled-view.
 - `autoiter.zig`—`max_iter` policy;READ,never re-derive. QUADRATIC ramp,
   `d=@max(0,log2(mag/default_magnification))`:`autoMaxIter(mag) !u32`=
   `clamp(base_max_iter(512)+iter_per_doubling_squared·d²,512,auto_max_iter(65536))`
@@ -87,7 +87,7 @@ end-to-end⇒shallow renders match pre-M6.
   `Pass{rows_total,rows_done,chunk_rows}`:`fraction()`,`done()`,`nextChunk()`(never 0),
   `advance(rows,elapsed_ns)`. `adaptChunkRows(rows,elapsed_ns,target_ns)`→
   `target_chunk_ns`(0.5s budget),≤4×/step,clamped `1..max_chunk_rows`;
-  `initial_chunk_rows`=4. `progressLabel(buf[progress_label_buf_len],f)`.
+  `initial_chunk_rows`=4. `progressLabel(buf[progress_label_buf_len],f)`;`statusControl(rendering,cancelled)`→`StatusControl{cancel,render,none}`,rendering-WINS.
   `upsampleInto(dst,dst_w,dst_h,src,src_w,src_h)`=nearest-neighbour BLOCKY preview.
 - `colorpass.zig`—`colorInto(rgba,iter,lut,max_iter,params,interior)` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write;sentinel→`interior`;alpha FORCED 255.

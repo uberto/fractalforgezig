@@ -909,7 +909,8 @@ fn runLoop(
                 ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
                 (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
             const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
-            switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done)) {
+            // `cancelled` is a literal `false` for now; T2 replaces it with `nav.cancelled`.
+            switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done, false)) {
                 .full => beginFullPass(engine, &nav, real_w, real_h),
                 .coarse, .none => {},
             }
