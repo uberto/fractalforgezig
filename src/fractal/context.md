@@ -119,6 +119,11 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
   number(pre-M6),RAW digits→f128,NEVER drop that branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.
+- `scheme.zig`—COLOUR-ONLY save/load,INDEPENDENT of persist,NO view/centre/side/policy.
+  `Scheme{stops,mapping_mode,mapping_period,banded,interior_r/g/b/a}`;`SchemeStop{pos,r,g,b,a}`.
+  `fromEngine`/`fromJson(json,alloc)` heap-own `stops` ONLY(mapping_mode=static tag)→`free(s,alloc)`;
+  `toJson(buf)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`),bad mode→engine's current.
+  `ParseError`+`UnknownMappingMode`;NO version field.
 
 ## Conventions
 
