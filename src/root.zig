@@ -35,6 +35,8 @@ test {
     _ = @import("fractal/persist.zig");
     // M8: colour-only save/load — a view-free sibling of persist.zig.
     _ = @import("fractal/scheme.zig");
+    // M8: built-in colouring presets (const data) + bakeable preview gradients.
+    _ = @import("fractal/presets.zig");
     // Pure line formatters for the user-only input probe (`zig build probe`).
     _ = @import("probe_fmt.zig");
     // Cross-module acceptance tests for M6 deep zoom (pure tier: no window, no GPU).

@@ -50,15 +50,14 @@ end-to-end⇒shallow renders match pre-M6.
   (`@max`⇒MONOTONE:`d²` re-climbs when `d<0`);bad `mag`→`InvalidMagnification`.
   `iter_per_doubling_squared`=comptime-DERIVED(`floor_doublings`,`floor_magnification`)⇒the
   ceiling hits `viewport.precision_floor_side` EXACTLY;NEVER hard-code. 65536 caps the RAMP
-  only;PINNED reach `max_manual_iter`(2^24,f32-exact). 1e-30 iterates most pixels to
-  `max_iter`:ACCEPTED.
+  only;PINNED reach `max_manual_iter`(2^24,f32-exact).
   `IterPolicy{auto=true,manual_value=512}`:`manual(v)` demands
   `[min_manual_iter(16),max_manual_iter]`,else `MaxIterOutOfRange`;
   `effective(mag)`=ramp if `auto` else `clampManual(v)`.
   `maxIterRangeMessage(buf,v)`,`policySummary(buf,policy,mag)`.
 - `mandelbrot.zig`—`iterate(c_re,c_im,max_iter) f32`→smooth escape else
   `interior_sentinel`(-1.0). `iterateExact(f128,f128,max_iter)`=the SAME algorithm in f128,
-  TEST-ONLY,NEVER in renderer. TRUST it only to ~1e-20—deeper,use the f128 PERTURBATION ladder.
+  TEST-ONLY,NEVER in renderer;trust to ~1e-20—deeper uses the perturbation ladder.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
   (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL,never restate.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.
@@ -87,7 +86,7 @@ end-to-end⇒shallow renders match pre-M6.
   `Pass{rows_total,rows_done,chunk_rows}`:`fraction()`,`done()`,`nextChunk()`(never 0),
   `advance(rows,elapsed_ns)`. `adaptChunkRows(rows,elapsed_ns,target_ns)`→
   `target_chunk_ns`(0.5s budget),≤4×/step,clamped `1..max_chunk_rows`;
-  `initial_chunk_rows`=4. `progressLabel(buf[progress_label_buf_len],f)`→`"rendering 42%"`.
+  `initial_chunk_rows`=4. `progressLabel(buf[progress_label_buf_len],f)`.
   `upsampleInto(dst,dst_w,dst_h,src,src_w,src_h)`=nearest-neighbour BLOCKY preview.
 - `colorpass.zig`—`colorInto(rgba,iter,lut,max_iter,params,interior)` PURE;
   `rgba.len==iter.len*4` checked BEFORE any write;sentinel→`interior`;alpha FORCED 255.
@@ -123,6 +122,8 @@ end-to-end⇒shallow renders match pre-M6.
   `fromEngine`/`fromJson(json,alloc)` heap-own `stops` ONLY(mapping_mode=static tag)→`free(s,alloc)`;
   `toJson(buf)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`),bad mode→engine's current.
   `ParseError`+`UnknownMappingMode`;NO version field.
+- `presets.zig`—BUILT-IN colourings(const,binary-baked;NEVER `free`). `Preset{name,scheme}`,
+  `all()→[]const Preset`(>1),`gradientOf(p)`→bakeable `Gradient`. `all()[0]`(Classic)pos 0..1⇒LUT=end stops.
 
 ## Conventions
 
