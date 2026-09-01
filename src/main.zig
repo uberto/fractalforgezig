@@ -180,8 +180,12 @@ pub fn main() !void {
     var editor = editor_mod.Editor.initDefault();
     var view_editor = editor_mod.ViewEditor.initFromView(engine.view);
 
+    // Preview textures for the built-in preset swatches (baked once; see `panels.SwatchGallery`).
+    var gallery = try panels.SwatchGallery.init(device.handle);
+    defer gallery.deinit();
+
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor);
+    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor, &gallery);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -519,6 +523,7 @@ fn runLoop(
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
+    gallery: *const panels.SwatchGallery,
 ) void {
     var frame_timer: ?std.time.Timer = std.time.Timer.start() catch |err| blk: {
         app_log.warn("frame timer unavailable ({s}); frame ms will read 0", .{@errorName(err)});
@@ -806,6 +811,7 @@ fn runLoop(
             engine,
             editor,
             view_editor,
+            gallery,
             nav.open_ctx_menu,
             nav.right_click_pt,
             hover_pt,

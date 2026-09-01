@@ -132,6 +132,11 @@ pub extern fn igBeginPopup(str_id: [*:0]const u8, flags: WindowFlags) bool;
 // Invisible overlay button over the image (captures hover/click without stealing focus)
 pub extern fn igInvisibleButton(str_id: [*:0]const u8, size: ImVec2, flags: ButtonFlags) bool;
 
+// True when the LAST submitted item was clicked with `mouse_button` (0 = left). Used by the
+// preset swatch gallery (T5): `ffImguiImage` submits an item, and a click on it applies the
+// preset. Inert while the item is disabled (`igBeginDisabled`), so it cannot fire mid-render.
+pub extern fn igIsItemClicked(mouse_button: c_int) bool;
+
 // Cursor position in screen space (used for tooltip / coordinate readout placement)
 pub extern fn igGetCursorScreenPos() ImVec2;
 

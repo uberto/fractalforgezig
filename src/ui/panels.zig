@@ -16,6 +16,8 @@ const gesture = @import("gesture.zig");
 const viewport = @import("../fractal/viewport.zig");
 const engine_mod = @import("../fractal/engine.zig");
 const texture_mod = @import("../gpu/texture.zig");
+const gradient = @import("../fractal/gradient.zig");
+const presets_mod = @import("../fractal/presets.zig");
 const navigate = @import("../fractal/navigate.zig");
 const autoiter = @import("../fractal/autoiter.zig");
 const progressive = @import("../fractal/progressive.zig");
@@ -118,6 +120,49 @@ pub const CoordRequest = struct {
     input_mode: ?gesture.InputMode = null,
 };
 
+/// Number of built-in presets — comptime-known, so it sizes `SwatchGallery.textures` exactly.
+const preset_count = presets_mod.all().len;
+
+/// On-screen size (px) of one preset preview swatch. The baked LUT is `gradient.lut_size` wide
+/// and one texel tall; ImGui scales it to this box, so the ramp reads as a smooth horizontal
+/// gradient. Sized so a few fit across the fixed `data_panel_w` (see the wrap math below).
+const preview_w: f32 = 96.0;
+const preview_h: f32 = 20.0;
+/// Gap between swatches in the wrap grid.
+const swatch_gap: f32 = 8.0;
+
+/// Preview textures for the built-in colour presets (T5). Each preset's gradient is baked ONCE
+/// to a `lut_size`×1 LUT and uploaded to its own small GPU texture; the swatch gallery draws
+/// these every frame. Built once at startup and freed at teardown — NEVER per frame, which would
+/// leak a GPU texture each frame. The `handle`s live behind `texture_mod`.
+pub const SwatchGallery = struct {
+    /// One preview texture per `presets.all()` entry, in the same order.
+    textures: [preset_count]texture_mod.Texture,
+
+    /// Bake every preset's gradient ramp into its own preview texture and upload it. On any GPU
+    /// failure, destroys the textures created so far and returns the error, so the caller never
+    /// leaks a half-built gallery. Logs the failing call via `texture_mod` (scope `.gpu`).
+    pub fn init(device: *c.SDL_GPUDevice) texture_mod.Error!SwatchGallery {
+        var self: SwatchGallery = undefined;
+        var made: usize = 0;
+        errdefer for (self.textures[0..made]) |t| t.destroy();
+
+        for (presets_mod.all(), 0..) |preset, i| {
+            var lut: [gradient.lut_size]gradient.Rgba8 = undefined;
+            gradient.bakeLut(presets_mod.gradientOf(preset), &lut);
+            self.textures[i] = try texture_mod.createRgbaTexture(device, gradient.lut_size, 1);
+            made += 1;
+            try texture_mod.upload(device, self.textures[i], std.mem.sliceAsBytes(lut[0..]));
+        }
+        return self;
+    }
+
+    /// Release every preview texture. Call exactly once during teardown.
+    pub fn deinit(self: SwatchGallery) void {
+        for (self.textures) |t| t.destroy();
+    }
+};
+
 /// Build one frame of the fixed layout. Call between `Ui.newFrame` and `Ui.endFrame`.
 /// Sets `quit_requested.*` when File→Quit is chosen. Returns the context-menu action
 /// selected this frame (`.none` when no menu item was chosen).
@@ -141,6 +186,7 @@ pub fn draw(
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
+    gallery: *const SwatchGallery,
     open_ctx_menu: bool,
     right_click_pt: viewport.ComplexHi,
     hover_pt: ?viewport.ComplexHi,
@@ -222,7 +268,7 @@ pub fn draw(
         coord_request.input_mode = drawInputPanel(input_mode);
         ig.igSpacing();
         if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
-            const pal = drawPalettePanel(device, texture, engine, editor);
+            const pal = drawPalettePanel(device, texture, engine, editor, gallery);
             if (pal.save_scheme) save_scheme_requested = true;
             if (pal.load_scheme) load_scheme_requested = true;
         }
@@ -651,9 +697,12 @@ fn drawPalettePanel(
     texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
+    gallery: *const SwatchGallery,
 ) PaletteResult {
     var result = PaletteResult{};
     var edits = Edits{};
+
+    drawSwatchGallery(device, texture, engine, editor, gallery);
 
     ig.igSeparatorText("Palette");
     var i: usize = 0;
@@ -712,6 +761,65 @@ fn drawPalettePanel(
     if (ig.igSmallButton("Load scheme\xe2\x80\xa6")) result.load_scheme = true;
 
     return result;
+}
+
+/// Draw the built-in preset gallery: a wrap grid of clickable gradient-ramp swatches, each a
+/// preview texture baked from `presets.gradientOf` (see `SwatchGallery`). Clicking one applies
+/// that preset as an EDITABLE starting point (requirement "Built-in colouring presets"). Lives
+/// inside the caller's `igBeginDisabled(rendering)` block, so the whole grid greys out and stops
+/// responding while a render pass runs.
+///
+/// The wrap count is derived from the FIXED `data_panel_w`, not the live content-region width, so
+/// a data-panel scrollbar appearing or disappearing can never feed back into the layout (the
+/// scrollbar↔ContentAvail oscillation recorded for this project).
+fn drawSwatchGallery(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
+    gallery: *const SwatchGallery,
+) void {
+    ig.igSeparatorText("Presets");
+
+    // Usable width inside the data-panel child (window padding + border on both edges); a fixed
+    // estimate keeps the wrap count constant across frames.
+    const usable_w: f32 = data_panel_w - 24.0;
+    const per_row: usize = @max(1, @as(usize, @intFromFloat(@floor((usable_w + swatch_gap) / (preview_w + swatch_gap)))));
+
+    for (presets_mod.all(), 0..) |preset, idx| {
+        ig.igPushID_Int(@intCast(idx));
+        defer ig.igPopID();
+
+        c.ffImguiImage(gallery.textures[idx].handle, preview_w, preview_h);
+        if (ig.igIsItemClicked(0)) applyPreset(device, texture, engine, editor, preset);
+
+        // Name in a hover tooltip (kept off the grid so the swatches stay compact).
+        if (ig.igBeginItemTooltip()) {
+            var name_buf: [64]u8 = undefined;
+            const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{preset.name}) catch "preset";
+            ig.igTextUnformatted(name_z.ptr, null);
+            ig.igEndTooltip();
+        }
+
+        // Wrap: keep placing swatches on the same row until the row is full or the list ends.
+        const at_row_end = (idx + 1) % per_row == 0;
+        if (!at_row_end and idx + 1 < presets_mod.all().len) ig.igSameLine(0, swatch_gap);
+    }
+}
+
+/// Apply a preset as an editable starting point: load it into the editor (`applyScheme`), then
+/// push the colouring to the engine as a COLOUR pass only (`applyEdits` → the same setters palette
+/// edits use, never re-iterating) and re-upload. Logs a one-line "applied preset <name>".
+fn applyPreset(
+    device: *c.SDL_GPUDevice,
+    texture: texture_mod.Texture,
+    engine: *engine_mod.Engine,
+    editor: *editor_mod.Editor,
+    preset: presets_mod.Preset,
+) void {
+    editor.applyScheme(preset.scheme);
+    applyEdits(device, texture, engine, editor, .{ .gradient = true, .mapping = true, .interior = true });
+    ui_log.info("applied preset {s}", .{preset.name});
 }
 
 /// Apply the frame's edits to the engine and re-upload the recolored buffer. Runs ONLY
