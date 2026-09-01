@@ -11,7 +11,7 @@ Own Dear ImGui: context, SDL3+SDL_GPU backends, per-frame cycle, layout, palette
 Render target=the fractal REGION (`render_w/render_h`); `main.zig` targets it full-res, re-arming
 on change. `viewport.fitImageRect` letterboxes, NEVER stretches, IS the coordinate-mapping rect.
 Keep `no_scrollbar`: its width cut a `ContentAvail`→region→content oscillation that cancelled
-passes; `region_thrash_limit` warns after 8.
+passes.
 
 ## Layout: single window, two fixed regions
 
@@ -22,16 +22,15 @@ save_requested,open_requested,coord}`: `image_rect`=fitted ON-SCREEN rect (mappi
 `progress`(=`engine.passFraction()`) swaps the readout for
 `igProgressBar`+`progressive.progressLabel`. Status-bar lookup:
 `engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left: image; right: data+coord+palette. Menu: File→Save/Open/Quit, Help.
-Palette widgets edit stops/mode/period/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
-`editor.zig` (PURE): `Editor`+`toGradient`+`addStop`/`removeStop`+`indexToInputMode`. `stats.zig`
+Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
+`editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`(re-fill from a loaded colouring—`main.zig` calls it on every load so the panel shows what loaded)+`applyScheme`(load a preset/scheme as an EDITABLE start)+`indexToInputMode`. `stats.zig`
 (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
 
 ## Stack, bridge, `Ui` (imgui.zig)
 
 `build.zig` vendors cimgui+ImGui docking+SDL3/SDLGPU3 backends. `../cimgui.zig` holds
-`extern` decls, NOT `@cImport cimgui.h` (docking bitfields→`opaque{}`); add decls as
-needed. Bridge (`vendor/bridge`) wraps by-value `ImVec2`
-calls (`ffImgui*`, e.g. `ffImguiImage`). Per frame:
+`extern` decls, NOT `@cImport cimgui.h` (docking bitfields→`opaque{}`). Bridge
+(`vendor/bridge`) wraps by-value `ImVec2` calls (`ffImgui*`). Per frame:
 `newFrame()`→build→`endFrame()`→`prepareDrawData(cmd)` BEFORE the render
 pass→`renderDrawData(cmd,pass)`. Init order:
 `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
@@ -45,9 +44,9 @@ middle/Space+left→`panByPixels`. wheel/pinch→`nav.gestures` (pure
 `Accumulator.addPinch`(INCREMENTAL,multiplies)/`addWheel`/`endPinch`+`take()` DRAIN a frame to ONE
 `Intent{zoom_factor,pan_dx,pan_dy,began}`; `zoom_factor` INVERTS scale (open⇒<1⇒zoom IN, SIDE mult);
 ONLY `endPinch` ends a pinch run, a `.wheel_pan` run ends on a pan-less drain, bad input IGNORED;
-`classifyWheel(sample,mode)` by `nav.input_mode` (Input combo REQUESTS `CoordRequest.input_mode`,
-session-only): `.mouse`/`.trackpad` wins, `.auto` pans on ANY horizontal then `y!=integer_y`
-(whole-tick, NOT `@floor`), else zooms; `pan_x_sign`/`pan_y_sign` PROVISIONAL, unmeasured. Installed
+`classifyWheel(sample,mode)` by `nav.input_mode` (Input combo REQUESTS `CoordRequest.input_mode`):
+`.mouse`/`.trackpad` wins, `.auto` pans on ANY horizontal then `y!=integer_y`
+(whole-tick, NOT `@floor`), else zooms. Installed
 ONCE/frame zoom-about-`cursorCoord`|pan-by-`real_s`, `began`⇒`HistoryDebt` (1 undo/run, OWED till a
 view installs);
 right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord` in the STATUS
@@ -67,16 +66,15 @@ idle.
 keeping the decimal ONLY if it re-parses to the identical `f128`. NEVER `{d}` an `f128` (⇒`(float)`);
 `parseCoordHi` reads EXPONENT form back, never truncate.
 `coordDigits`/`max_coord_digits` budget the READ-ONLY readout (`viewport.formatCoord`); NEVER cut
-editable text to them. `mag`/`manual_iter_buf` stay f64/u32 (`writeF64`/`parseF64`);
-`coordFieldWidth()` shows 34 decimals.
+editable text to them. `mag`/`manual_iter_buf` stay f64/u32 (`writeF64`/`parseF64`).
 `initFromView`/`syncFromView` fill all 7; `syncFromPolicy(policy,engine.max_iter)` shows the count
 IN USE (ramp's under Auto, NOT `policy.manual_value`); `iterFieldReadOnly()`(=`auto_iter`)⇒field
 read-only+greyed, re-synced every frame; `leaveAuto` (TOTAL) pins what SHOWS, else `base_max_iter`;
 `iterRejection`→`IterRejection` picks the `.err` message.
 `parseAndApplyCenterMag`/`parseAndApplyCorners`→`?SquareView`, `parseIterPolicy`→`?IterPolicy`;
 `drawCoordPanel` REQUESTS (returns `CoordRequest{view,policy,input_mode}`), never applies; parse
-failure logs `.err` and re-syncs. `writeF64` RESERVES the last byte⇒ALWAYS terminated, `.scientific`
-when the decimal won't fit (else `mag` goes unterminated, aborting `InputTextEx`).
+failure logs `.err` and re-syncs. `writeF64` RESERVES the last byte⇒ALWAYS terminated (else
+`InputTextEx` aborts), `.scientific` when the decimal won't fit.
 
 ## File dialog: dialog.zig
 

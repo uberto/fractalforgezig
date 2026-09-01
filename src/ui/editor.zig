@@ -20,6 +20,8 @@ const mapping = @import("../fractal/mapping.zig");
 const color = @import("../fractal/color.zig");
 const viewport = @import("../fractal/viewport.zig");
 const autoiter = @import("../fractal/autoiter.zig");
+const scheme = @import("../fractal/scheme.zig");
+const presets = @import("../fractal/presets.zig");
 const gesture = @import("gesture.zig");
 
 /// Reused verbatim from `color.zig` (M0). Channel order R, G, B, A. Do not redefine.
@@ -51,6 +53,10 @@ pub const Editor = struct {
     mode_index: c_int = 0,
     /// The `cyclic` period; ignored by linear/log (mirrors `mapping.Params`).
     period: f32 = mapping.default_period,
+    /// Whether iteration bands are shown (banded) or the escape value gives a continuous
+    /// gradient (smooth). Part of the colouring; surfaced by `params()` (mirrors
+    /// `mapping.Params.banded`).
+    banded: bool = false,
     /// The dedicated interior color (plan A5).
     interior: Rgba8 = color.interior_color,
 
@@ -80,7 +86,41 @@ pub const Editor = struct {
 
     /// The mapping selection for `Engine.setMapping`.
     pub fn params(self: *const Editor) mapping.Params {
-        return .{ .mode = indexToMode(self.mode_index), .period = self.period };
+        return .{ .mode = indexToMode(self.mode_index), .period = self.period, .banded = self.banded };
+    }
+
+    /// Repopulate the editor from a colouring just loaded onto the engine, so the panel shows
+    /// what was loaded rather than the values previously on display (requirement "Loading
+    /// restores the palette panel"). Mirrors `ViewEditor.syncFromView`/`syncFromPolicy`: it
+    /// overwrites every field. The stop count is clamped to `gradient.max_stops` (a `Gradient`
+    /// never holds more, so the clamp is defensive, not lossy).
+    pub fn syncFromColouring(self: *Editor, g: gradient.Gradient, p: mapping.Params, interior: Rgba8) void {
+        const src = g.stops();
+        const n = @min(src.len, gradient.max_stops);
+        @memcpy(self.stops_buf[0..n], src[0..n]);
+        self.count = n;
+        self.mode_index = modeToIndex(p.mode);
+        self.period = p.period;
+        self.banded = p.banded;
+        self.interior = interior;
+    }
+
+    /// Load a preset or scheme into the editor as an EDITABLE starting point (requirement
+    /// "Built-in colouring presets" → "applying a preset replaces the colouring and stays
+    /// editable"): the stops/mode/period/banded/interior all become the scheme's, and the
+    /// stops can still be added/removed/recoloured afterwards. An unknown `mapping_mode`
+    /// falls back to the current mode rather than trapping — presets are always valid, so
+    /// this only guards a hand-built scheme.
+    pub fn applyScheme(self: *Editor, s: scheme.Scheme) void {
+        const n = @min(s.stops.len, gradient.max_stops);
+        for (s.stops[0..n], 0..) |st, i| {
+            self.stops_buf[i] = .{ .pos = st.pos, .color = .{ st.r, st.g, st.b, st.a } };
+        }
+        self.count = n;
+        self.mode_index = modeToIndex(std.meta.stringToEnum(mapping.Mode, s.mapping_mode) orelse self.mode());
+        self.period = s.mapping_period;
+        self.banded = s.banded;
+        self.interior = .{ s.interior_r, s.interior_g, s.interior_b, s.interior_a };
     }
 
     /// Build the ascending-sorted `Gradient` for `Engine.setGradient`. Copies the stops,
@@ -499,6 +539,40 @@ pub fn indexToInputMode(i: c_int) gesture.InputMode {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const expectApproxEqAbs = testing.expectApproxEqAbs;
+
+test "acceptance: after a load the palette editor shows the loaded colouring" {
+    const g = gradient.Gradient.fromStops(&[_]gradient.Stop{
+        .{ .pos = 0.0, .color = .{ 1, 2, 3, 255 } },
+        .{ .pos = 1.0, .color = .{ 9, 8, 7, 255 } },
+    });
+    var ed = Editor.initDefault();
+    ed.syncFromColouring(g, .{ .mode = .cyclic, .period = 21.0, .banded = true }, .{ 5, 6, 7, 255 });
+
+    try expectEqual(@as(usize, 2), ed.stops().len);
+    try expectEqual(gradient.Rgba8{ 1, 2, 3, 255 }, ed.stops()[0].color);
+    try expectEqual(mapping.Mode.cyclic, ed.mode());
+    try expectApproxEqAbs(@as(f32, 21.0), ed.period, 1e-6);
+    try expectEqual(true, ed.banded);
+    try expectEqual(@as(u8, 5), ed.interior[0]);
+}
+
+test "acceptance: applying a preset replaces the colouring and stays editable" {
+    const p = presets.all()[0];
+    var ed = Editor.initDefault();
+    ed.applyScheme(p.scheme);
+
+    // The editor took the preset's colouring.
+    try expectEqual(p.scheme.stops.len, ed.stops().len);
+    try expectEqual(std.meta.stringToEnum(mapping.Mode, p.scheme.mapping_mode).?, ed.mode());
+
+    // ...and it is still editable afterwards: a stop can be added (the preset is below the cap).
+    const before = ed.stops().len;
+    try expect(ed.addStop());
+    try expectEqual(before + 1, ed.stops().len);
+}
 
 test "initDefault mirrors the engine's default palette, mapping, period, and interior" {
     const e = Editor.initDefault();

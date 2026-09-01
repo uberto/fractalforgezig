@@ -926,7 +926,7 @@ fn runLoop(
 
         // ── File dialog result processing ─────────────────────────────────────
         if (dialog.takePending(&pending_dialog)) |result| {
-            handleDialogResult(result, device, texture, engine, &nav, real_w, real_h, view_editor);
+            handleDialogResult(result, device, texture, engine, &nav, real_w, real_h, editor, view_editor);
         }
 
         // Only update frame_ms when the fractal actually re-rendered; skip mouse-move frames.
@@ -949,6 +949,7 @@ fn handleDialogResult(
     nav: *NavState,
     real_w: u32,
     real_h: u32,
+    editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
 ) void {
     const alloc = std.heap.page_allocator;
@@ -1019,6 +1020,10 @@ fn handleDialogResult(
             syncTexture(device, texture, engine);
             view_editor.syncFromView(engine.view);
             view_editor.syncFromPolicy(engine.policy, engine.max_iter);
+            // The load replaced the engine's colouring; resync the palette panel so it shows
+            // what was loaded, not the values previously on display (requirement "Loading
+            // restores the palette panel").
+            editor.syncFromColouring(engine.gradient, engine.params, engine.interior);
             nav.needs_upload = true;
             armFullPass(nav);
             app_log.info("state loaded from '{s}'", .{path});

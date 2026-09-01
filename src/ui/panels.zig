@@ -669,6 +669,11 @@ fn drawPalettePanel(
         edits.mapping = true;
     }
     ig.igEndDisabled();
+    // Banded vs smooth is part of the colouring, applied as a colour pass (never re-iterates).
+    // Sits in the palette panel, which the caller already wraps in `igBeginDisabled(rendering)`.
+    if (ig.igCheckbox("banded", &editor.banded)) {
+        edits.mapping = true;
+    }
 
     ig.igSeparatorText("Interior");
     var interior = colorToFloats(editor.interior);
