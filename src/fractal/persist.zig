@@ -117,6 +117,16 @@ pub const min_json_buf_len = json_fixed_fields_len + 2 * (center_text_max_len + 
 
 /// Render ONE centre coordinate as the decimal text the file carries. Returns a slice of `buf`.
 ///
+/// SIBLING, DO NOT MERGE: `src/ui/editor.zig`'s `writeCoordHi` also renders an `f128` to decimal,
+/// and the two look mergeable but are NOT. They optimise for opposite things. THIS one writes
+/// straight into a fixed 79-byte destination and lets `render`'s conservative length BOUND decide
+/// the form — cheap, bounded, no re-parse, exactly what the save path wants. `writeCoordHi` renders
+/// into a generous scratch, length-checks the ACTUAL output, and re-parses to PROVE the plain form
+/// is lossless — readable and verified, exactly what the live editor field wants. On the real
+/// deep-zoom residue `7.500000620552782493177801370620728e-11` they legitimately DISAGREE: this one
+/// emits the exponent form (pinned below), `writeCoordHi` emits plain. A shared helper cannot honour
+/// both contracts at once, so they stay separate on purpose. (m8/T8 parked, user-confirmed.)
+///
 /// FORMAT: `{d}` — full precision, i.e. the SHORTEST decimal that reparses to the identical
 /// `f128`. Do NOT replace it with a fixed decimal count: `{d:.34}` reads like "34 digits" but
 /// means 34 digits AFTER THE POINT, a 1e-34 grid that is COARSER than the `f128` ulp for

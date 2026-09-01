@@ -373,6 +373,17 @@ comptime {
 
 /// Write ONE coordinate into a null-terminated text buffer at full `f128` precision.
 ///
+/// SIBLING, DO NOT MERGE: `src/fractal/persist.zig`'s `writeCenter` also renders an `f128` to
+/// decimal, and the two look mergeable but are NOT. They optimise for opposite things. THIS one
+/// renders into a generous scratch, length-checks the ACTUAL output against the field, and re-parses
+/// to PROVE the plain form is lossless — readable and verified, exactly what a live editor field
+/// wants. `writeCenter` writes straight into a fixed destination and lets `render`'s conservative
+/// length BOUND pick the form — cheap, bounded, no re-parse, exactly what the save path wants. On
+/// the real deep-zoom residue `7.500000620552782493177801370620728e-11` they legitimately DISAGREE:
+/// this one shows it plain, `writeCenter` writes the exponent form (pinned by a persist test). A
+/// shared helper cannot honour both contracts at once, so they stay separate on purpose. (m8/T8
+/// parked, user-confirmed.)
+///
 /// Form: the SHORTEST-ROUND-TRIP decimal (`0.131825904205311970493132056385139`) when it fits,
 /// else the shortest-round-trip exponent form (`3.7e-33`). Both name the value exactly, so
 /// `parseCoordHi` returns the identical `f128` — which is what a user pasting a coordinate back
