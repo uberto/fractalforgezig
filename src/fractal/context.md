@@ -120,7 +120,7 @@ end-to-end⇒shallow renders match pre-M6.
 - `scheme.zig`—COLOUR-ONLY save/load,INDEPENDENT of persist,NO view/centre/side/policy.
   `Scheme{stops,mapping_mode,mapping_period,banded,interior_r/g/b/a}`;`SchemeStop{pos,r,g,b,a}`.
   `fromEngine`/`fromJson(json,alloc)` heap-own `stops` ONLY(mapping_mode=static tag)→`free(s,alloc)`;
-  `toJson(buf)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`),bad mode→engine's current.
+  `toJson(buf≥min_json_buf_len)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`),bad mode→engine's current.
   `ParseError`+`UnknownMappingMode`;NO version field.
 - `presets.zig`—BUILT-IN colourings(const,binary-baked;NEVER `free`). `Preset{name,scheme}`,
   `all()→[]const Preset`(>1),`gradientOf(p)`→bakeable `Gradient`. `all()[0]`(Classic)pos 0..1⇒LUT=end stops.

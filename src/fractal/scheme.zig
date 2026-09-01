@@ -86,6 +86,22 @@ const WireStop = struct {
     a: u8,
 };
 
+// ─── Buffer sizing ─────────────────────────────────────────────────────────────
+
+/// Generous per-stop byte budget in `indent_2` form: the five keys (`pos`,`r`,`g`,`b`,`a`),
+/// their values, punctuation and indentation. Comfortably over the ~90 bytes a stop needs.
+const scheme_stop_bytes = 128;
+
+/// Fixed non-stop bytes: the `mapping_mode`/`mapping_period`/`banded`/`interior_*` keys, their
+/// values, and the surrounding braces and newlines. Comfortably over the ~200 bytes they need.
+const scheme_fixed_bytes = 512;
+
+/// The buffer length that fits `toJson`'s output for ANY valid `Scheme`. A scheme carries NO
+/// view text (no `f128` centre), so it needs only the stops plus the fixed colouring fields.
+/// Callers (main.zig's scheme save) MUST size their buffer from here rather than hand-writing a
+/// number: a buffer that no longer fits `gradient.max_stops` stops is an overflow, not cosmetic.
+pub const min_json_buf_len = scheme_fixed_bytes + gradient_mod.max_stops * scheme_stop_bytes;
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Serialise `scheme` as indented JSON into `buf`. Returns the bytes written. A buffer too

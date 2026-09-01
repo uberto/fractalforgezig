@@ -21,9 +21,9 @@ save_requested,open_requested,coord}`: `image_rect`=fitted ON-SCREEN rect (mappi
 (`igBeginDisabled`), leaving only image+wheel/pinch+progress live;
 `progress`(=`engine.passFraction()`) swaps the readout for
 `igProgressBar`+`progressive.progressLabel`. Status-bar lookup:
-`engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left: image; right: data+coord+palette. Menu: File→Save/Open/Quit, Help.
+`engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left image, right data+coord+palette; Menu File(Save/Open/Quit)+Help.
 Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
-`editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`(re-fill from a loaded colouring—`main.zig` calls it on every load so the panel shows what loaded)+`applyScheme`(load a preset/scheme as an EDITABLE start)+`indexToInputMode`. `stats.zig`
+`editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`(re-fill from a loaded colouring)+`applyScheme`(preset/scheme as EDITABLE start)+`indexToInputMode`. `stats.zig`
 (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
 
 ## Stack, bridge, `Ui` (imgui.zig)
@@ -55,7 +55,7 @@ BAR. EVERY view/policy change goes through
 `cancelPass`→`installView`/`installPolicy`→`renderCoarse` (blocking, per-axis `coarse_divisor`)
 →`syncFromView`→`armFullPass`; NOTHING iterates full-res synchronously.
 `refine.decidePass` fires `beginFullPass`; `stepPassChunk` runs one `engine.stepPass()`/frame.
-Pump: `engine.pass!=null`→`SDL_PollEvent`, else `SDL_WaitEventTimeout(16)` when a pass is owed / `-1`
+Pump: `engine.pass!=null`→`SDL_PollEvent`, else `SDL_WaitEventTimeout(16)` if a pass is owed / `-1`
 idle.
 
 ## Coord panel + ViewEditor
@@ -73,15 +73,17 @@ read-only+greyed, re-synced every frame; `leaveAuto` (TOTAL) pins what SHOWS, el
 `iterRejection`→`IterRejection` picks the `.err` message.
 `parseAndApplyCenterMag`/`parseAndApplyCorners`→`?SquareView`, `parseIterPolicy`→`?IterPolicy`;
 `drawCoordPanel` REQUESTS (returns `CoordRequest{view,policy,input_mode}`), never applies; parse
-failure logs `.err` and re-syncs. `writeF64` RESERVES the last byte⇒ALWAYS terminated (else
-`InputTextEx` aborts), `.scientific` when the decimal won't fit.
+failure logs `.err` and re-syncs. `writeF64` RESERVES the last byte⇒ALWAYS terminated.
 
 ## File dialog: dialog.zig
 
 `PendingDialog{kind,path_buf,path_len}`—stack-alloc in `runLoop`, outlives callbacks.
-`showSave`/`showOpen(window,pending)` no-op unless `kind==.none`. `takePending`→`?PendingResult`,
-`null` on cancel. `callconv(.c)` callback writes the path in. Filter
-`*.fractal`.
+`showSave`/`showOpen`(+`…Scheme` variants)`(window,pending)` no-op unless `kind==.none`
+(`kind∈{save,open,save_scheme,open_scheme}`). `takePending`→`?PendingResult`, `null` on cancel.
+`callconv(.c)` callback writes the path. Filters `.fractal`/`.fpal`(colour-only). Scheme Save/Load:
+BUTTONS in the Coloring header (`drawPalettePanel`), inside `igBeginDisabled(rendering)`; load
+`scheme.fromJson`→`applyToEngine`(setters, no re-iterate)→`syncFromColouring`, bad file refused
+with its named reason.
 
 ## Testing
 

@@ -24,6 +24,7 @@ const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
 const perturb = @import("fractal/perturb.zig");
 const persist = @import("fractal/persist.zig");
+const scheme = @import("fractal/scheme.zig");
 const dialog = @import("ui/dialog.zig");
 
 const app_log = std.log.scoped(.app);
@@ -858,6 +859,8 @@ fn runLoop(
         // Open file dialogs when menu items were clicked (after the ImGui frame).
         if (draw_result.save_requested) dialog.showSave(window, &pending_dialog);
         if (draw_result.open_requested) dialog.showOpen(window, &pending_dialog);
+        if (draw_result.save_scheme_requested) dialog.showSaveScheme(window, &pending_dialog);
+        if (draw_result.load_scheme_requested) dialog.showOpenScheme(window, &pending_dialog);
 
         // Act on the context-menu selection.
         if (draw_result.ctx_action != .none) {
@@ -1027,6 +1030,74 @@ fn handleDialogResult(
             nav.needs_upload = true;
             armFullPass(nav);
             app_log.info("state loaded from '{s}'", .{path});
+        },
+        .save_scheme => {
+            // The COLOURING only — no view, no iteration count. See `scheme.zig`.
+            const s = scheme.fromEngine(engine, alloc) catch |err| {
+                app_log.err("save scheme: fromEngine failed ({s})", .{@errorName(err)});
+                return;
+            };
+            defer scheme.free(s, alloc);
+
+            const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+                app_log.err("save scheme: cannot create '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            defer file.close();
+
+            // Sized from scheme's own constant, never a hand-written number: a scheme carries no
+            // view text, so its worst case is `max_stops` stops plus the fixed colouring fields.
+            var json_buf: [scheme.min_json_buf_len]u8 = undefined;
+            const json_bytes = scheme.toJson(s, &json_buf) catch |err| {
+                app_log.err("save scheme: toJson failed ({s})", .{@errorName(err)});
+                return;
+            };
+            file.writeAll(json_bytes) catch |err| {
+                app_log.err("save scheme: write failed for '{s}' ({s})", .{ path, @errorName(err) });
+                return;
+            };
+            app_log.info("colour scheme saved to '{s}' ({d} stops)", .{ path, s.stops.len });
+        },
+        .open_scheme => {
+            const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+                app_log.err("load scheme: cannot read '{s}' ({s}); keeping the current colouring", .{ path, @errorName(err) });
+                return;
+            };
+            defer file.close();
+
+            // Read allowance: a scheme we WRITE always fits in `min_json_buf_len`; a hand-edited
+            // or re-indented file gets room on top of that rather than being truncated into a
+            // spurious parse error.
+            var file_buf: [4 * scheme.min_json_buf_len]u8 = undefined;
+            const n = file.readAll(&file_buf) catch |err| {
+                app_log.err("load scheme: read failed for '{s}' ({s}); keeping the current colouring", .{ path, @errorName(err) });
+                return;
+            };
+
+            // A file we cannot use is REFUSED with its named reason (from `ParseError`), and the
+            // current colouring is left untouched — nothing has been applied to the engine yet.
+            const s = scheme.fromJson(file_buf[0..n], alloc) catch |err| {
+                app_log.err("load scheme: '{s}' refused ({s}); keeping the current colouring", .{ path, @errorName(err) });
+                return;
+            };
+            defer scheme.free(s, alloc);
+
+            // Colour setters ONLY (`scheme.applyToEngine`): the view does not move and the fractal
+            // is not re-iterated — a colour pass, not an iteration pass.
+            scheme.applyToEngine(s, engine) catch |err| {
+                app_log.err("load scheme: apply failed for '{s}' ({s}); keeping the current colouring", .{ path, @errorName(err) });
+                return;
+            };
+
+            // Show the loaded colouring in the palette panel (requirement "Loading restores the
+            // palette panel"). The image was recoloured in place — same size, so no texture
+            // resize — so upload it and owe one more present frame to put it on screen.
+            editor.syncFromColouring(engine.gradient, engine.params, engine.interior);
+            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
+                app_log.err("load scheme: re-upload of recoloured buffer failed ({s})", .{@errorName(err)});
+            };
+            nav.needs_present = true;
+            app_log.info("colour scheme loaded from '{s}' ({d} stops)", .{ path, s.stops.len });
         },
         .none => {},
     }

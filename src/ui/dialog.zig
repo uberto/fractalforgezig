@@ -18,8 +18,9 @@ const log = std.log.scoped(.ui);
 /// Maximum path length stored in `PendingDialog`. Paths longer than this are truncated.
 pub const max_path_len = 511;
 
-/// Outcome kind stored in `PendingDialog` after the callback fires.
-pub const Kind = enum { none, save, open };
+/// Outcome kind stored in `PendingDialog` after the callback fires. `save`/`open` are the whole
+/// picture (`.fractal`); `save_scheme`/`open_scheme` are a colour-only scheme (`.fpal`).
+pub const Kind = enum { none, save, open, save_scheme, open_scheme };
 
 /// Written by the C callback; polled by the main loop each frame.
 /// Stack-allocate one in `runLoop`; its lifetime must outlive all dialog callbacks.
@@ -49,6 +50,13 @@ pub const PendingResult = struct {
 const fractal_filter = c.SDL_DialogFileFilter{
     .name = "Fractal files (*.fractal)", // free-form label; the glob is fine HERE
     .pattern = "fractal",
+};
+
+/// A colour-only scheme file. BARE extension `fpal`, never `*.fpal` — same SDL3 validation rule
+/// as `fractal_filter` above (a glob in `pattern` fails and the dialog silently never appears).
+const scheme_filter = c.SDL_DialogFileFilter{
+    .name = "Colour schemes (*.fpal)", // free-form label; the glob is fine HERE
+    .pattern = "fpal",
 };
 
 // ─── C callback ──────────────────────────────────────────────────────────────
@@ -112,6 +120,28 @@ pub fn showOpen(window: *c.SDL_Window, pending: *PendingDialog) void {
     pending.callback_fired = false;
     c.SDL_ShowOpenFileDialog(dialogCallback, pending, window, &fractal_filter, 1, null, false);
     log.info("open dialog requested", .{});
+}
+
+/// Show the OS save dialog for a colour SCHEME (`.fpal`). No-op if a dialog is already pending.
+/// Mirrors `showSave`; only the file filter differs.
+pub fn showSaveScheme(window: *c.SDL_Window, pending: *PendingDialog) void {
+    if (pending.kind != .none) return;
+    pending.kind = .save_scheme;
+    pending.path_len = 0;
+    pending.callback_fired = false;
+    c.SDL_ShowSaveFileDialog(dialogCallback, pending, window, &scheme_filter, 1, null);
+    log.info("save-scheme dialog requested", .{});
+}
+
+/// Show the OS open dialog for a colour SCHEME (`.fpal`). No-op if a dialog is already pending.
+/// Mirrors `showOpen`; only the file filter differs.
+pub fn showOpenScheme(window: *c.SDL_Window, pending: *PendingDialog) void {
+    if (pending.kind != .none) return;
+    pending.kind = .open_scheme;
+    pending.path_len = 0;
+    pending.callback_fired = false;
+    c.SDL_ShowOpenFileDialog(dialogCallback, pending, window, &scheme_filter, 1, null, false);
+    log.info("open-scheme dialog requested", .{});
 }
 
 /// Check whether a dialog completed. Returns `null` if no result is ready yet or the user

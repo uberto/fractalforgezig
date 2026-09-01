@@ -93,6 +93,11 @@ pub const DrawResult = struct {
     needs_rerender: bool = false,
     save_requested: bool = false,
     open_requested: bool = false,
+    /// Set when the Coloring panel's "Save scheme…" / "Load scheme…" button was clicked;
+    /// main.zig opens the appropriate SDL `.fpal` dialog after the frame. These sit INSIDE the
+    /// `igBeginDisabled(rendering)` block, so they cannot fire while a render pass is running.
+    save_scheme_requested: bool = false,
+    load_scheme_requested: bool = false,
     /// A view / `max_iter` policy the coord panel wants installed (see `CoordRequest`).
     coord: CoordRequest = .{},
 };
@@ -148,6 +153,8 @@ pub fn draw(
     var needs_rerender = false;
     var save_requested = false;
     var open_requested = false;
+    var save_scheme_requested = false;
+    var load_scheme_requested = false;
     var coord_request = CoordRequest{};
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
@@ -215,7 +222,9 @@ pub fn draw(
         coord_request.input_mode = drawInputPanel(input_mode);
         ig.igSpacing();
         if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
-            drawPalettePanel(device, texture, engine, editor);
+            const pal = drawPalettePanel(device, texture, engine, editor);
+            if (pal.save_scheme) save_scheme_requested = true;
+            if (pal.load_scheme) load_scheme_requested = true;
         }
         ig.igEndDisabled();
         c.ffImguiEndChild();
@@ -234,6 +243,8 @@ pub fn draw(
         .needs_rerender = needs_rerender,
         .save_requested = save_requested,
         .open_requested = open_requested,
+        .save_scheme_requested = save_scheme_requested,
+        .load_scheme_requested = load_scheme_requested,
         .coord = coord_request,
     };
 }
@@ -628,12 +639,20 @@ const Edits = struct {
 /// per-row Remove), Add-stop, the mapping combo + cyclic-period slider, and the interior
 /// color edit. On ANY change it applies the edit to `engine` and re-uploads to `texture`
 /// via `applyEdits` — never re-iterating.
+/// What the Coloring panel asks the app to do this frame beyond its own colour edits. Save/Load
+/// scheme both open an OS file dialog, which main.zig launches AFTER the frame (like File→Save…).
+const PaletteResult = struct {
+    save_scheme: bool = false,
+    load_scheme: bool = false,
+};
+
 fn drawPalettePanel(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
-) void {
+) PaletteResult {
+    var result = PaletteResult{};
     var edits = Edits{};
 
     ig.igSeparatorText("Palette");
@@ -683,6 +702,16 @@ fn drawPalettePanel(
     }
 
     if (edits.any()) applyEdits(device, texture, engine, editor, edits);
+
+    // Save / Load a portable colour scheme (`.fpal`). These only RAISE a request; main.zig opens
+    // the OS dialog after the frame and does the file I/O (like File→Save…). They live here,
+    // inside the caller's `igBeginDisabled(rendering)` block, so both grey out during a pass.
+    ig.igSeparatorText("Scheme");
+    if (ig.igSmallButton("Save scheme\xe2\x80\xa6")) result.save_scheme = true;
+    ig.igSameLine(0, 8.0);
+    if (ig.igSmallButton("Load scheme\xe2\x80\xa6")) result.load_scheme = true;
+
+    return result;
 }
 
 /// Apply the frame's edits to the engine and re-upload the recolored buffer. Runs ONLY
