@@ -20,8 +20,13 @@
 //!   * `max_iter == 0` (degenerate) and `period <= 0` (would divide by zero) both guard
 //!     to `0` rather than trapping.
 //!
+//! A `banded` flag on `Params` (default `false`, i.e. smooth) floors the escape value to
+//! its integer iteration count before the per-mode transform, so pixels sharing an integer
+//! iteration count share a palette index and the bands are visible.
+//!
 //! Formulas are documented inline BELOW so a future GPU fragment-shader color pass can be
-//! written to match this CPU math bit-for-bit (M-future GPU parity, plan A1).
+//! written to match this CPU math bit-for-bit (M-future GPU parity, plan A1) — including the
+//! banded floor, applied first when the flag is set.
 const std = @import("std");
 
 /// The available mapping transforms. Selected in the UI (T6); default is `linear`
@@ -35,9 +40,15 @@ pub const default_period: f32 = 32.0;
 
 /// Mapping selection. `period` is used ONLY by `Mode.cyclic` and MUST be `> 0`; other
 /// modes ignore it. Defaults to `linear` + `default_period`.
+///
+/// `banded` (default `false` — smooth, today's look) floors the escape value to its
+/// integer iteration count BEFORE the per-mode transform, so pixels sharing an integer
+/// iteration count share a palette index and the iteration bands become visible. A future
+/// GPU shader matches this by flooring `smooth` first when banding is on.
 pub const Params = struct {
     mode: Mode = .linear,
     period: f32 = default_period,
+    banded: bool = false,
 };
 
 /// Map an escaped smooth iteration value to a LUT index in `[0,1]`.
@@ -60,21 +71,25 @@ pub fn mapToUnit(smooth: f32, max_iter: u32, params: Params) f32 {
     // negative or non-finite value can never be a valid LUT index — clamp it to 0.
     if (!std.math.isFinite(smooth) or smooth < 0.0) return 0.0;
 
+    // Banded: collapse the escape value to its integer iteration count before the
+    // per-mode transform, so a whole band shares one palette index. Smooth leaves it as-is.
+    const v = if (params.banded) @floor(smooth) else smooth;
+
     switch (params.mode) {
         .linear => {
             if (max_iter == 0) return 0.0; // guard div-by-zero
             const denom: f32 = @floatFromInt(max_iter);
-            return std.math.clamp(smooth / denom, 0.0, 1.0);
+            return std.math.clamp(v / denom, 0.0, 1.0);
         },
         .log => {
             if (max_iter == 0) return 0.0; // guard div-by-zero (log(1) == 0)
             const denom = std.math.log(f32, std.math.e, 1.0 + @as(f32, @floatFromInt(max_iter)));
-            const num = std.math.log(f32, std.math.e, 1.0 + smooth);
+            const num = std.math.log(f32, std.math.e, 1.0 + v);
             return std.math.clamp(num / denom, 0.0, 1.0);
         },
         .cyclic => {
             if (params.period <= 0.0) return 0.0; // guard div-by-zero
-            const scaled = smooth / params.period;
+            const scaled = v / params.period;
             const frac = scaled - @floor(scaled); // fract(x) in [0,1)
             // scaled is >= 0 here (smooth >= 0, period > 0), so frac is already [0,1);
             // clamp only to defend against float rounding landing exactly on 1.0.
@@ -180,4 +195,21 @@ test "Params defaults to linear with the documented default period" {
     const p = Params{};
     try expectEqual(Mode.linear, p.mode);
     try expectEqual(default_period, p.period);
+}
+
+test "acceptance: banded colouring gives one colour per iteration band" {
+    // Two escape values in the SAME integer band (10.x) and two straddling a band edge (10.x/11.x).
+    const in_band_lo: f32 = 10.3;
+    const in_band_hi: f32 = 10.7;
+    const next_band: f32 = 11.2;
+
+    // Banded on: the two values inside band 10 collapse to one index...
+    const banded = Params{ .mode = .linear, .banded = true };
+    try expectEqual(mapToUnit(in_band_lo, 100, banded), mapToUnit(in_band_hi, 100, banded));
+    // ...and a value in the next band is a different index.
+    try expect(mapToUnit(in_band_hi, 100, banded) != mapToUnit(next_band, 100, banded));
+
+    // Smooth (banded off): the two values inside band 10 are NOT forced together.
+    const smooth = Params{ .mode = .linear, .banded = false };
+    try expect(mapToUnit(in_band_lo, 100, smooth) != mapToUnit(in_band_hi, 100, smooth));
 }
