@@ -18,7 +18,7 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 | [navigation](navigation/spec.md) | Cursor-anchored zoom, centered zoom, pan, box-select, reset, trackpad pinch zoom and two-finger pan, the per-frame gesture coalescing, the pointing-device wheel discriminator, refusal of impossible gestures, the zoom depth limit warning, the maximum zoom-out clamp. |
 | [deep-zoom](deep-zoom/spec.md) | Perturbation rendering below the double-precision floor down to a side of 1e-30, accuracy against full-precision iteration, GPU deep zoom with logged CPU fallback, 34-digit view coordinates, precision-preserving navigation at depth. |
 | [view-coordinates](view-coordinates/spec.md) | The square view model, the centre/magnification and corner duals, pixel↔complex mapping, aspect-preserving display, the coordinate readout's precision. |
-| [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, the interior colour, opaque output. |
+| [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, banded vs smooth colouring, the interior colour, opaque output, portable colour-scheme files, and the built-in presets. |
 | [gpu-acceleration](gpu-acceleration/spec.md) | GPU iteration agreeing with the CPU, banded dispatch, CPU fallback on GPU failure, the user's backend choice. |
 | [persistence](persistence/spec.md) | Saving and reopening the complete render state as a `.fractal` JSON file, and refusing a corrupt one. |
 | [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, render statistics, the file dialogs, startup and failure logging. |
@@ -45,6 +45,14 @@ folded parts are `_not pinned by a test_`: the two-finger swipe's direction and 
 platform-reported values were never measured — the probe was not run — so they ship provisional and
 are on the user's walkthrough checklist), and the event loop's per-gesture history push (glue with
 no test tier). The pure logic behind every requirement is test-pinned.
+
+Milestone `m8-coloring-schemes` added four `colouring` requirements — **Banded or smooth iteration
+colouring**, **Portable colouring schemes**, **Built-in colouring presets** and **Loading restores
+the palette panel** — and rewrote `persistence`'s **The whole picture is saved** to carry the new
+`banded` flag and to pin the two scenarios that shipped in M5 but were unpinned. The scheme
+Save/Load buttons, the preset swatch gallery and the banded checkbox are ImGui glue whose active
+state during a render is pilot-verified (see `rendering`'s panel-disabled note), not unit-tested; the
+pure logic behind every new requirement is test-pinned.
 
 ## Verification
 

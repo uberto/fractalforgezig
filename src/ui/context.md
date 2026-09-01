@@ -21,8 +21,9 @@ save_requested,open_requested,coord}`: `image_rect`=fitted ON-SCREEN rect (mappi
 (`igBeginDisabled`), leaving only image+wheel/pinch+progress live;
 `progress`(=`engine.passFraction()`) swaps the readout for
 `igProgressBar`+`progressive.progressLabel`. Status-bar lookup:
-`engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left image, right data+coord+palette; Menu File(Save/Open/Quit)+Help.
+`engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left image, right data+coord+palette.
 Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
+`drawPalettePanel` also draws the preset grid (`drawSwatchGallery`): `SwatchGallery` bakes each `presets.gradientOf` to a texture ONCE (freed at teardown), click→`applyPreset`.
 `editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`(re-fill from a loaded colouring)+`applyScheme`(preset/scheme as EDITABLE start)+`indexToInputMode`. `stats.zig`
 (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
 
@@ -32,8 +33,7 @@ Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`�
 `extern` decls, NOT `@cImport cimgui.h` (docking bitfields→`opaque{}`). Bridge
 (`vendor/bridge`) wraps by-value `ImVec2` calls (`ffImgui*`). Per frame:
 `newFrame()`→build→`endFrame()`→`prepareDrawData(cmd)` BEFORE the render
-pass→`renderDrawData(cmd,pass)`. Init order:
-`SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
+pass→`renderDrawData(cmd,pass)`. Init: `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
 
 ## Navigation + progressive render (main.zig)
 
@@ -42,18 +42,17 @@ pass→`renderDrawData(cmd,pass)`. Init order:
 middle/Space+left→`panByPixels`. wheel/pinch→`nav.gestures` (pure
 `ui/gesture.zig`, tests in `src/gesture_test.zig`):
 `Accumulator.addPinch`(INCREMENTAL,multiplies)/`addWheel`/`endPinch`+`take()` DRAIN a frame to ONE
-`Intent{zoom_factor,pan_dx,pan_dy,began}`; `zoom_factor` INVERTS scale (open⇒<1⇒zoom IN, SIDE mult);
+`Intent{zoom_factor,pan_dx,pan_dy,began}`; `zoom_factor` INVERTS scale (open⇒zoom IN);
 ONLY `endPinch` ends a pinch run, a `.wheel_pan` run ends on a pan-less drain, bad input IGNORED;
 `classifyWheel(sample,mode)` by `nav.input_mode` (Input combo REQUESTS `CoordRequest.input_mode`):
 `.mouse`/`.trackpad` wins, `.auto` pans on ANY horizontal then `y!=integer_y`
 (whole-tick, NOT `@floor`), else zooms. Installed
 ONCE/frame zoom-about-`cursorCoord`|pan-by-`real_s`, `began`⇒`HistoryDebt` (1 undo/run, OWED till a
 view installs);
-right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord` in the STATUS
-BAR. EVERY view/policy change goes through
+right-click→`drawNavContextMenu`→`zoomCentered`; hover→`viewport.formatCoord`. EVERY view/policy change goes through
 `applyViewCoarse`/`showViewCoarse`/`showPolicyCoarse`:
 `cancelPass`→`installView`/`installPolicy`→`renderCoarse` (blocking, per-axis `coarse_divisor`)
-→`syncFromView`→`armFullPass`; NOTHING iterates full-res synchronously.
+→`syncFromView`→`armFullPass`; nothing iterates full-res synchronously.
 `refine.decidePass` fires `beginFullPass`; `stepPassChunk` runs one `engine.stepPass()`/frame.
 Pump: `engine.pass!=null`→`SDL_PollEvent`, else `SDL_WaitEventTimeout(16)` if a pass is owed / `-1`
 idle.
@@ -64,7 +63,7 @@ idle.
 `coord_buf_bytes` (=`viewport.coord_text_buf_len`, 64 B); `mag_buf` SAME; `auto_iter`;
 `manual_iter_buf`. COORDINATES are `f128`. `writeCoordHi`: `std.fmt.float.render` `.decimal` else `.scientific`,
 keeping the decimal ONLY if it re-parses to the identical `f128`. NEVER `{d}` an `f128` (⇒`(float)`);
-`parseCoordHi` reads EXPONENT form back, never truncate.
+`parseCoordHi` reads EXPONENT form back.
 `coordDigits`/`max_coord_digits` budget the READ-ONLY readout (`viewport.formatCoord`); NEVER cut
 editable text to them. `mag`/`manual_iter_buf` stay f64/u32 (`writeF64`/`parseF64`).
 `initFromView`/`syncFromView` fill all 7; `syncFromPolicy(policy,engine.max_iter)` shows the count
@@ -79,9 +78,8 @@ failure logs `.err` and re-syncs. `writeF64` RESERVES the last byte⇒ALWAYS ter
 
 `PendingDialog{kind,path_buf,path_len}`—stack-alloc in `runLoop`, outlives callbacks.
 `showSave`/`showOpen`(+`…Scheme` variants)`(window,pending)` no-op unless `kind==.none`
-(`kind∈{save,open,save_scheme,open_scheme}`). `takePending`→`?PendingResult`, `null` on cancel.
-`callconv(.c)` callback writes the path. Filters `.fractal`/`.fpal`(colour-only). Scheme Save/Load:
-BUTTONS in the Coloring header (`drawPalettePanel`), inside `igBeginDisabled(rendering)`; load
+(`kind∈{save,open,save_scheme,open_scheme}`). `takePending`→`?PendingResult`, `null` on cancel. Filters `.fractal`/`.fpal`(colour-only). Scheme Save/Load:
+BUTTONS in the Coloring header, inside `igBeginDisabled(rendering)`; load
 `scheme.fromJson`→`applyToEngine`(setters, no re-iterate)→`syncFromColouring`, bad file refused
 with its named reason.
 

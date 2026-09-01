@@ -275,3 +275,7 @@ had, and stay usable.
   until the pass finishes or is cancelled. So at deep depths a palette edit cannot be *made*
   through the UI while a pass runs: **Colour edits never re-iterate** is a promise about what the
   engine does when such an edit arrives, and it is pinned at engine level, not through the panel.
+  The `colouring` controls added since — the scheme **Save**/**Load** buttons, the preset swatch
+  gallery and the **banded** checkbox — all sit inside the same disabled block, so they too are
+  inactive while a pass runs. That they grey out and reactivate is ImGui glue with no test tier; it
+  is **pilot-verified** by a manual smoke run, not a unit test, exactly as the panel disabling above.

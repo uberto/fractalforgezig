@@ -72,8 +72,9 @@ end-to-end⇒shallow renders match pre-M6.
   `gpuFallbackMessage(buf,reason)`/`fallback_message_buf_len`.
 - `gradient.zig`—`Stop{pos:f32∈[0,1],color:Rgba8}`;ASCENDING,cap `max_stops`=32:
   `fromStops`,`stops()`,`bakeLut(g,out:*[lut_size=1024]Rgba8)`,`default()`.
-- `mapping.zig`—`Mode{linear,log,cyclic}`;`Params{mode,period=default_period(32.0)}`
-  (cyclic-only,>0);`mapToUnit(smooth,max_iter,params)` CLAMPED[0,1);bad→0.
+- `mapping.zig`—`Mode{linear,log,cyclic}`;`Params{mode,period=default_period(32.0),banded=false}`
+  (period cyclic-only,>0;`banded` FLOORS smooth⇒one colour/iteration band);
+  `mapToUnit(smooth,max_iter,params)` CLAMPED[0,1);bad→0.
 - `iterbuf.zig`—ITERATION only. `iterationBufferLen(vp)`=w*h;`iterateInto(buf,vp,max_iter)`
   PURE(pixel centers;bad `buf.len`→`BufferSizeMismatch`);
   `iterateRowsInto(buf,vp,max_iter,y0,rows)` band-only/composable,
@@ -113,15 +114,15 @@ end-to-end⇒shallow renders match pre-M6.
   `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
   setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
   (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=LOSSY<1).
-  PLAIN or e-notation(deep centres CAN take e-form);both EXACT,NEVER prune fallback.
+  PLAIN or e-notation(deep centres CAN take e-form);both EXACT.
   NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
   number(pre-M6),RAW digits→f128,NEVER drop branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.
 - `scheme.zig`—COLOUR-ONLY save/load,INDEPENDENT of persist,NO view/centre/side/policy.
   `Scheme{stops,mapping_mode,mapping_period,banded,interior_r/g/b/a}`;`SchemeStop{pos,r,g,b,a}`.
   `fromEngine`/`fromJson(json,alloc)` heap-own `stops` ONLY(mapping_mode=static tag)→`free(s,alloc)`;
-  `toJson(buf≥min_json_buf_len)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`),bad mode→engine's current.
-  `ParseError`+`UnknownMappingMode`;NO version field.
+  `toJson(buf≥min_json_buf_len)`;`applyToEngine`=COLOUR setters ONLY(NEVER `setViewport`).
+  `ParseError`+`UnknownMappingMode`.
 - `presets.zig`—BUILT-IN colourings(const,binary-baked;NEVER `free`). `Preset{name,scheme}`,
   `all()→[]const Preset`(>1),`gradientOf(p)`→bakeable `Gradient`. `all()[0]`(Classic)pos 0..1⇒LUT=end stops.
 

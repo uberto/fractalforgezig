@@ -44,8 +44,8 @@ writing it as a decimal string, and SHALL still load files that carry the center
 ### Requirement: The whole picture is saved
 
 The system SHALL save, in one file, everything that determines the image — the view, the iteration
-policy, and the complete palette including every stop, the mapping mode, its period and the interior
-colour — and SHALL restore all of it together.
+policy, and the complete palette including every stop, the mapping mode, its period, the banded flag
+and the interior colour — and SHALL restore all of it together.
 
 #### Scenario: The iteration policy, the mapping and the stop count survive the round trip
 
@@ -57,19 +57,16 @@ colour — and SHALL restore all of it together.
 #### Scenario: The stops themselves and the whole interior colour survive too
 
 - **WHEN** the current state is written to a file and read back
-- **THEN** each gradient stop's position and colour, and all four channels of the interior colour,
-  are the values that were saved
-- **Test**: _not pinned by a test_ — the round-trip test compares the palette only by stop *count*
-  and the interior colour only by its red channel, so the stop contents and the remaining channels
-  are shipped but unpinned
+- **THEN** each gradient stop's position and colour, all four channels of the interior colour, and the
+  banded flag are the values that were saved
+- **Test**: `src/fractal/persist.zig::acceptance: every stop and every interior channel survives a round-trip`
 
 #### Scenario: The reopened app looks like the one that saved
 
 - **WHEN** a saved file is applied to a running app
-- **THEN** the app's palette, mapping and iteration settings match the ones the file was saved from
-- **Test**: _not pinned by a test_ — only the *view* half of the apply is pinned, by
-  `src/fractal/persist.zig::applyToEngine: loaded state matches original engine`, which asserts the
-  restored centre and side and nothing about the palette, mapping or iteration policy
+- **THEN** the app's palette, mapping, banded flag and interior colour match the ones the file was
+  saved from
+- **Test**: `src/fractal/persist.zig::acceptance: applying a loaded picture restores the whole colouring`
 
 ### Requirement: A damaged file is refused with a named reason
 

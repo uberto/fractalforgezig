@@ -191,8 +191,105 @@ palette settings.
 - **THEN** the image mirrors top to bottom, as the escape values do
 - **Test**: `src/fractal/colorpass.zig::full-image golden: top/bottom symmetry is preserved (colored image mirrors)`
 
+### Requirement: Banded or smooth iteration colouring
+
+The system SHALL let the user choose between smooth colouring, where the fractional escape value
+gives a continuous gradient, and banded colouring, where pixels sharing an integer iteration count
+share a colour so the iteration bands are visible; the choice is part of the colouring and SHALL be
+applied as a colour pass, without re-iterating.
+
+#### Scenario: Banded colouring gives one colour per iteration band
+
+- **WHEN** two escape values that share the same integer part are mapped with banding on
+- **THEN** they map to the same palette index; and with banding off (smooth) two such values can map
+  to different indices
+- **Test**: `src/fractal/mapping.zig::acceptance: banded colouring gives one colour per iteration band`
+
+### Requirement: Portable colouring schemes
+
+The system SHALL save the current colouring — the gradient stops, the mapping mode and its period,
+whether iteration bands are shown, and the interior colour — to a standalone scheme file that carries
+nothing identifying the view (no centre, side or iteration count), and SHALL load such a file to
+replace the current colouring and repaint the image without changing the view or re-iterating the
+fractal. A scheme file it cannot use SHALL be refused with a named reason, leaving the current
+colouring unchanged.
+
+#### Scenario: A saved scheme carries the colouring and not the view
+
+- **WHEN** the current colouring is written to a scheme file
+- **THEN** the file records the stops, the mapping mode, the period, the banded flag and the interior
+  colour, and contains no centre, side or iteration-count field
+- **Test**: `src/fractal/scheme.zig::acceptance: a saved scheme carries the colouring and not the view`
+
+#### Scenario: Loading a scheme replaces the colouring and keeps the view
+
+- **WHEN** a scheme file is loaded onto a view
+- **THEN** the gradient, mapping mode, period, banded flag and interior colour become the file's, and
+  the view centre, side and iteration policy are unchanged
+- **Test**: `src/fractal/scheme.zig::acceptance: loading a scheme replaces the colouring and keeps the view`
+
+#### Scenario: Loading a scheme repaints without re-iterating
+
+- **WHEN** a scheme is loaded onto an already-rendered image
+- **THEN** the image is recoloured and the fractal is not iterated again (a colour pass, not an
+  iteration pass)
+- **Test**: `src/fractal/scheme.zig::acceptance: loading a scheme repaints without re-iterating`
+
+#### Scenario: A damaged scheme file is refused with a named reason
+
+- **WHEN** a scheme file is loaded that is not valid JSON, is missing a required setting, names an
+  unknown mapping mode, or carries an empty or unsorted gradient
+- **THEN** it is refused with a reason naming what was wrong, and the current colouring is unchanged
+- **Test**: `src/fractal/scheme.zig::acceptance: a damaged scheme file is refused with a named reason`
+
+### Requirement: Built-in colouring presets
+
+The system SHALL offer a set of built-in colouring presets, each a complete colouring (stops, mapping
+mode, period, banded flag and interior colour) shown with a preview of its gradient; applying one
+SHALL replace the current colouring with the preset's as an editable starting point, repainting
+without re-iterating.
+
+#### Scenario: The presets are complete, valid colourings
+
+- **WHEN** the built-in presets are enumerated
+- **THEN** there is more than one, and each has at least one stop and no more than the maximum, its
+  stops in sortable ascending order, and a known mapping mode
+- **Test**: `src/fractal/presets.zig::acceptance: the presets are complete, valid colourings`
+
+#### Scenario: A preset's preview is its own gradient
+
+- **WHEN** a preset's preview swatch is produced
+- **THEN** it is the baked gradient ramp of that preset — its first texel the first stop's colour and
+  its last texel the last stop's colour
+- **Test**: `src/fractal/presets.zig::acceptance: a preset's preview is its own gradient`
+
+#### Scenario: Applying a preset replaces the colouring and stays editable
+
+- **WHEN** a preset is applied to the palette editor
+- **THEN** the editor's stops, mapping mode, period, banded flag and interior become the preset's, and
+  the stops can still be edited (added, removed, recoloured) afterwards
+- **Test**: `src/ui/editor.zig::acceptance: applying a preset replaces the colouring and stays editable`
+
+### Requirement: Loading restores the palette panel
+
+When the colouring is replaced by loading a file — a saved picture or a scheme — the palette controls
+SHALL show the colouring that was loaded, not the values that were on display before.
+
+#### Scenario: After a load the palette editor shows the loaded colouring
+
+- **WHEN** the palette editor is resynchronised from an engine whose colouring differs from the
+  editor's current values
+- **THEN** the editor's stops, mapping mode, period, banded flag and interior all match the engine's
+- **Test**: `src/ui/editor.zig::acceptance: after a load the palette editor shows the loaded colouring`
+
 ## Notes
 
 - That a colour edit costs no fractal recomputation is stated in `rendering` (**Colour edits never
-  re-iterate**); this capability owns only what the colours are.
-- The palette, mapping mode, period and interior colour are all part of what `persistence` saves.
+  re-iterate**); this capability owns only what the colours are. Loading a scheme, applying a preset
+  and toggling banded all route through the colour setters, so they inherit that guarantee.
+- The palette, mapping mode, period, banded flag and interior colour are all part of what
+  `persistence` saves. A scheme file (**Portable colouring schemes**) carries the same colouring but
+  none of the view, so it is portable between pictures.
+- The scheme Save/Load buttons, the preset swatch gallery and the banded checkbox are ImGui glue that
+  `rendering`'s panel-disabled note names as pilot-verified: that they are inactive during a render
+  pass is confirmed by a manual smoke run, not a unit test.
