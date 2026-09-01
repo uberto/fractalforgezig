@@ -6,16 +6,16 @@ Pure core:view→Mandelbrot image. NEVER import SDL/GPU/`c.zig`/`@cImport`. No
 globals/clock/random;register every module in `src/root.zig`'s `test`.
 Failures:TYPED error+pure message builder;ONLY `engine.zig` logs(`std.log(.fractal)`).
 
-Decoupling:ITERATE ONCE into a persistent `[]f32`;palette edits rerun ONLY CHEAP
+Decoupling:ITERATE ONCE into persistent `[]f32`;palette edits rerun ONLY CHEAP
 `colorpass`(baked `gradient` LUT+`mapping`→RGBA8),NEVER `iterbuf`.
 
 ## Precision split
 
 `ComplexHi{re,im:f128}`+`.lo()`=where the view IS;`Complex`/`Viewport`=a pixel RELATIVE to
 it,ALWAYS f64. `f128` is software-emulated(~100× slower):NEVER per-pixel—offset f64,added
-ONCE onto the centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
+ONCE onto centre. ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,
 `mandelbrot.iterateExact`. `Viewport`,`iterbuf`,`mandelbrot`,GPU stay f64
-end-to-end⇒shallow renders bit-identical to pre-M6.
+end-to-end⇒shallow renders match pre-M6.
 
 ## Modules
 
@@ -30,7 +30,7 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `imageViewport(S)`→`Viewport`. Readout:`coordDigits(mag)`→
   `formatCoord(buf[coord_buf_len],ComplexHi,mag)`,`max_coord_digits`=34;`coord_text_buf_len`=UI
   buffers. Warn-only zoom floor HERE:`precision_floor_side`(1e-30=f128-CENTRE limit,NOT
-  f64),`atPrecisionFloor(v)`(strict `<`),
+  f64),`atPrecisionFloor(v)`(strict),
   `precisionFloorMessage(buf[floor_message_buf_len],side)`.
   RECT render:`rectViewport(w,h)`,
   `Viewport.complexToPixel(pt)`+`pixelIndex(pt)→?usize`(null off-image),NOT the square map.
@@ -38,10 +38,10 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   centred rect drives drawing+mapping,NEVER a stretch.
 - `navigate.zig`—transforms→NEW `SquareView`;`factor` scales SIDE(`<1`=zoom IN).
   `zoomAbout(v,anchor:ComplexHi,f)` pins `anchor` to its pixel;`zoomCentered(v,point,f)`
-  recenters;`panByPixels(v,dpx,dpy,S)` moves the VIEW(pass NEGATED mouse delta);
+  recenters;`panByPixels(v,dpx,dpy,S)` moves VIEW(pass NEGATED mouse delta);
   `boxSelect(v,a,b,S)` square-snaps drags;`reset()`=`defaultView()`.All→`DegenerateRegion` on
   bad input/`S==0`/overflow. RE-EXPORTS viewport's 4 floor names. `max_view_side`(8.0)=WIDEST
-  view;the side-GROWING paths SATURATE,never error.
+  view;side-GROWING paths SATURATE.
 - `refine.zig`—`decidePass(interacting,idle_ns,full_pass_done)`→
   `PassDecision{coarse,full,none}`;`idle_threshold_ns`=150ms.
 - `autoiter.zig`—`max_iter` policy;READ,never re-derive. QUADRATIC ramp,
@@ -49,22 +49,22 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `clamp(base_max_iter(512)+iter_per_doubling_squared·d²,512,auto_max_iter(65536))`
   (`@max`⇒MONOTONE:`d²` re-climbs when `d<0`);bad `mag`→`InvalidMagnification`.
   `iter_per_doubling_squared`=comptime-DERIVED(`floor_doublings`,`floor_magnification`)⇒the
-  ceiling hits `viewport.precision_floor_side` EXACTLY;NEVER hard-code it. 65536 caps the RAMP
+  ceiling hits `viewport.precision_floor_side` EXACTLY;NEVER hard-code. 65536 caps the RAMP
   only;PINNED reach `max_manual_iter`(2^24,f32-exact). 1e-30 iterates most pixels to
-  `max_iter`:ACCEPTED,never lower it.
+  `max_iter`:ACCEPTED.
   `IterPolicy{auto=true,manual_value=512}`:`manual(v)` demands
   `[min_manual_iter(16),max_manual_iter]`,else `MaxIterOutOfRange`;
   `effective(mag)`=ramp if `auto` else `clampManual(v)`.
   `maxIterRangeMessage(buf,v)`,`policySummary(buf,policy,mag)`.
 - `mandelbrot.zig`—`iterate(c_re,c_im,max_iter) f32`→smooth escape else
   `interior_sentinel`(-1.0). `iterateExact(f128,f128,max_iter)`=the SAME algorithm in f128,
-  TEST-ONLY,NEVER in a renderer. TRUST it only to ~1e-20(drift 514 iter@1e-25,8175@1e-31)—deeper,use the f128 PERTURBATION ladder.
+  TEST-ONLY,NEVER in renderer. TRUST it only to ~1e-20—deeper,use the f128 PERTURBATION ladder.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
-  (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL it,never restate it.
+  (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL,never restate.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.
   `ReferenceOrbit.compute(alloc,center:ComplexHi,max_iter)` f128-iterates the CENTRE,stores
   `Z_0..Z_k` as f64 `re`/`im`;`len()`,`deinit(alloc)`,`capacity`=allocation(TRIMMED if
-  the centre escapes);`re[0]=im[0]=0`(`Z_0`),`re[1]`=C;→`OrbitError.NonFiniteCenter`.
+  centre escapes);`re[0]=im[0]=0`(`Z_0`),`re[1]`=C;→`OrbitError.NonFiniteCenter`.
   `iterateDelta(orbit BY VALUE,dc_re,dc_im,max_iter) f32`:`δ←2·Z_m·δ+δ²+δc`,escape on
   `|Z_m+δ|²>4`,f64 THROUGHOUT(NEVER widen),coloured by `smoothEscapeValue`⇒comparable to
   `iterate`. REBASE(Zhuoran) if `|Z_m+δ|<|δ|`/`m+1==len()`:`δ←Z_m+δ`,`m←0`—EXACT(`Z_0=0`);
@@ -99,13 +99,12 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `stepPassRows` both dispatch via ONE private `cpuIterateBand`.`ensureOrbit` builds ONE
   `ReferenceOrbit` per render(lazy;`orbit_computations` counts),`orbitPtr()` borrows it,
   EVERY boundary(`iterate`,`beginPass`,`cancelPass`,`finishPass`,`deinit`)FREES it—never
-  cache it.A non-null `orbit` OBLIGES the backend:iterate DEEP or RETURN an
-  error(engine warns,CPU finishes the band).
+  cache.A non-null `orbit` OBLIGES the backend:iterate DEEP or RETURN an
+  error(engine warns,CPU finishes band).
   `pathSummary(buf)`+`path_summaries`=1/completed render;`IterateError` folds
   `OrbitFailure`→`orbitFailureMessage(buf[orbit_message_buf_len],err,side,max_iter)`.
   `setViewport`/`setPolicy`/`resize` re-iterate(bump BOTH counters);
-  `setGradient`/`setMapping`/`setInterior`=color pass ONLY,`iteration_passes` UNCHANGED(THE
-  GUARANTEE). NON-BLOCKING,PREFER:`installView(v)`/`installPolicy(p)` refresh `max_iter`,render
+  `setGradient`/`setMapping`/`setInterior`=color pass ONLY,`iteration_passes` UNCHANGED(GUARANTEE). NON-BLOCKING,PREFER:`installView(v)`/`installPolicy(p)` refresh `max_iter`,render
   NOTHING;`beginPass(w,h)` reallocs+seeds the BLOCKY preview(`upsampleInto`,else black);
   `stepPass()`=one self-timed chunk(`stepPassRows(rows)` deterministic),
   `true`=complete→bumps each counter ONCE,clears `pass:?progressive.Pass`;`cancelPass()` on
@@ -115,9 +114,9 @@ end-to-end⇒shallow renders bit-identical to pre-M6.
   `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
   setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
   (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=LOSSY<1).
-  PLAIN or e-notation(deep centres CAN take e-form);both EXACT,NEVER prune that fallback.
+  PLAIN or e-notation(deep centres CAN take e-form);both EXACT,NEVER prune fallback.
   NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
-  number(pre-M6),RAW digits→f128,NEVER drop that branch;bad text→`InvalidField`.
+  number(pre-M6),RAW digits→f128,NEVER drop branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.
 - `scheme.zig`—COLOUR-ONLY save/load,INDEPENDENT of persist,NO view/centre/side/policy.
   `Scheme{stops,mapping_mode,mapping_period,banded,interior_r/g/b/a}`;`SchemeStop{pos,r,g,b,a}`.
