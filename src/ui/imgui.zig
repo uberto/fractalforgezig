@@ -28,6 +28,13 @@ pub const Ui = struct {
         };
         errdefer ig.igDestroyContext(ctx);
 
+        // Lift floating popups off the near-black main window: the default dark theme
+        // leaves ImGuiCol_PopupBg (~0.08) all but indistinguishable from WindowBg (~0.06),
+        // so the colour-picker popup looked like the interface behind it. A lighter, faintly
+        // cool gray makes the picker (and the right-click menu, tooltips and modals) read as a
+        // distinct panel. Set once here, before the first frame.
+        c.ffImguiSetPopupBg(0.19, 0.19, 0.21, 0.98);
+
         const color_format = device.swapchainTextureFormat();
         if (!c.ffImguiInitBackends(window, device.handle, color_format)) {
             const sdl_error = std.mem.span(c.SDL_GetError());

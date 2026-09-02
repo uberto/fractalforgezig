@@ -73,6 +73,12 @@ void ffImguiImage(SDL_GPUTexture *texture, float w, float h);
 // Use for letterboxed images that must sit at a computed position in window space.
 void ffImguiSetCursorScreenPos(float x, float y);
 
+// Tint the background of floating popups (ImGuiCol_PopupBg) — the colour-picker
+// popup, the right-click menu, tooltips and modals — so they read as a distinct
+// panel instead of blending into the near-black main window. Call once after
+// igCreateContext, before the first frame.
+void ffImguiSetPopupBg(float r, float g, float b, float a);
+
 #ifdef __cplusplus
 }
 #endif

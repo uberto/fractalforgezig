@@ -85,3 +85,8 @@ extern "C" void ffImguiSetCursorScreenPos(float x, float y)
 {
     ImGui::SetCursorScreenPos(ImVec2(x, y));
 }
+
+extern "C" void ffImguiSetPopupBg(float r, float g, float b, float a)
+{
+    ImGui::GetStyle().Colors[ImGuiCol_PopupBg] = ImVec4(r, g, b, a);
+}
