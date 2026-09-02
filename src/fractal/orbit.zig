@@ -52,7 +52,9 @@ pub fn compute(c_re: f64, c_im: f64, max_iter: u32, out: [][2]f64) Result {
     return .{ .points_written = written, .escaped = false };
 }
 
-test "the orbit starts at the origin and its second point is c" {
+// M10 acceptance tests (AT3, AT4) — materialized verbatim from
+// `.inception/m10-inspector-windows/acceptance-tests.md`. Immutable: do not weaken.
+test "acceptance: the orbit starts at the origin and its next point is c" {
     var buf: [33][2]f64 = undefined;
     const c_re = -0.5;
     const c_im = 0.25;
@@ -65,12 +67,16 @@ test "the orbit starts at the origin and its second point is c" {
     try std.testing.expectEqual(c_im, buf[1][1]);
 }
 
-test "an escaping point is marked escaped and ends before the cap" {
+test "acceptance: an escaping point ends its orbit at escape, an interior point fills to the cap" {
     var buf: [33][2]f64 = undefined;
-    const r = compute(2.0, 0.0, 32, &buf);
 
-    try std.testing.expect(r.escaped);
-    try std.testing.expect(r.points_written < 33);
+    const escaping = compute(2.0, 0.0, 32, &buf);
+    try std.testing.expect(escaping.escaped);
+    try std.testing.expect(escaping.points_written < 33);
+
+    const interior = compute(0.0, 0.0, 32, &buf);
+    try std.testing.expect(!interior.escaped);
+    try std.testing.expectEqual(@as(usize, 33), interior.points_written);
 }
 
 test "the escaping point itself is the last one written" {
@@ -81,14 +87,6 @@ test "the escaping point itself is the last one written" {
 
     const last = buf[r.points_written - 1];
     try std.testing.expect(last[0] * last[0] + last[1] * last[1] > mandelbrot.bail_radius_squared);
-}
-
-test "an interior point fills the buffer to max_iter + 1 points" {
-    var buf: [33][2]f64 = undefined;
-    const r = compute(0.0, 0.0, 32, &buf);
-
-    try std.testing.expect(!r.escaped);
-    try std.testing.expectEqual(@as(usize, 33), r.points_written);
 }
 
 test "a buffer shorter than max_iter + 1 is clamped, never overrun" {

@@ -206,19 +206,19 @@ test "iterate is deterministic for repeated identical input" {
 
 // ─── iterateJulia (M10 Julia inspector) ──────────────────────────────────────
 
-test "iterateJulia holds c fixed: an interior seed for c=0 returns the sentinel" {
-    // c = 0 ⇒ z → z²; a seed inside the unit circle stays bounded (interior).
-    try std.testing.expectEqual(interior_sentinel, iterateJulia(0.5, 0.0, 0.0, 0.0, 512));
+// M10 acceptance tests (AT1, AT2) — materialized verbatim from
+// `.inception/m10-inspector-windows/acceptance-tests.md`. Immutable: do not weaken.
+test "acceptance: the Julia set for c=0 is the filled unit disk" {
+    // c = 0 ⇒ z → z². Inside the unit circle: bounded (interior). Outside: escapes.
+    const inside = iterateJulia(0.5, 0.0, 0.0, 0.0, 512);
+    try std.testing.expectEqual(interior_sentinel, inside);
+
+    const outside = iterateJulia(2.0, 0.0, 0.0, 0.0, 512);
+    try std.testing.expect(outside != interior_sentinel);
+    try std.testing.expect(outside > 0.0);
 }
 
-test "iterateJulia holds c fixed: a seed outside the unit circle for c=0 escapes" {
-    // Same c = 0 map, but |z₀| > 1 ⇒ z² grows without bound (a real positive smooth value).
-    const v = iterateJulia(2.0, 0.0, 0.0, 0.0, 512);
-    try std.testing.expect(v != interior_sentinel);
-    try std.testing.expect(v > 0.0);
-}
-
-test "iterateJulia never returns NaN or Inf for a seed that overflows immediately" {
+test "acceptance: a fast-escaping Julia point never returns NaN or Inf" {
     const v = iterateJulia(1.0e6, 1.0e6, -0.8, 0.156, 512);
     try std.testing.expect(v == interior_sentinel or std.math.isFinite(v));
 }
