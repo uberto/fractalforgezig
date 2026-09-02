@@ -245,6 +245,12 @@ const NavState = struct {
     /// Passed to `panels.draw`, which FREEZES the edit panels while it is set: a value edited
     /// against a half-rendered image would only apply to the next pass anyway.
     rendering: bool = true,
+    /// Set when the user cancelled this view's refinement (Cancel button or Escape) and has not
+    /// restarted it or changed the view. Fed to `refine.decidePass`, where it wins over every
+    /// other rule so idle promotion cannot re-arm the very pass the user just stopped (the
+    /// cancel→re-arm→cancel loop). Cleared by `armFullPass` on a Render restart and at every view
+    /// change (each `showViewCoarse`/`showPolicyCoarse` supersedes the cancelled view).
+    cancelled: bool = false,
     /// Set when engine output changed and needs to be uploaded to the GPU texture.
     /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
     needs_upload: bool = false,
@@ -452,10 +458,35 @@ fn renderCoarse(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h:
 
 /// Arm the coarse→fine promotion: the loop's idle check (`refine.decidePass`) starts the
 /// full-resolution progressive pass once the user has held still past the idle threshold.
+///
+/// Clears `nav.cancelled` (m9): this is called from every view change (`showViewCoarse` /
+/// `showPolicyCoarse` / resize / GPU toggle / load) AND from the status-bar Render restart, and
+/// each of those supersedes a cancelled view — so a re-armed pass must render normally rather than
+/// be suppressed by the stale cancel latch. The cancel path itself does NOT arm, so it keeps the
+/// latch set.
 fn armFullPass(nav: *NavState) void {
     nav.rendering = true;
     nav.full_pass_done = false;
+    nav.cancelled = false;
     nav.idle_timer = std.time.Timer.start() catch null;
+}
+
+/// Stop the in-flight full-resolution pass at the user's request (Cancel button or Escape).
+/// Abandons the pass so its remaining rows never land — the partly-refined image stays on screen —
+/// and sets `nav.full_pass_done` so neither idle promotion nor the region re-arm restarts it, plus
+/// `nav.cancelled` so `refine.decidePass` keeps it suppressed until the user restarts or navigates.
+/// Reads the completion BEFORE abandoning the pass (`passFraction` returns null once it is gone).
+/// Guard the call on `nav.rendering`: cancelling when nothing is rendering is meaningless.
+fn requestCancel(engine: *engine_mod.Engine, nav: *NavState) void {
+    const pct: u32 = if (engine.passFraction()) |f|
+        @intFromFloat(@round(std.math.clamp(f, 0.0, 1.0) * 100.0))
+    else
+        0;
+    engine.cancelPass();
+    nav.rendering = false;
+    nav.full_pass_done = true;
+    nav.cancelled = true;
+    app_log.info("render cancelled at {d}%", .{pct});
 }
 
 /// Start the full-resolution progressive pass for the current view at the fractal region's
@@ -654,6 +685,10 @@ fn runLoop(
                             } else if (event.key.scancode == c.SDL_SCANCODE_Y) {
                                 historyRedo(engine, &nav, real_w, real_h, view_editor);
                             }
+                        } else if (event.key.scancode == c.SDL_SCANCODE_ESCAPE and nav.rendering) {
+                            // Escape while a pass is in flight is the keyboard twin of the
+                            // status-bar Cancel button (m9): same abandon-and-keep behaviour.
+                            requestCancel(engine, &nav);
                         }
                     },
                     else => {},
@@ -818,6 +853,7 @@ fn runLoop(
             nav.input_mode,
             nav.rendering,
             engine.passFraction(),
+            nav.cancelled,
             &quit_requested,
         );
         // Update image_rect from the live ImGui geometry every frame so coordinate
@@ -825,6 +861,15 @@ fn runLoop(
         if (draw_result.image_rect.side > 0) image_rect.* = draw_result.image_rect;
         nav.open_ctx_menu = false;
         if (quit_requested) running = false;
+
+        // ── Cancel / Render controls (m9) ─────────────────────────────────────
+        // The status-bar Cancel button and Escape both route through `requestCancel`; Escape is
+        // handled in the event loop above, the button here. Guarded on `nav.rendering` so a
+        // stale click cannot fire once the pass has already finished. Render re-arms the same view
+        // through `armFullPass` (which clears the cancel latch), and the normal completion summary
+        // covers the restart's success.
+        if (draw_result.cancel_requested and nav.rendering) requestCancel(engine, &nav);
+        if (draw_result.render_requested and nav.cancelled) armFullPass(&nav);
 
         // ── Follow the fractal region's live size ─────────────────────────────
         // The region — not the OS window — is the full-resolution target, and only ImGui
@@ -909,8 +954,7 @@ fn runLoop(
                 ig.igIsMouseDragging(ig.mouse_button_middle, -1.0) or
                 (ig.igIsKeyDown_Nil(ig.key_space) and ig.igIsMouseDragging(ig.mouse_button_left, -1.0));
             const idle_ns: u64 = if (nav.idle_timer) |*t| t.read() else 0;
-            // `cancelled` is a literal `false` for now; T2 replaces it with `nav.cancelled`.
-            switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done, false)) {
+            switch (refine.decidePass(interacting, idle_ns, nav.full_pass_done, nav.cancelled)) {
                 .full => beginFullPass(engine, &nav, real_w, real_h),
                 .coarse, .none => {},
             }

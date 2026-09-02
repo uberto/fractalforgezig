@@ -100,6 +100,13 @@ pub const DrawResult = struct {
     /// `igBeginDisabled(rendering)` block, so they cannot fire while a render pass is running.
     save_scheme_requested: bool = false,
     load_scheme_requested: bool = false,
+    /// Set when the status-bar Cancel control was clicked this frame (m9). It lives in the
+    /// always-live status bar, OUTSIDE `igBeginDisabled(rendering)`, so the user can stop an
+    /// in-flight pass — the whole point of the control. main.zig cancels the pass after the frame.
+    cancel_requested: bool = false,
+    /// Set when the status-bar Render control was clicked this frame (m9): the user wants to
+    /// re-run the full-resolution pass for the unchanged view after a cancel. main.zig re-arms it.
+    render_requested: bool = false,
     /// A view / `max_iter` policy the coord panel wants installed (see `CoordRequest`).
     coord: CoordRequest = .{},
 };
@@ -178,6 +185,11 @@ pub const SwatchGallery = struct {
 /// `rendering` freezes the edit panels (a value edited against a half-rendered image would be
 /// applied to the next pass anyway); `progress` is the in-flight pass's completion, which
 /// takes over the status bar as a progress bar. Both come from the engine's pass state.
+///
+/// `cancelled` is `NavState.cancelled`: the user stopped this view's refinement and has not
+/// restarted it. Together with `rendering` it drives `progressive.statusControl` to pick the
+/// status-bar control — Cancel while rendering, Render after a cancel, neither otherwise — which
+/// is why both flow through to `drawStatusBar`.
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
@@ -193,6 +205,7 @@ pub fn draw(
     input_mode: gesture.InputMode,
     rendering: bool,
     progress: ?f32,
+    cancelled: bool,
     quit_requested: *bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
@@ -201,6 +214,8 @@ pub fn draw(
     var open_requested = false;
     var save_scheme_requested = false;
     var load_scheme_requested = false;
+    var cancel_requested = false;
+    var render_requested = false;
     var coord_request = CoordRequest{};
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
@@ -253,8 +268,12 @@ pub fn draw(
         drawFractal(texture.handle, live_rect);
         ig.igEndChild();
 
-        // Status bar sits outside the fractal child, directly below it.
-        drawStatusBar(engine, live_rect, hover_pt, progress);
+        // Status bar sits outside the fractal child, directly below it — and, crucially, OUTSIDE
+        // the data panel's `igBeginDisabled(rendering)` block, so its Cancel/Render controls stay
+        // clickable while a pass runs (the whole point of a Cancel button).
+        const status = drawStatusBar(engine, live_rect, hover_pt, progress, rendering, cancelled);
+        if (status.cancel) cancel_requested = true;
+        if (status.render) render_requested = true;
         ig.igEndGroup();
 
         ig.igSameLine(0, region_spacing);
@@ -291,6 +310,8 @@ pub fn draw(
         .open_requested = open_requested,
         .save_scheme_requested = save_scheme_requested,
         .load_scheme_requested = load_scheme_requested,
+        .cancel_requested = cancel_requested,
+        .render_requested = render_requested,
         .coord = coord_request,
     };
 }
@@ -339,30 +360,67 @@ fn drawFractal(texture: *c.SDL_GPUTexture, image_rect: viewport.ImageRect) void 
 const iter_info_buf_len: usize =
     std.fmt.comptimePrint("  interior ({d})", .{autoiter.max_manual_iter}).len;
 
-/// One-line status bar at the bottom of the fractal region. While a pass is in flight
-/// (`progress` non-null) it shows a PROGRESS BAR instead of the readout — the one place the
-/// user can see that the app is working rather than hung. Otherwise: coordinate + iteration
-/// value when the cursor is over the image, `---` when it is not.
+/// Width (px) reserved for the status bar's Cancel/Render button so the progress bar can take the
+/// rest of the line. Wide enough for "Cancel"/"Render" at the 7-px bitmap font plus button
+/// padding, with room to spare; nothing depends on it being exact.
+const status_button_w: f32 = 72.0;
+/// Gap between the progress bar and the Cancel button that shares its line.
+const status_button_gap: f32 = 8.0;
+
+/// What the status bar's control reported this frame — at most one of the two is ever set,
+/// because `statusControl` offers exactly one control at a time (see `progressive.statusControl`).
+const StatusResult = struct {
+    /// The Cancel control was clicked (only offered while a pass is in flight).
+    cancel: bool = false,
+    /// The Render control was clicked (only offered after a cancel).
+    render: bool = false,
+};
+
+/// One-line status bar at the bottom of the fractal region. `progressive.statusControl` maps the
+/// render state to what it shows:
+///   * `.cancel` (a pass is in flight) → a PROGRESS BAR sharing its line with a Cancel button, so
+///     the user can both see the app working and stop it;
+///   * `.render` (the pass was cancelled) → a Render button to re-run the same view;
+///   * `.none` → the coordinate + iteration readout when the cursor is over the image, `---` else.
+/// The returned `StatusResult` tells `draw` which control fired; the buttons live here, OUTSIDE the
+/// data panel's disabled block, so Cancel stays clickable during a render.
 fn drawStatusBar(
     engine: *const engine_mod.Engine,
     rect: viewport.ImageRect,
     hover_pt: ?viewport.ComplexHi,
     progress: ?f32,
-) void {
+    rendering: bool,
+    cancelled: bool,
+) StatusResult {
     ig.igSpacing();
-    if (progress) |f| {
-        var label_buf: [progressive.progress_label_buf_len]u8 = undefined;
-        const label: ?[*:0]const u8 = if (progressive.progressLabel(&label_buf, f)) |l| l.ptr else |_| null;
-        // Full region width; one text line high so the reserved status-bar strip still fits.
-        ig.igProgressBar(f, .{ .x = -1.0, .y = ig.igGetTextLineHeightWithSpacing() }, label);
-        return;
+    const line_h = ig.igGetTextLineHeightWithSpacing();
+    switch (progressive.statusControl(rendering, cancelled)) {
+        .cancel => {
+            // `progress` is null in the brief coarse-preview window before the full pass begins;
+            // read that as 0% so the bar and its Cancel button appear the moment rendering starts.
+            const f = progress orelse 0.0;
+            var label_buf: [progressive.progress_label_buf_len]u8 = undefined;
+            const label: ?[*:0]const u8 = if (progressive.progressLabel(&label_buf, f)) |l| l.ptr else |_| null;
+            // Share the line: the bar takes what is left after the button and the gap, floored at
+            // one pixel so a very narrow window never asks for a negative width.
+            var avail_w: f32 = 0;
+            var avail_h: f32 = 0;
+            c.ffImguiContentAvail(&avail_w, &avail_h);
+            var bar_w = avail_w - status_button_w - status_button_gap;
+            if (bar_w < 1.0) bar_w = 1.0;
+            ig.igProgressBar(f, .{ .x = bar_w, .y = line_h }, label);
+            ig.igSameLine(0, status_button_gap);
+            return .{ .cancel = ig.igButton("Cancel", .{ .x = status_button_w, .y = line_h }) };
+        },
+        .render => return .{ .render = ig.igButton("Render", .{ .x = status_button_w, .y = line_h }) },
+        .none => {},
     }
     if (hover_pt) |pt| {
         var coord_buf: [viewport.coord_buf_len]u8 = undefined;
         const mag = engine.view.magnification();
         const coord_slice = viewport.formatCoord(&coord_buf, pt, mag) catch {
             ig.igTextUnformatted("---", null);
-            return;
+            return .{};
         };
 
         // Look up the iteration value for this pixel from the engine's iter buffer. The
@@ -401,6 +459,7 @@ fn drawStatusBar(
     } else {
         ig.igTextUnformatted("---", null);
     }
+    return .{};
 }
 
 /// Right-click navigation context menu. Must be called inside the ImGui window Begin/End.
