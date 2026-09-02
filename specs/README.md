@@ -21,7 +21,8 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 | [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, banded vs smooth colouring, the interior colour, opaque output, portable colour-scheme files, and the built-in presets. |
 | [gpu-acceleration](gpu-acceleration/spec.md) | GPU iteration agreeing with the CPU, banded dispatch, CPU fallback on GPU failure, the user's backend choice. |
 | [persistence](persistence/spec.md) | Saving and reopening the complete render state as a `.fractal` JSON file, and refusing a corrupt one. |
-| [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, stopping and restarting a render in progress, render statistics, the file dialogs, startup and failure logging. |
+| [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, stopping and restarting a render in progress, render statistics, the file dialogs, the View menu, full-screen presentation, startup and failure logging. |
+| [inspectors](inspectors/spec.md) | The live Julia inspector window that tracks the point under the pointer and freezes on leave, and the orbit inspector that plots a point's iterates over a mini-Mandelbrot with an optional connecting path. |
 
 ## Provenance
 
@@ -60,6 +61,15 @@ again on its own until the user restarts it or changes the view. The two pure de
 test-pinned (`refine.decidePass`'s cancel latch and `progressive.statusControl`); the Cancel/Render
 buttons, the Escape shortcut and the click→`cancelPass` wiring are ImGui/SDL glue, pilot-verified on
 the manual smoke run, exactly like the neighbouring app-shell glue scenarios.
+
+Milestone `m10-inspector-windows` added the `inspectors` capability — **Live Julia inspector** and
+**Orbit inspector** — and two `app-shell` requirements — **View menu shows and hides the
+inspectors** and **Full-screen presentation** — rewriting nothing (the Escape key stays with m9's
+cancel-render, so full screen uses F11 and the menu instead). Four pure decisions are test-pinned:
+the Julia classification (`mandelbrot.iterateJulia`) by two tests, and the orbit sequence
+(`orbit.compute`) by two more. The four remaining scenarios — the Julia preview's pointer tracking
+and freeze-on-leave, the orbit's connect-points path, the View-menu ↔ close-box sync, and the
+full-screen layout — are ImGui/SDL glue, pilot-verified on the manual smoke run.
 
 ## Verification
 

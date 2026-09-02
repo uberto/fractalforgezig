@@ -129,6 +129,34 @@ offer, in the same place, to start the render again for the unchanged view.
 - **THEN** a fresh full-resolution pass runs for the same view, without requiring any navigation
 - **Test**: _not pinned by a test_ — manual smoke run (ImGui/loop glue)
 
+### Requirement: View menu shows and hides the inspectors
+
+The system SHALL provide a View menu that shows or hides each inspector window, and SHALL keep the
+menu's state in step with the window, so that closing a window by its own control also updates the
+menu item that governs it.
+
+#### Scenario: The menu toggles a window, and closing the window updates the menu
+
+- **WHEN** the user toggles an inspector's View-menu item, or closes that inspector by its own
+  window control
+- **THEN** the window opens or closes accordingly, and the menu item's checked state always
+  reflects whether the window is currently open
+- **Test**: _not pinned by a test_ — manual smoke run (ImGui menu + window glue)
+
+### Requirement: Full-screen presentation
+
+The system SHALL provide a full-screen mode — toggled from the View menu and by a keyboard shortcut
+that is NOT the Escape key (Escape is reserved for cancelling a render) — which hides the control
+panel and expands the fractal image to fill the screen, and which can be left again by the same
+controls.
+
+#### Scenario: Full screen hides the panel and fills the screen, and can be left without Escape
+
+- **WHEN** the user enters full-screen mode and then leaves it
+- **THEN** on entering, the control panel is hidden and the fractal image fills the screen; and the
+  mode can be toggled off again by the View-menu item or the keyboard shortcut, without using Escape
+- **Test**: _not pinned by a test_ — manual smoke run (SDL window + ImGui layout glue)
+
 ### Requirement: Render statistics
 
 The system SHALL report what the last render cost and what it did — processor time, frame time,
@@ -259,6 +287,10 @@ full-resolution render.
 - The gestures the image area accepts are specified in `navigation`; the numbers the coordinate
   panel shows and accepts are in `view-coordinates`; what the file dialogs read and write is in
   `persistence`.
+- The two windows the View menu governs are specified in `inspectors`. Full-screen mode
+  deliberately avoids the Escape key: Escape is already owned by **Stopping a render in progress**
+  (it cancels an in-flight render), so full screen is toggled by the View menu and F11 instead, and
+  the two never collide.
 - Unpinned scenarios above are shipped behavior in the ImGui and platform-dialog tiers, which carry
   no unit tests by design. They are verified by the manual smoke run (`zig build run`) and named
   here so a future milestone can pin them if the tiers ever become testable.
