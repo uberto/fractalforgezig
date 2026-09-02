@@ -56,8 +56,9 @@ end-to-end⇒shallow renders match pre-M6.
   `effective(mag)`=ramp if `auto` else `clampManual(v)`.
   `maxIterRangeMessage(buf,v)`,`policySummary(buf,policy,mag)`.
 - `mandelbrot.zig`—`iterate(c_re,c_im,max_iter) f32`→smooth escape else
-  `interior_sentinel`(-1.0). `iterateExact(f128,f128,max_iter)`=the SAME algorithm in f128,
-  TEST-ONLY,NEVER in renderer;trust to ~1e-20—deeper uses the perturbation ladder.
+  `interior_sentinel`(-1.0). `iterateJulia(z0_re,z0_im,c_re,c_im,max_iter)`=Julia twin,seed z0,c
+  FIXED,shares loop,f64. `iterateExact(f128,f128,max_iter)`=SAME algorithm in f128,
+  TEST-ONLY,NEVER in renderer;trust ~1e-20.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
   (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL,never restate.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.
@@ -77,6 +78,7 @@ end-to-end⇒shallow renders match pre-M6.
   `mapToUnit(smooth,max_iter,params)` CLAMPED[0,1);bad→0.
 - `iterbuf.zig`—ITERATION only. `iterationBufferLen(vp)`=w*h;`iterateInto(buf,vp,max_iter)`
   PURE(pixel centers;bad `buf.len`→`BufferSizeMismatch`);
+  `iterateJuliaInto(buf,vp,c_re,c_im,max_iter)`=Julia twin,pixel=seed z0,c fixed,same contract;
   `iterateRowsInto(buf,vp,max_iter,y0,rows)` band-only/composable,
   overrun→`RowRangeOutOfBounds`;`iterateBandInto(band,…)`=same but buffer-LOCAL(row `y0`
   at index 0=the GPU's contract);`iterate(...)`→`IterationResult{values,elapsed_ns}`.
@@ -114,7 +116,7 @@ end-to-end⇒shallow renders match pre-M6.
   `fromEngine`→`toJson(buf≥min_json_buf_len)`,`fromJson(json,alloc)`,`applyToEngine`(color
   setters first,`setViewport` LAST). CENTRE=quoted decimal STRING
   (`writeCenter`=`{d}`=shortest-EXACT,`center_text_max_len`;NEVER fixed `.34`=LOSSY<1).
-  PLAIN or e-notation(deep centres CAN take e-form);both EXACT.
+  PLAIN or e-notation,both EXACT.
   NO version field⇒`CenterJson.jsonParse` IS back-compat:string(M6)OR
   number(pre-M6),RAW digits→f128,NEVER drop branch;bad text→`InvalidField`.
   `ParseError{InvalidJson,MissingField,InvalidField,GradientEmpty,GradientNotSorted}`.

@@ -80,6 +80,37 @@ pub fn iterateInto(buf: []f32, vp: Viewport, max_iter: u32) IterError!void {
     return iterateRowsInto(buf, vp, max_iter, 0, vp.height);
 }
 
+/// Fill `buf` with one smooth Julia value per pixel for `vp`, holding the parameter
+/// `c = (c_re, c_im)` FIXED while each pixel's mapped complex coordinate is used as the
+/// SEED `z₀` (`mandelbrot.iterateJulia`). This is the buffer-filling twin of `iterateInto`
+/// for the Julia inspector: same length contract (`buf.len` MUST equal
+/// `iterationBufferLen(vp)`; a mismatch returns `IterError.BufferSizeMismatch` rather than
+/// writing out of bounds), same pixel-CENTER sampling, and interior pixels keep the `-1.0`
+/// sentinel. Shallow `f64` only — the inspector never deep-zooms.
+///
+/// PURE and deterministic: no allocation, no clock, no global state.
+pub fn iterateJuliaInto(buf: []f32, vp: Viewport, c_re: f64, c_im: f64, max_iter: u32) IterError!void {
+    const expected = iterationBufferLen(vp);
+    if (buf.len != expected) return IterError.BufferSizeMismatch;
+
+    var y: u32 = 0;
+    while (y < vp.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < vp.width) : (x += 1) {
+            // Sample the pixel CENTER (the +0.5 convention). The mapped coordinate is the
+            // SEED z₀; c is the fixed pair — the mirror of the Mandelbrot roles.
+            const px = @as(f64, @floatFromInt(x)) + 0.5;
+            const py = @as(f64, @floatFromInt(y)) + 0.5;
+            const z0 = vp.pixelToComplex(px, py);
+            const smooth = mandelbrot.iterateJulia(z0.re, z0.im, c_re, c_im, max_iter);
+
+            const idx = @as(usize, y) * @as(usize, vp.width) + @as(usize, x);
+            std.debug.assert(idx < buf.len);
+            buf[idx] = smooth;
+        }
+    }
+}
+
 /// Iterate ONLY image rows `y0 .. y0 + rows` of `vp` into `buf`, leaving every other row
 /// untouched. `buf` is the FULL `width * height` buffer (not the band), so a band write
 /// lands at the same indices the whole-image pass would use — that is what lets M5's
@@ -275,6 +306,38 @@ test "iterateInto rejects a buffer whose length is not width*height" {
     const vp = Viewport.fixedView(golden_w, golden_h);
     var too_small: [golden_w * golden_h - 1]f32 = undefined;
     try std.testing.expectError(IterError.BufferSizeMismatch, iterateInto(&too_small, vp, golden_iter));
+}
+
+test "iterateJuliaInto rejects a buffer whose length is not width*height" {
+    const vp = Viewport.fixedView(golden_w, golden_h);
+    var too_small: [golden_w * golden_h - 1]f32 = undefined;
+    try std.testing.expectError(
+        IterError.BufferSizeMismatch,
+        iterateJuliaInto(&too_small, vp, 0.0, 0.0, golden_iter),
+    );
+}
+
+test "iterateJuliaInto for c=0 fills interior at the centre and escaped pixels at the corners" {
+    // c = 0 ⇒ the filled Julia set is the closed unit disk. A view centred on the origin with
+    // side 4 (real/imag span [-2, 2]) puts the origin at the centre pixel (interior) and the
+    // image corners near |z₀| ≈ 2.6 (escaped) — the Julia analogue of the unit-disk fact.
+    const jw = 16;
+    const jh = 16;
+    const view = try viewport.SquareView.fromCenterSide(.{ .re = 0.0, .im = 0.0 }, 4.0);
+    const vp = view.rectViewport(jw, jh);
+    var buf: [jw * jh]f32 = undefined;
+    try iterateJuliaInto(&buf, vp, 0.0, 0.0, golden_iter);
+
+    // Centre pixel: seed near the origin ⇒ interior sentinel.
+    try std.testing.expectEqual(mandelbrot.interior_sentinel, valueAt(&buf, jw, jw / 2, jh / 2));
+
+    // All four corners: seed well outside the unit circle ⇒ a finite, escaped smooth value.
+    const corners = [_][2]usize{ .{ 0, 0 }, .{ jw - 1, 0 }, .{ 0, jh - 1 }, .{ jw - 1, jh - 1 } };
+    for (corners) |cxy| {
+        const v = valueAt(&buf, jw, cxy[0], cxy[1]);
+        try std.testing.expect(v != mandelbrot.interior_sentinel);
+        try std.testing.expect(std.math.isFinite(v));
+    }
 }
 
 test "iterateInto is deterministic: two runs produce scalar-identical buffers" {

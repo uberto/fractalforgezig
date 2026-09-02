@@ -65,12 +65,34 @@ pub fn iterateExact(c_re: f128, c_im: f128, max_iter: u32) f32 {
     return iterateIn(f128, c_re, c_im, max_iter);
 }
 
+/// The Julia variant of `iterate`: iterate `z = z² + c` from the SEED `z = (z0_re, z0_im)`
+/// with `c` held fixed, returning the same smooth escape value / `interior_sentinel` as
+/// `iterate`. This is the exact mirror of the Mandelbrot map with the two roles swapped —
+/// the pixel is the seed `z₀` and `c` is the point under the pointer (T3 supplies it).
+///
+/// `f64` only: the inspector preview is a shallow, fixed-`max_iter` side view, never a deep
+/// zoom. Shares the ONE escape loop with `iterate` (`iterateFrom`), so the two differ solely
+/// in the initial `z` and the Julia preview colours by the very same convention as the main
+/// image. Pure and deterministic: no allocation, no global state, no I/O.
+pub fn iterateJulia(z0_re: f64, z0_im: f64, c_re: f64, c_im: f64, max_iter: u32) f32 {
+    return iterateFrom(f64, z0_re, z0_im, c_re, c_im, max_iter);
+}
+
 /// `iterate`'s body, parameterized on the float type so `iterateExact` is the same
 /// algorithm BY CONSTRUCTION rather than by a comment that could drift. `F` is `f64` for
-/// the render path and `f128` for the test ground truth.
+/// the render path and `f128` for the test ground truth. Iterates from `z = 0` (the
+/// Mandelbrot seed); the shared loop lives in `iterateFrom`.
 fn iterateIn(comptime F: type, c_re: F, c_im: F, max_iter: u32) f32 {
-    var z_re: F = 0.0;
-    var z_im: F = 0.0;
+    return iterateFrom(F, 0.0, 0.0, c_re, c_im, max_iter);
+}
+
+/// The shared escape loop for BOTH the Mandelbrot map (`iterateIn`, seed `z₀ = 0`) and the
+/// Julia map (`iterateJulia`, seed = the pixel). Iterate `z = z² + c` from `(z0_re, z0_im)`
+/// with `c` fixed; the escape test and the smooth-value tail are identical to what `iterate`
+/// has always done, so the Mandelbrot path is unchanged byte-for-byte when `z₀ = 0`.
+fn iterateFrom(comptime F: type, z0_re: F, z0_im: F, c_re: F, c_im: F, max_iter: u32) f32 {
+    var z_re: F = z0_re;
+    var z_im: F = z0_im;
 
     // Main escape loop. `n` counts completed `z = z² + c` steps. We test the bail
     // radius AFTER stepping so `n` is the count at the moment of crossing.
@@ -180,6 +202,33 @@ test "fast-escaping points never return NaN or Inf" {
 
 test "iterate is deterministic for repeated identical input" {
     try std.testing.expectEqual(iterate(0.3, 0.0, 512), iterate(0.3, 0.0, 512));
+}
+
+// ─── iterateJulia (M10 Julia inspector) ──────────────────────────────────────
+
+test "iterateJulia holds c fixed: an interior seed for c=0 returns the sentinel" {
+    // c = 0 ⇒ z → z²; a seed inside the unit circle stays bounded (interior).
+    try std.testing.expectEqual(interior_sentinel, iterateJulia(0.5, 0.0, 0.0, 0.0, 512));
+}
+
+test "iterateJulia holds c fixed: a seed outside the unit circle for c=0 escapes" {
+    // Same c = 0 map, but |z₀| > 1 ⇒ z² grows without bound (a real positive smooth value).
+    const v = iterateJulia(2.0, 0.0, 0.0, 0.0, 512);
+    try std.testing.expect(v != interior_sentinel);
+    try std.testing.expect(v > 0.0);
+}
+
+test "iterateJulia never returns NaN or Inf for a seed that overflows immediately" {
+    const v = iterateJulia(1.0e6, 1.0e6, -0.8, 0.156, 512);
+    try std.testing.expect(v == interior_sentinel or std.math.isFinite(v));
+}
+
+test "iterateJulia is the seed-varying mirror of iterate: seed=0 matches iterate for the same c" {
+    // With z₀ = 0 the Julia map IS the Mandelbrot map, so it must reproduce iterate exactly —
+    // the defining relationship between the two, and a guard that the shared loop did not drift.
+    const c_re = 0.3;
+    const c_im = 0.0;
+    try std.testing.expectEqual(iterate(c_re, c_im, 512), iterateJulia(0.0, 0.0, c_re, c_im, 512));
 }
 
 // ─── iterateExact (M6 ground truth) ──────────────────────────────────────────
