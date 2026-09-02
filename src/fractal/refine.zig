@@ -73,12 +73,11 @@ test "decidePass: idle but not past threshold yet returns none" {
     try std.testing.expectEqual(PassDecision.none, decidePass(false, 1, false, false));
 }
 
-test "decidePass: a cancelled view is not promoted; clearing the cancel restores promotion" {
-    // Idle past the threshold with no full pass done: normally this promotes to `.full`. Once
-    // the user has cancelled, the same state must yield `.none` so the partly-refined image is
-    // left as it is and idle promotion cannot re-arm the pass the user just cancelled.
+test "acceptance: a cancelled view is not promoted, and clearing the cancel restores promotion" {
+    // A user cancel latches the current view: even idle past the threshold with the full pass not
+    // done, no pass is scheduled — .none, not .coarse, so the partly-refined image is left as it is.
+    // Clearing the latch restores normal promotion for the very same inputs.
     try std.testing.expectEqual(PassDecision.none, decidePass(false, idle_threshold_ns + 1, false, true));
-    // Clearing the cancel restores normal promotion for the very same view state.
     try std.testing.expectEqual(PassDecision.full, decidePass(false, idle_threshold_ns + 1, false, false));
 }
 

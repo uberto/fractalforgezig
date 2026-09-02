@@ -253,13 +253,12 @@ test "progressLabel clamps an out-of-range fraction to 100%" {
     try std.testing.expectEqualStrings("rendering 100%", try progressLabel(&buf, 1.7));
 }
 
-test "statusControl offers cancel while rendering, render after a cancel, none otherwise" {
-    // A render in flight always offers Cancel — even if a stale cancel flag lingers.
+test "acceptance: statusControl offers cancel while rendering, render after a cancel, neither otherwise" {
+    // While a full pass runs the status area offers Cancel; once the user has cancelled (and it is
+    // not running) it offers Render to restart; with nothing to act on it offers neither.
     try std.testing.expectEqual(StatusControl.cancel, statusControl(true, false));
     try std.testing.expectEqual(StatusControl.cancel, statusControl(true, true));
-    // A cancelled, not-yet-restarted render offers Render instead.
     try std.testing.expectEqual(StatusControl.render, statusControl(false, true));
-    // Neither in flight nor cancelled: the progress area offers nothing.
     try std.testing.expectEqual(StatusControl.none, statusControl(false, false));
 }
 
