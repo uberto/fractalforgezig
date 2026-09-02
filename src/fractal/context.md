@@ -61,6 +61,11 @@ end-to-end⇒shallow renders match pre-M6.
   TEST-ONLY,NEVER in renderer;trust ~1e-20.
   `smoothEscapeValue(F,z_re,z_im,c_re,c_im,escape_n)`=THE colouring tail
   (`extra_iterations`,`n+1−log2(log2|z|)`,non-finite→`escape_n`):CALL,never restate.
+- `orbit.zig`—PURE orbit sequence for the orbit inspector(complex-plane ONLY,no screen map).
+  `compute(c_re,c_im,max_iter,out:[][2]f64)→Result{points_written,escaped}`:writes `out[0]={0,0}`
+  then `z=z²+c` per step;STOP on `|z|²>bail_radius_squared`(escaping point INCLUDED,escaped=true)
+  or buffer full.Interior fills to `max_iter+1`;caller sizes `out≥max_iter+1`;short `out` CLAMPED
+  (never OOB).Imports `mandelbrot.bail_radius_squared`—never restate the radius.
 - `perturb.zig`—DEEP path arithmetic for `side<=threshold_side`(1e-6);pure,LOG-FREE.
   `ReferenceOrbit.compute(alloc,center:ComplexHi,max_iter)` f128-iterates the CENTRE,stores
   `Z_0..Z_k` as f64 `re`/`im`;`len()`,`deinit(alloc)`,`capacity`=allocation(TRIMMED if

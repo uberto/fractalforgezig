@@ -19,6 +19,8 @@ test {
     _ = @import("fractal/navigate.zig");
     _ = @import("fractal/autoiter.zig");
     _ = @import("fractal/mandelbrot.zig");
+    // M10: pure orbit sequence for the orbit inspector (complex-plane only).
+    _ = @import("fractal/orbit.zig");
     _ = @import("fractal/perturb.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/gradient.zig");
