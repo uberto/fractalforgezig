@@ -98,6 +98,37 @@ work in progress rather than a hang.
 - **THEN** the palette and view controls are disabled until it completes
 - **Test**: _not pinned by a test_ — manual smoke run (ImGui glue)
 
+### Requirement: Stopping a render in progress
+
+The system SHALL let the user stop an in-flight full-resolution render — from a control beside the
+progress bar or by pressing the Escape key — leaving the partly-refined image on display, and SHALL
+offer, in the same place, to start the render again for the unchanged view.
+
+#### Scenario: A render in flight offers Cancel; a cancelled render offers Render
+
+- **WHEN** a full-resolution render is in flight
+- **THEN** the progress area offers a Cancel control alongside the percentage
+- **WHEN** a render has been cancelled and not yet restarted
+- **THEN** the progress area offers a Render control instead
+- **WHEN** there is neither a render in flight nor a cancelled one
+- **THEN** the progress area offers neither
+- **Test**: `src/fractal/progressive.zig::acceptance: statusControl offers cancel while rendering, render after a cancel, neither otherwise`
+
+#### Scenario: Cancelling stops the render and keeps the partial image
+
+- **WHEN** the user cancels an in-flight render, with the Cancel control or the Escape key
+- **THEN** iteration stops and the partly-refined image stays on display, neither blanked nor
+  reverted to the coarse preview
+- **Test**: _not pinned by a test_ — manual smoke run (ImGui/SDL glue); the engine's
+  abandon-and-keep behaviour is pinned by `rendering`'s **Progressive refinement** →
+  `src/fractal/engine.zig::cancelPass abandons the pass, leaving the partly refined image on display`
+
+#### Scenario: Restarting renders the same view again
+
+- **WHEN** the user activates the Render control after cancelling
+- **THEN** a fresh full-resolution pass runs for the same view, without requiring any navigation
+- **Test**: _not pinned by a test_ — manual smoke run (ImGui/loop glue)
+
 ### Requirement: Render statistics
 
 The system SHALL report what the last render cost and what it did — processor time, frame time,

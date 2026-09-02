@@ -191,7 +191,9 @@ the value being shown so the user edits on from it.
 
 The system SHALL answer every view change with an immediate coarse image and then refine it to
 full resolution in self-timed chunks while reporting progress, so the app is never unresponsive
-and the final image is the one a single full-resolution pass would have produced.
+and the final image is the one a single full-resolution pass would have produced — and SHALL NOT
+resume refining a view whose refinement the user has cancelled, until the user restarts it or
+changes the view.
 
 #### Scenario: A settled view is promoted to full resolution
 
@@ -224,6 +226,14 @@ and the final image is the one a single full-resolution pass would have produced
 - **WHEN** a new input arrives and the in-flight refinement is cancelled
 - **THEN** the partly refined image stays on display instead of reverting or blanking
 - **Test**: `src/fractal/engine.zig::cancelPass abandons the pass, leaving the partly refined image on display`
+
+#### Scenario: A cancelled view is not refined again on its own
+
+- **WHEN** the user has cancelled the current view's refinement, is idle past the promotion
+  threshold, and no full pass has completed for that view
+- **THEN** no full-resolution pass is scheduled (the partly-refined image is left as it is), and
+  clearing the cancel restores normal promotion for the same view
+- **Test**: `src/fractal/refine.zig::acceptance: a cancelled view is not promoted, and clearing the cancel restores promotion`
 
 #### Scenario: Chunk size adapts to what the machine can do
 
@@ -271,8 +281,11 @@ had, and stay usable.
   window size a 1e-30 view takes minutes of chunks, and the auto ramp deliberately overshoots the
   minimum count a depth needs.
 - **What "never unresponsive" covers, and what it does not.** During a pass the image, the progress
-  bar and the wheel (which cancels and re-arms) stay live, but the whole data panel is disabled
-  until the pass finishes or is cancelled. So at deep depths a palette edit cannot be *made*
+  bar, the wheel (which cancels and re-arms) and the status-bar Cancel control (with the Escape key)
+  stay live, but the whole data panel is disabled until the pass finishes or is cancelled. When the
+  user cancels, the partly-refined image is left exactly as it stood and stays put — idle promotion
+  will not re-arm the pass on its own until the user restarts it (a Render control appears in the
+  same place) or changes the view (see `app-shell`'s **Stopping a render in progress**). So at deep depths a palette edit cannot be *made*
   through the UI while a pass runs: **Colour edits never re-iterate** is a promise about what the
   engine does when such an edit arrives, and it is pinned at engine level, not through the panel.
   The `colouring` controls added since — the scheme **Save**/**Load** buttons, the preset swatch

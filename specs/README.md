@@ -21,7 +21,7 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 | [colouring](colouring/spec.md) | The gradient stop model, stop editing, the three iteration→gradient mapping modes, banded vs smooth colouring, the interior colour, opaque output, portable colour-scheme files, and the built-in presets. |
 | [gpu-acceleration](gpu-acceleration/spec.md) | GPU iteration agreeing with the CPU, banded dispatch, CPU fallback on GPU failure, the user's backend choice. |
 | [persistence](persistence/spec.md) | Saving and reopening the complete render state as a `.fractal` JSON file, and refusing a corrupt one. |
-| [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, render statistics, the file dialogs, startup and failure logging. |
+| [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, stopping and restarting a render in progress, render statistics, the file dialogs, startup and failure logging. |
 
 ## Provenance
 
@@ -53,6 +53,13 @@ the palette panel** — and rewrote `persistence`'s **The whole picture is saved
 Save/Load buttons, the preset swatch gallery and the banded checkbox are ImGui glue whose active
 state during a render is pilot-verified (see `rendering`'s panel-disabled note), not unit-tested; the
 pure logic behind every new requirement is test-pinned.
+
+Milestone `m9-cancel-render` added one `app-shell` requirement — **Stopping a render in progress** —
+and rewrote `rendering`'s **Progressive refinement** to promise that a cancelled view is not refined
+again on its own until the user restarts it or changes the view. The two pure decisions are
+test-pinned (`refine.decidePass`'s cancel latch and `progressive.statusControl`); the Cancel/Render
+buttons, the Escape shortcut and the click→`cancelPass` wiring are ImGui/SDL glue, pilot-verified on
+the manual smoke run, exactly like the neighbouring app-shell glue scenarios.
 
 ## Verification
 
