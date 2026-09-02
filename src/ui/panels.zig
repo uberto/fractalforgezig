@@ -109,6 +109,14 @@ pub const DrawResult = struct {
     render_requested: bool = false,
     /// A view / `max_iter` policy the coord panel wants installed (see `CoordRequest`).
     coord: CoordRequest = .{},
+    /// Set when a View-menu item was clicked this frame (T5). main.zig owns the bools these
+    /// govern — `julia.open`, `orbit.open`, and the loop's `fullscreen` — and flips them after
+    /// the frame, so the menu is a request just like File→Save/Open. `toggle_fullscreen` also
+    /// drives `SDL_SetWindowFullscreen`; the checkmarks come back through `julia_open` /
+    /// `orbit_open` / `fullscreen` passed INTO `draw`, so they always mirror the live state.
+    toggle_julia: bool = false,
+    toggle_orbit: bool = false,
+    toggle_fullscreen: bool = false,
 };
 
 /// What the coord panel asks the app to do this frame. The panel NEVER installs these
@@ -190,6 +198,12 @@ pub const SwatchGallery = struct {
 /// restarted it. Together with `rendering` it drives `progressive.statusControl` to pick the
 /// status-bar control — Cancel while rendering, Render after a cancel, neither otherwise — which
 /// is why both flow through to `drawStatusBar`.
+///
+/// `julia_open` / `orbit_open` / `fullscreen` are the CURRENT states (T5), owned by main.zig:
+/// the two inspectors' open flags and the full-screen mode. They feed the View menu's checkmarks
+/// and — for `fullscreen` — the layout branch that hides the data panel and gives the fractal the
+/// whole content region. A click on a View item comes back as a `toggle_*` flag in `DrawResult`
+/// for main.zig to apply after the frame; the panel never flips these itself.
 pub fn draw(
     device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
@@ -206,6 +220,9 @@ pub fn draw(
     rendering: bool,
     progress: ?f32,
     cancelled: bool,
+    julia_open: bool,
+    orbit_open: bool,
+    fullscreen: bool,
     quit_requested: *bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
@@ -216,6 +233,9 @@ pub fn draw(
     var load_scheme_requested = false;
     var cancel_requested = false;
     var render_requested = false;
+    var toggle_julia = false;
+    var toggle_orbit = false;
+    var toggle_fullscreen = false;
     var coord_request = CoordRequest{};
     // live_rect is updated from ImGui geometry below; fallback keeps old rect on collapsed window.
     var live_rect = viewport.ImageRect{ .x = 0, .y = 0, .w = 0, .h = 0, .side = 0 };
@@ -225,17 +245,22 @@ pub fn draw(
 
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
-        const menu = drawMenuBar(quit_requested);
+        const menu = drawMenuBar(quit_requested, julia_open, orbit_open, fullscreen);
         if (menu.open_about) ig.igOpenPopup_Str(about_popup, 0);
         if (menu.save_requested) save_requested = true;
         if (menu.open_requested) open_requested = true;
+        if (menu.toggle_julia) toggle_julia = true;
+        if (menu.toggle_orbit) toggle_orbit = true;
+        if (menu.toggle_fullscreen) toggle_fullscreen = true;
         // Open the right-click nav popup inside the window so the ID stack is correct.
         if (open_ctx_menu) ig.igOpenPopup_Str("##nav_ctx", 0);
 
         var avail_w: f32 = 0;
         var avail_h: f32 = 0;
         c.ffImguiContentAvail(&avail_w, &avail_h);
-        var fractal_w = avail_w - data_panel_w - region_spacing;
+        // Full screen (T5) hides the data panel and hands the WHOLE content region to the fractal;
+        // otherwise the panel takes its fixed `data_panel_w` (plus the gap) off the right.
+        var fractal_w = if (fullscreen) avail_w else avail_w - data_panel_w - region_spacing;
         if (fractal_w < 0) fractal_w = 0;
         // Reserve one text line + spacing for the status bar so the image fits.
         const status_bar_h: f32 = ig.igGetTextLineHeightWithSpacing() + 6.0;
@@ -276,23 +301,29 @@ pub fn draw(
         if (status.render) render_requested = true;
         ig.igEndGroup();
 
-        ig.igSameLine(0, region_spacing);
+        // The data panel is hidden in full screen: skip the SameLine and the whole child (and its
+        // `igBeginDisabled` block) so the fractal keeps the full content region. Every request the
+        // panel raises (needs_rerender, scheme save/load, coord view/policy/input) simply stays at
+        // its default this frame — there is no panel to raise them.
+        if (!fullscreen) {
+            ig.igSameLine(0, region_spacing);
 
-        _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
-        ig.igBeginDisabled(rendering);
-        if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
-        ig.igSpacing();
-        coord_request = drawCoordPanel(engine, view_editor);
-        ig.igSpacing();
-        coord_request.input_mode = drawInputPanel(input_mode);
-        ig.igSpacing();
-        if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
-            const pal = drawPalettePanel(device, texture, engine, editor, gallery);
-            if (pal.save_scheme) save_scheme_requested = true;
-            if (pal.load_scheme) load_scheme_requested = true;
+            _ = c.ffImguiBeginChild("data_panel", 0, 0, true);
+            ig.igBeginDisabled(rendering);
+            if (drawDataPanel(engine.renderViewport(), max_iter, s, engine)) needs_rerender = true;
+            ig.igSpacing();
+            coord_request = drawCoordPanel(engine, view_editor);
+            ig.igSpacing();
+            coord_request.input_mode = drawInputPanel(input_mode);
+            ig.igSpacing();
+            if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
+                const pal = drawPalettePanel(device, texture, engine, editor, gallery);
+                if (pal.save_scheme) save_scheme_requested = true;
+                if (pal.load_scheme) load_scheme_requested = true;
+            }
+            ig.igEndDisabled();
+            c.ffImguiEndChild();
         }
-        ig.igEndDisabled();
-        c.ffImguiEndChild();
 
         // Context menu must be opened and rendered in the same window scope.
         ctx_action = drawNavContextMenu(right_click_pt);
@@ -313,6 +344,9 @@ pub fn draw(
         .cancel_requested = cancel_requested,
         .render_requested = render_requested,
         .coord = coord_request,
+        .toggle_julia = toggle_julia,
+        .toggle_orbit = toggle_orbit,
+        .toggle_fullscreen = toggle_fullscreen,
     };
 }
 
@@ -320,10 +354,21 @@ const MenuResult = struct {
     open_about: bool = false,
     save_requested: bool = false,
     open_requested: bool = false,
+    /// Set when a View-menu item was clicked this frame: the user asked to flip that state.
+    /// main.zig owns the bools (`julia.open`, `orbit.open`, the loop's `fullscreen`), so it
+    /// applies the toggle after the frame — the menu only reports the click, exactly like
+    /// File→Save/Open above. The current value is passed IN as the item's `selected` arg so the
+    /// checkmark always mirrors the live state (a window closed by its own box clears the flag,
+    /// and the menu follows next frame).
+    toggle_julia: bool = false,
+    toggle_orbit: bool = false,
+    toggle_fullscreen: bool = false,
 };
 
-/// Draw the menu bar. Sets `quit_requested.*` on File→Quit.
-fn drawMenuBar(quit_requested: *bool) MenuResult {
+/// Draw the menu bar. Sets `quit_requested.*` on File→Quit. `julia_open` / `orbit_open` /
+/// `fullscreen` are the CURRENT states, passed in as each View item's `selected` arg so the
+/// checkmark reflects live state; a click reports a toggle request for main.zig to apply.
+fn drawMenuBar(quit_requested: *bool, julia_open: bool, orbit_open: bool, fullscreen: bool) MenuResult {
     var result = MenuResult{};
     if (ig.igBeginMenuBar()) {
         if (ig.igBeginMenu("File", true)) {
@@ -331,6 +376,13 @@ fn drawMenuBar(quit_requested: *bool) MenuResult {
             if (ig.igMenuItem_Bool("Open\xe2\x80\xa6", null, false, true)) result.open_requested = true;
             ig.igSeparator();
             if (ig.igMenuItem_Bool("Quit", null, false, true)) quit_requested.* = true;
+            ig.igEndMenu();
+        }
+        if (ig.igBeginMenu("View", true)) {
+            if (ig.igMenuItem_Bool("Julia inspector", null, julia_open, true)) result.toggle_julia = true;
+            if (ig.igMenuItem_Bool("Orbit inspector", null, orbit_open, true)) result.toggle_orbit = true;
+            ig.igSeparator();
+            if (ig.igMenuItem_Bool("Full screen", "F11", fullscreen, true)) result.toggle_fullscreen = true;
             ig.igEndMenu();
         }
         if (ig.igBeginMenu("Help", true)) {

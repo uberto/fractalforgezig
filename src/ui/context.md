@@ -15,15 +15,20 @@ Keep `no_scrollbar`: cut a `ContentAvail`→region→content oscillation that ca
 ## Layout: single window, two fixed regions
 
 `panels.zig`—`draw(…)→DrawResult{ctx_action,image_rect,render_w,render_h,needs_rerender,
-save_requested,open_requested,coord}`: `image_rect`=fitted ON-SCREEN rect (mapping),
-`render_w/h`=REGION size. `rendering` freezes the data panel
-(`igBeginDisabled`), leaving image+wheel/pinch+status-bar live. Status bar
+save_requested,open_requested,coord,toggle_julia/orbit/fullscreen}`: `image_rect`=fitted ON-SCREEN
+rect (mapping), `render_w/h`=REGION size. `rendering` freezes the data panel
+(`igBeginDisabled`), leaving image+wheel/pinch+status-bar live.
+`drawMenuBar` View menu (Julia/Orbit inspector, sep, Full screen "F11"): each item's `selected`=the
+CURRENT `julia_open`/`orbit_open`/`fullscreen` passed INTO `draw` (checkmark mirrors live state); a
+click reports `toggle_*`, main.zig owns+flips the bool after the frame. `fullscreen`⇒layout SKIPS the
+data-panel child+disabled block, fractal fills content; main.zig drives `SDL_SetWindowFullscreen`
+(borderless)+F11, NEVER Escape (m9). Status bar
 (`drawStatusBar`, OUTSIDE the disabled block) shows what
 `progressive.statusControl(rendering,cancelled)` picks: `.cancel`⇒`igProgressBar`
 (+`progressLabel`,`progress`=`engine.passFraction()`) sharing its line with Cancel;
 `.render`⇒a Render button; `.none`⇒hover readout. Buttons→`DrawResult.cancel_requested/render_requested`, main.zig acts after. Status-bar lookup:
 `engine.renderViewport().pixelIndex(pt.lo())` (rect stride), NOT the square map. Left image, right data+coord+palette.
-Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
+Palette edits stops/mode/period/banded/interior; `applyEdits`→setter→re-upload, NEVER re-iterates.
 `drawPalettePanel` draws the preset grid (`drawSwatchGallery`): `SwatchGallery` bakes each `presets.gradientOf` to a texture ONCE, click→`applyPreset`.
 `editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`+`applyScheme`+`indexToInputMode`. `stats.zig`
 (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
@@ -60,23 +65,23 @@ hover→`viewport.formatCoord`. EVERY view/policy change goes through
 `cancelPass`→`installView`/`installPolicy`→`renderCoarse` (blocking, per-axis `coarse_divisor`)
 →`syncFromView`→`armFullPass`; nothing iterates full-res synchronously.
 `refine.decidePass(…,nav.cancelled)` fires `beginFullPass`; `stepPassChunk` runs one
-`engine.stepPass()`/frame. m9 Cancel: `requestCancel` (status Cancel button OR Escape while
-`rendering`)⇒`cancelPass`+`rendering=false`,`full_pass_done=true`,`cancelled=true`, logs `render
-cancelled at NN%`; `cancelled` suppresses promotion so NO cancel→re-arm loop. Render
-button⇒`armFullPass`, which clears `cancelled`—as does every view change.
+`engine.stepPass()`/frame. m9 Cancel: `requestCancel` (status Cancel OR Escape while
+`rendering`)⇒`cancelPass`+`rendering=false`,`full_pass_done`/`cancelled=true`, logs `render
+cancelled at NN%`; `cancelled` suppresses promotion (no re-arm loop). Render⇒`armFullPass`
+clears `cancelled`, as does every view change.
 Pump: `engine.pass!=null`→`SDL_PollEvent`, else `SDL_WaitEventTimeout(16)` if owed / `-1` idle.
 
 ## Coord panel + ViewEditor
 
-`ViewEditor` (`editor.zig`, PURE, tested): center re/im + corner a/b re/im buffers are
-`coord_buf_bytes` (64 B); `mag_buf` SAME; `auto_iter`; `manual_iter_buf`. COORDINATES are `f128`. `writeCoordHi`: `.decimal` else `.scientific`, keeping
+`ViewEditor` (`editor.zig`, PURE, tested): center re/im + corner a/b re/im buffers
+`coord_buf_bytes`(64 B), `mag_buf` SAME, `auto_iter`, `manual_iter_buf`. COORDINATES `f128`. `writeCoordHi`: `.decimal` else `.scientific`, keeping
 decimal ONLY if it re-parses identical. NEVER `{d}` an `f128`; `parseCoordHi` reads EXPONENT back.
 `coordDigits`/`max_coord_digits` budget the READ-ONLY readout; NEVER cut editable text.
 `mag`/`manual_iter_buf` stay f64/u32.
-`initFromView`/`syncFromView` fill all 7; `syncFromPolicy(policy,engine.max_iter)` shows the count
-IN USE (ramp's under Auto); `iterFieldReadOnly()`(=`auto_iter`)⇒field read-only+greyed, re-synced
-every frame; `leaveAuto` (TOTAL) pins what SHOWS, else `base_max_iter`;
-`iterRejection`→`IterRejection` picks the `.err` message.
+`initFromView`/`syncFromView` fill all 7; `syncFromPolicy(policy,max_iter)` shows the count
+IN USE (ramp under Auto); `iterFieldReadOnly()`(=`auto_iter`)⇒read-only+greyed, re-synced/frame;
+`leaveAuto`(TOTAL) pins what SHOWS else `base_max_iter`; `iterRejection`→`IterRejection` picks the
+`.err` msg.
 `parseAndApplyCenterMag`/`parseAndApplyCorners`→`?SquareView`, `parseIterPolicy`→`?IterPolicy`;
 `drawCoordPanel` REQUESTS (returns `CoordRequest{view,policy,input_mode}`), never applies; parse
 failure logs `.err` and re-syncs.
@@ -91,6 +96,6 @@ Save/Load: BUTTONS in the Coloring header, inside `igBeginDisabled(rendering)`; 
 
 ## Testing
 
-Visual=manual smoke+logs. `stats.zig`/`editor.zig`/`gesture.zig` are PURE+unit-tested; `dialog.zig`
-is glue. `panels.zig` imports `c.zig`⇒OUT of `root.zig`, its tests NEVER run—keep pure logic in
-`editor.zig`/`stats.zig`/`gesture.zig`.
+Visual=manual smoke+logs. `stats.zig`/`editor.zig`/`gesture.zig` PURE+unit-tested; `dialog.zig`
+glue. `panels.zig` imports `c.zig`⇒OUT of `root.zig`, tests NEVER run—keep pure logic in
+`editor.zig`/`stats.zig`/`gesture.zig`. View menu + full screen are pilot-only glue.

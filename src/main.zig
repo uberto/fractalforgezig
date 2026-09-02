@@ -978,9 +978,18 @@ fn runLoop(
     // The navigation square side that goes with it (pan/zoom geometry is square).
     var real_s: u32 = engine.image_side;
 
+    // Full-screen presentation (T5): session-only, default windowed. When set, `panels.draw` hides
+    // the data panel and the fractal fills the content region; `SDL_SetWindowFullscreen` (borderless
+    // desktop) is driven off changes to this flag. Toggled from the View menu and by F11 — NEVER
+    // Escape, which m9 owns for cancel-render.
+    var fullscreen = false;
+
     var running = true;
     while (running) {
         if (frame_timer) |*t| t.reset();
+        // Set this frame by F11 (event loop) or the View→Full screen menu item (after the frame);
+        // one apply site below flips `fullscreen` and calls `SDL_SetWindowFullscreen` exactly once.
+        var toggle_fullscreen = false;
 
         // ── SDL event pump — wait for the first event then drain the queue.
         // How long we may block depends on whether the app owes the user work:
@@ -1094,6 +1103,12 @@ fn runLoop(
                             // Escape while a pass is in flight is the keyboard twin of the
                             // status-bar Cancel button (m9): same abandon-and-keep behaviour.
                             requestCancel(engine, &nav);
+                        } else if (event.key.scancode == c.SDL_SCANCODE_F11) {
+                            // F11 toggles full screen (T5). Deliberately NOT Escape — m9 owns Escape
+                            // for cancel-render, and full screen must be leavable without it. The
+                            // flip + `SDL_SetWindowFullscreen` happen at the one apply site after the
+                            // frame, shared with the View→Full screen menu item.
+                            toggle_fullscreen = true;
                         }
                     },
                     else => {},
@@ -1264,6 +1279,9 @@ fn runLoop(
             nav.rendering,
             engine.passFraction(),
             nav.cancelled,
+            julia.open,
+            orbit.open,
+            fullscreen,
             &quit_requested,
         );
         // Update image_rect from the live ImGui geometry every frame so coordinate
@@ -1271,6 +1289,21 @@ fn runLoop(
         if (draw_result.image_rect.side > 0) image_rect.* = draw_result.image_rect;
         nav.open_ctx_menu = false;
         if (quit_requested) running = false;
+
+        // ── View menu toggles (T5) ────────────────────────────────────────────
+        // main.zig owns these bools; the menu (and F11, for full screen) only REQUEST a flip.
+        // The inspectors' own close boxes clear `julia.open` / `orbit.open` directly, so the
+        // menu checkmarks — read from the same fields next frame — stay in step either way.
+        if (draw_result.toggle_julia) julia.open = !julia.open;
+        if (draw_result.toggle_orbit) orbit.open = !orbit.open;
+        if (draw_result.toggle_fullscreen) toggle_fullscreen = true;
+        if (toggle_fullscreen) {
+            fullscreen = !fullscreen;
+            // SDL3: a true here enters borderless desktop full screen (no mode set), a false
+            // returns to the windowed frame. Both apply next frame's layout via the `fullscreen`
+            // flag passed into `panels.draw`.
+            _ = c.SDL_SetWindowFullscreen(window, fullscreen);
+        }
 
         // ── Cancel / Render controls (m9) ─────────────────────────────────────
         // The status-bar Cancel button and Escape both route through `requestCancel`; Escape is
