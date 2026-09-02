@@ -15,6 +15,8 @@ const viewport = @import("fractal/viewport.zig");
 const navigate = @import("fractal/navigate.zig");
 const autoiter = @import("fractal/autoiter.zig");
 const engine_mod = @import("fractal/engine.zig");
+const iterbuf = @import("fractal/iterbuf.zig");
+const colorpass = @import("fractal/colorpass.zig");
 const texture_mod = @import("gpu/texture.zig");
 const compute_mod = @import("gpu/compute.zig");
 const stats_mod = @import("ui/stats.zig");
@@ -86,6 +88,18 @@ const coarse_divisor: u32 = 4;
 /// the pass and the image would stay blocky forever. Finishing at a slightly stale size is
 /// strictly better: `viewport.fitImageRect` letterboxes the difference instead of stretching.
 const region_thrash_limit: u8 = 8;
+
+/// The Julia inspector preview is a fixed small square (T3): cheap enough to re-iterate on the CPU
+/// every time the pointer moves to a new complex point, and never deep-zoomed. One side, in pixels.
+const julia_side: u32 = 256;
+/// The Julia preview's OWN iteration cap. Also the mapping cap handed to `colorpass.colorInto`
+/// (plan-review note N1): colouring the preview with the ENGINE's `max_iter` — which at depth runs
+/// into the thousands — would crush every preview escape value into the palette's low end and wash
+/// the picture out. The preview's budget and its colour cap must be the same number.
+const julia_max_iter: u32 = 256;
+/// Side of the FIXED Julia z-plane viewport, centred on the origin: side 3 ⇒ re, im ∈ [-1.5, 1.5],
+/// the classic frame that shows the whole filled Julia set for the c values around the main set.
+const julia_view_side: f64 = 3.0;
 
 pub fn main() !void {
     var buf: [128]u8 = undefined;
@@ -184,8 +198,13 @@ pub fn main() !void {
     var gallery = try panels.SwatchGallery.init(device.handle);
     defer gallery.deinit();
 
+    // Live Julia inspector (T3): CPU buffers allocated up front; its GPU texture is created lazily
+    // on first open and destroyed here alongside the main texture.
+    var julia = try JuliaInspector.init(std.heap.page_allocator);
+    defer julia.deinit(std.heap.page_allocator);
+
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor, &gallery);
+    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor, &gallery, &julia);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -283,6 +302,141 @@ const NavState = struct {
     redo_buf: [history_cap]viewport.SquareView = undefined,
     redo_len: usize = 0,
 };
+
+// ─── Julia inspector ───────────────────────────────────────────────────────────
+
+/// The Live Julia inspector (T3): a floating, resizable ImGui window that shows the Julia set for
+/// the complex point under the pointer on the main fractal. It renders on the CPU into a fixed
+/// `julia_side × julia_side` buffer, colours it with the app's CURRENT palette/mapping, and shows
+/// it through one GPU texture that is created once and re-uploaded — never re-created per frame.
+///
+/// Cost discipline (glue): the expensive step (iterate) runs ONLY when the parameter `c` changes,
+/// so a still pointer costs nothing and a pointer that has LEFT the fractal freezes the last
+/// preview (see `renderJulia`). The cheap step (colour + upload) also runs when the engine has
+/// recoloured since our last paint, so a palette edit flows into the preview without re-iterating.
+const JuliaInspector = struct {
+    /// Whether the window is shown. A plain bool on purpose (T3 scope): its `igBegin` close box
+    /// clears it, and T5's View-menu checkmark will read and write the same field.
+    open: bool = false,
+    /// The preview texture. `null` until the window is first opened; created lazily by
+    /// `ensureJuliaTexture` and re-uploaded thereafter. Destroyed once, at shutdown.
+    tex: ?texture_mod.Texture = null,
+    /// The `c` the buffer currently holds a Julia set for. `null` before the first render. Drives
+    /// both re-render-on-move (a new `c` re-iterates) and freeze-on-leave (a null hover keeps it).
+    last_c: ?[2]f64 = null,
+    /// `engine.color_passes` at our last colour pass. When the engine's counter has moved past this
+    /// the palette/mapping changed, so re-colour and re-upload even though `c` is unchanged.
+    last_color_passes: u32 = 0,
+    /// Set when `rgba` holds pixels not yet on the texture; the deferred post-frame section uploads
+    /// them (GPU work must never run inside the main window's ImGui Begin/End).
+    needs_upload: bool = false,
+    /// Smooth iteration values, one f32 per preview pixel (`julia_side²`).
+    iter: []f32,
+    /// The coloured RGBA8 preview, four bytes per pixel, uploaded to `tex`.
+    rgba: []u8,
+
+    /// Allocate the fixed CPU buffers. The texture is NOT created here — it is created lazily on
+    /// first open (`ensureJuliaTexture`) so a run that never opens the inspector pays no GPU cost.
+    fn init(alloc: std.mem.Allocator) !JuliaInspector {
+        const pixels: usize = @as(usize, julia_side) * @as(usize, julia_side);
+        const iter = try alloc.alloc(f32, pixels);
+        errdefer alloc.free(iter);
+        const rgba = try alloc.alloc(u8, pixels * 4);
+        return .{ .iter = iter, .rgba = rgba };
+    }
+
+    /// Free the buffers and destroy the texture if it was ever created.
+    fn deinit(self: *JuliaInspector, alloc: std.mem.Allocator) void {
+        if (self.tex) |*t| t.destroy();
+        alloc.free(self.iter);
+        alloc.free(self.rgba);
+    }
+};
+
+/// Iterate and/or colour the Julia preview for this frame. Does nothing while the window is closed.
+///
+/// The parameter `c` is the point under the pointer (`hover_pt.lo()`, f128 → f64); when the pointer
+/// is off the fractal (`hover_pt == null`) it stays on `last_c`, which freezes the preview. Iteration
+/// (the expensive step) runs ONLY when `c` differs from `last_c`; colouring + upload (the cheap step)
+/// runs when `c` changed OR the engine has recoloured since our last pass — so a palette edit follows
+/// without a re-iterate. All failures are the pure buffer-size contract, impossible for our fixed
+/// sizes; they are logged and swallowed rather than crashing the app.
+fn renderJulia(julia: *JuliaInspector, engine: *const engine_mod.Engine, hover_pt: ?viewport.ComplexHi) void {
+    if (!julia.open) return;
+
+    const c_pair: [2]f64 = if (hover_pt) |pt| blk: {
+        const lo = pt.lo();
+        break :blk .{ lo.re, lo.im };
+    } else julia.last_c orelse return; // never rendered and pointer off the image: nothing to show yet
+
+    const c_changed = julia.last_c == null or
+        julia.last_c.?[0] != c_pair[0] or julia.last_c.?[1] != c_pair[1];
+
+    if (c_changed) {
+        const view = viewport.SquareView.fromCenterSide(.{ .re = 0.0, .im = 0.0 }, julia_view_side) catch |err| {
+            app_log.err("Julia preview viewport rejected ({s})", .{@errorName(err)});
+            return;
+        };
+        const vp = view.rectViewport(julia_side, julia_side);
+        iterbuf.iterateJuliaInto(julia.iter, vp, c_pair[0], c_pair[1], julia_max_iter) catch |err| {
+            app_log.err("Julia preview iterate failed ({s})", .{@errorName(err)});
+            return;
+        };
+        julia.last_c = c_pair;
+    }
+
+    // Colour when the parameter changed or the palette/mapping did (engine.color_passes moved).
+    if (c_changed or julia.last_color_passes != engine.color_passes) {
+        colorpass.colorInto(julia.rgba, julia.iter, &engine.lut, julia_max_iter, engine.params, engine.interior) catch |err| {
+            app_log.err("Julia preview colour failed ({s})", .{@errorName(err)});
+            return;
+        };
+        julia.last_color_passes = engine.color_passes;
+        julia.needs_upload = true;
+    }
+}
+
+/// Draw the Julia inspector as its OWN top-level window (NOT nested in the main window's
+/// Begin/End). Passing `&julia.open` as `p_open` gives the window a close box that clears the flag.
+/// The texture is shown letterboxed to a square inside the window's content area, reusing the
+/// main-image `fitImageRect` idiom so a non-square window never stretches the preview. Uses only
+/// the already-uploaded texture handle — all GPU work is deferred to the post-frame section.
+fn drawJuliaWindow(julia: *JuliaInspector) void {
+    if (!julia.open) return;
+    if (ig.igBegin("Julia inspector", &julia.open, ig.window_flags_no_saved_settings)) {
+        if (julia.tex) |tex| {
+            var avail_w: f32 = 0.0;
+            var avail_h: f32 = 0.0;
+            c.ffImguiContentAvail(&avail_w, &avail_h);
+            const origin = ig.igGetCursorScreenPos();
+            const rect = viewport.fitImageRect(
+                @intFromFloat(@max(origin.x, 0.0)),
+                @intFromFloat(@max(origin.y, 0.0)),
+                @intFromFloat(@max(avail_w, 0.0)),
+                @intFromFloat(@max(avail_h, 0.0)),
+                tex.width,
+                tex.height,
+            );
+            if (rect.w > 0 and rect.h > 0) {
+                c.ffImguiSetCursorScreenPos(@floatFromInt(rect.x), @floatFromInt(rect.y));
+                c.ffImguiImage(tex.handle, @floatFromInt(rect.w), @floatFromInt(rect.h));
+            }
+        }
+    }
+    ig.igEnd();
+}
+
+/// Create the preview texture on first open. Does nothing once it exists (so it is created ONCE and
+/// re-uploaded, never per frame). On a texture error, log once and close the window rather than
+/// crash — the rest of the app keeps running without the inspector.
+fn ensureJuliaTexture(device: gpu.Device, julia: *JuliaInspector) void {
+    if (julia.tex != null) return;
+    julia.tex = texture_mod.createRgbaTexture(device.handle, julia_side, julia_side) catch |err| {
+        app_log.err("Julia preview texture creation failed ({s}); closing the inspector", .{@errorName(err)});
+        julia.open = false;
+        return;
+    };
+}
 
 /// Push `old_view` onto the undo stack before committing a new view.
 /// Clears the redo stack (a new navigation invalidates the redo chain).
@@ -569,6 +723,7 @@ fn runLoop(
     editor: *editor_mod.Editor,
     view_editor: *editor_mod.ViewEditor,
     gallery: *const panels.SwatchGallery,
+    julia: *JuliaInspector,
 ) void {
     var frame_timer: ?std.time.Timer = std.time.Timer.start() catch |err| blk: {
         app_log.warn("frame timer unavailable ({s}); frame ms will read 0", .{@errorName(err)});
@@ -843,6 +998,11 @@ fn runLoop(
         _ = c.SDL_GetMouseState(&mx, &my);
         const hover_pt = engine.view.cursorCoord(@floatCast(mx), @floatCast(my), image_rect.*);
 
+        // Live Julia inspector (T3): iterate/colour the preview for the point under the pointer
+        // BEFORE the frame is built (this is pure CPU work; no GPU commands), so the window drawn
+        // below shows the current buffer and the deferred section can upload it after the frame.
+        renderJulia(julia, engine, hover_pt);
+
         // While Auto is on, the iteration field is a READOUT of `engine.max_iter`, and the ramp
         // moves that on every zoom — so refresh it from the engine once per frame, before the panel
         // draws it. One site, and it covers every path that can change the count. Guarded on
@@ -955,6 +1115,10 @@ fn runLoop(
         // Navigation ImGui input: box-select and pan.
         handleNavInput(engine, &nav, image_rect.*, real_w, real_h, real_s, view_editor);
 
+        // Julia inspector window (T3): its own top-level Begin/End, drawn from the texture already
+        // on the GPU (upload happens in the deferred section after renderFrame).
+        drawJuliaWindow(julia);
+
         ui.endFrame();
 
         // ── Coarse→fine pass dispatch ─────────────────────────────────────────
@@ -988,9 +1152,25 @@ fn runLoop(
             };
             nav.needs_upload = false;
         }
+
+        // Julia preview upload (T3), also deferred past renderFrame for the same reason. The
+        // texture is created ONCE on first open, then only re-uploaded — never re-created per
+        // frame. `renderJulia` sets `needs_upload` only when the buffer actually changed.
+        var julia_uploaded = false;
+        if (julia.needs_upload) {
+            ensureJuliaTexture(device, julia);
+            if (julia.tex) |tex| {
+                texture_mod.upload(device.handle, tex, julia.rgba) catch |err| {
+                    app_log.err("Julia preview upload failed ({s})", .{@errorName(err)});
+                };
+                julia_uploaded = true;
+            }
+            julia.needs_upload = false;
+        }
+
         // An upload lands after this frame was presented, so the new pixels are owed one more
         // frame. Cleared automatically on that frame, which uploads nothing.
-        nav.needs_present = did_upload;
+        nav.needs_present = did_upload or julia_uploaded;
 
         // ── File dialog result processing ─────────────────────────────────────
         if (dialog.takePending(&pending_dialog)) |result| {
