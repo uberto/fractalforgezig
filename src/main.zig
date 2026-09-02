@@ -412,8 +412,12 @@ fn showViewCoarse(
     armFullPass(nav);
 }
 
-/// Install a new `max_iter` policy the same way: coarse now, full-res progressively after.
-/// `max_iter` feeds the iteration itself, so this is a re-render, not a recolor.
+/// Install a new `max_iter` policy: coarse now, full-res progressively after — but ONLY when the
+/// policy actually changes the resolved `max_iter`. The count feeds the iteration, so an unchanged
+/// count means byte-identical pixels and a render would be pure waste (and, since m9, a visible
+/// Cancel/progress-bar flash). Leaving Auto pins the count already on display, so it lands here
+/// unchanged and renders nothing; typing a new value, or an Auto ramp that resolves to a different
+/// count, re-renders as before.
 fn showPolicyCoarse(
     engine: *engine_mod.Engine,
     nav: *NavState,
@@ -422,7 +426,7 @@ fn showPolicyCoarse(
     real_h: u32,
     view_editor: *editor_mod.ViewEditor,
 ) void {
-    engine.cancelPass();
+    const previous_iter = engine.max_iter;
     engine.installPolicy(policy) catch |err| {
         app_log.err("max_iter policy rejected ({s}); keeping the previous one", .{@errorName(err)});
         // Rejected: the engine kept its previous policy AND its previous count, so this restores
@@ -430,6 +434,16 @@ fn showPolicyCoarse(
         view_editor.syncFromPolicy(engine.policy, engine.max_iter);
         return;
     };
+    // `installPolicy` refreshed `max_iter` for the new policy without touching the pixels. If the
+    // count is unchanged, the image on screen (or the pass still refining it) is already correct:
+    // record the policy for future view changes and leave any in-flight pass running — no cancel,
+    // no re-render. This is the "deselect Auto" case: the field was pinned to `engine.max_iter`, so
+    // the pin equals it and nothing needs redrawing.
+    if (engine.max_iter == previous_iter) {
+        view_editor.syncFromPolicy(engine.policy, engine.max_iter);
+        return;
+    }
+    engine.cancelPass();
     renderCoarse(engine, nav, real_w, real_h);
     // After the coarse render `engine.max_iter` is the count the new policy actually resolved to —
     // the ramp's value under Auto, the pin under a manual policy. Never re-derive it here.
