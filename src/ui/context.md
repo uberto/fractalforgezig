@@ -28,6 +28,13 @@ Palette widgets edit stops/mode/period/banded(checkbox)/interior; `applyEdits`�
 `editor.zig` (PURE): `Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`+`addStop`/`removeStop`+`syncFromColouring`+`applyScheme`+`indexToInputMode`. `stats.zig`
 (PURE): `Stats{render_ms,frame_ms,gpu_render_ms}`, `renderSummary`.
 
+## Inspectors (main.zig glue,pilot-only)
+
+Two OWN top-level `igBegin`/`igEnd`(`p_open`⇒T5 close box). `JuliaInspector`:256²,`iterateJuliaInto`
++`colorInto`,freeze-on-leave. `OrbitInspector`:full-set backdrop baked ONCE(re-bake on
+resize/palette),overlays `orbit.compute` via `ImDrawList_AddCircleFilled`/`_AddLine`(cimgui);
+`connect` toggles path. Texture upload DEFERRED.
+
 ## Stack, bridge, `Ui` (imgui.zig)
 
 `build.zig` vendors cimgui+ImGui docking+SDL3/SDLGPU3 backends. `../cimgui.zig` holds

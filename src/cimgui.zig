@@ -125,6 +125,13 @@ pub extern fn ImDrawList_AddRect(
     thickness: f32,
     flags: DrawFlags,
 ) void;
+// Orbit inspector overlay (M10/T4): filled dots per orbit point and, when the
+// user joins them, line segments between successive points. Both are standard
+// cimgui `ImDrawList` methods (exactly like `ImDrawList_AddRect` above), so no C++
+// bridge is needed — `ImVec2` maps to cimgui's `ImVec2_c` by value. `num_segments`
+// = 0 lets ImGui pick a segment count from the radius. No per-call allocation.
+pub extern fn ImDrawList_AddLine(self: *ImDrawList, p1: ImVec2, p2: ImVec2, col: ImU32, thickness: f32) void;
+pub extern fn ImDrawList_AddCircleFilled(self: *ImDrawList, center: ImVec2, radius: f32, col: ImU32, num_segments: c_int) void;
 
 // Context-menu popup (right-click zoom)
 pub extern fn igBeginPopup(str_id: [*:0]const u8, flags: WindowFlags) bool;

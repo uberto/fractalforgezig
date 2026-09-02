@@ -16,6 +16,7 @@ const navigate = @import("fractal/navigate.zig");
 const autoiter = @import("fractal/autoiter.zig");
 const engine_mod = @import("fractal/engine.zig");
 const iterbuf = @import("fractal/iterbuf.zig");
+const orbit_mod = @import("fractal/orbit.zig");
 const colorpass = @import("fractal/colorpass.zig");
 const texture_mod = @import("gpu/texture.zig");
 const compute_mod = @import("gpu/compute.zig");
@@ -100,6 +101,25 @@ const julia_max_iter: u32 = 256;
 /// Side of the FIXED Julia z-plane viewport, centred on the origin: side 3 ⇒ re, im ∈ [-1.5, 1.5],
 /// the classic frame that shows the whole filled Julia set for the c values around the main set.
 const julia_view_side: f64 = 3.0;
+
+/// The Orbit inspector backdrop is the standard full-set view of the whole Mandelbrot set:
+/// re ∈ [-2.0, 0.5], im ∈ [-1.25, 1.25] — a SQUARE region (both axes span 2.5), centred on
+/// -0.75 + 0i with side 2.5. The same view maps orbit points onto the on-screen backdrop rect.
+const orbit_view_center_re: f64 = -0.75;
+const orbit_view_side: f64 = 2.5;
+/// The orbit's own iteration cap. Matches the Julia preview's modest 256 (the plan's "modest
+/// max_iter"): the backdrop is COLOURED with it, and the plotted orbit is capped to it, so an
+/// interior point's orbit fills to `orbit_max_iter + 1` points. Keeping the colour cap and the
+/// orbit cap the same number stops a deep engine `max_iter` from washing the backdrop out (N1).
+const orbit_max_iter: u32 = 256;
+/// Bounds on the baked backdrop resolution (a square, since the view is square). The backdrop
+/// tracks the window's content region so it stays crisp when the window grows, but never bakes
+/// larger than this (a cost cap) nor smaller (avoid mush on a tiny window).
+const orbit_backdrop_max_side: u32 = 512;
+const orbit_backdrop_min_side: u32 = 64;
+/// Re-bake only when the target backdrop side has moved by more than this many pixels since the
+/// last bake — so dragging a resize re-bakes a handful of times, never every frame.
+const orbit_rebake_threshold: u32 = 24;
 
 pub fn main() !void {
     var buf: [128]u8 = undefined;
@@ -203,8 +223,13 @@ pub fn main() !void {
     var julia = try JuliaInspector.init(std.heap.page_allocator);
     defer julia.deinit(std.heap.page_allocator);
 
+    // Orbit inspector (T4): CPU backdrop buffers allocated up front; its GPU texture is created
+    // lazily on first open and destroyed alongside the main texture.
+    var orbit = try OrbitInspector.init(std.heap.page_allocator);
+    defer orbit.deinit(std.heap.page_allocator);
+
     app_log.info("entering event loop", .{});
-    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor, &gallery, &julia);
+    runLoop(window, device, ui, &texture, &image_rect, &app_stats, &engine, &editor, &view_editor, &gallery, &julia, &orbit);
     app_log.info("event loop exited; shutting down cleanly", .{});
 }
 
@@ -434,6 +459,216 @@ fn ensureJuliaTexture(device: gpu.Device, julia: *JuliaInspector) void {
     julia.tex = texture_mod.createRgbaTexture(device.handle, julia_side, julia_side) catch |err| {
         app_log.err("Julia preview texture creation failed ({s}); closing the inspector", .{@errorName(err)});
         julia.open = false;
+        return;
+    };
+}
+
+// ─── Orbit inspector ─────────────────────────────────────────────────────────
+
+/// The Orbit inspector (T4): a floating, resizable ImGui window that plots the orbit of the point
+/// under the pointer — the successive iterates `z₀ = 0`, `z₁ = c`, `z₂ = z₁² + c`, … — over a
+/// cached mini view of the WHOLE Mandelbrot set. A "Connect points" toggle joins the plotted
+/// points with line segments instead of drawing them as separate dots.
+///
+/// Cost discipline (glue): the backdrop is the static full-set view, baked ONCE via the pure
+/// iterate + colour passes and shown through one GPU texture. It is re-baked only when the window
+/// is resized materially (so it stays crisp) or the palette changed — never per frame and never on
+/// pointer move. Only the overlay tracks the pointer, and it is cheap: `orbit.compute` into a fixed
+/// buffer plus a handful of draw-list calls. Freeze-on-leave keeps the last orbit when the pointer
+/// leaves the main fractal, exactly like the Julia inspector.
+const OrbitInspector = struct {
+    /// Whether the window is shown. A plain bool: its `igBegin` close box clears it, and T5's
+    /// View-menu checkmark will read and write the same field.
+    open: bool = false,
+    /// The "Connect points" toggle: false = dots only, true = successive points joined by lines.
+    connect: bool = false,
+    /// The cached backdrop texture. `null` until the window is first opened; created (and re-created
+    /// on a resize) in the deferred post-frame section, never inside the ImGui frame.
+    mini_tex: ?texture_mod.Texture = null,
+    /// Pixel side the backdrop buffer currently holds a bake for (0 = none yet). Both the
+    /// re-bake-on-resize decision and the texture (re)creation read it.
+    baked_side: u32 = 0,
+    /// `engine.color_passes` at the last backdrop colour pass; a palette edit re-colours the
+    /// backdrop from the same iteration buffer without re-iterating.
+    last_color_passes: u32 = 0,
+    /// The `c` the orbit is currently plotted for; `null` before the first hover. Drives
+    /// freeze-on-leave: a null hover keeps the last orbit on display.
+    last_c: ?[2]f64 = null,
+    /// Set when `rgba` holds a baked backdrop not yet on the texture; the deferred post-frame
+    /// section uploads it (GPU work must never run inside an ImGui Begin/End).
+    needs_upload: bool = false,
+    /// Max-size backdrop buffers, sub-sliced to the actual baked side. Allocated once up front so a
+    /// resize re-bake never allocates.
+    iter: []f32,
+    rgba: []u8,
+
+    /// Allocate the fixed-max backdrop buffers. The texture is NOT created here — it is created
+    /// lazily on first open so a run that never opens the inspector pays no GPU cost.
+    fn init(alloc: std.mem.Allocator) !OrbitInspector {
+        const pixels: usize = @as(usize, orbit_backdrop_max_side) * @as(usize, orbit_backdrop_max_side);
+        const iter = try alloc.alloc(f32, pixels);
+        errdefer alloc.free(iter);
+        const rgba = try alloc.alloc(u8, pixels * 4);
+        return .{ .iter = iter, .rgba = rgba };
+    }
+
+    /// Free the buffers and destroy the texture if it was ever created.
+    fn deinit(self: *OrbitInspector, alloc: std.mem.Allocator) void {
+        if (self.mini_tex) |t| t.destroy();
+        alloc.free(self.iter);
+        alloc.free(self.rgba);
+    }
+};
+
+/// Clamp a desired backdrop side (from the window content region) into the bake bounds.
+fn clampBackdropSide(want: f32) u32 {
+    if (!(want > 0.0)) return orbit_backdrop_min_side;
+    const w: u32 = @intFromFloat(want);
+    return std.math.clamp(w, orbit_backdrop_min_side, orbit_backdrop_max_side);
+}
+
+/// Bake the mini-Mandelbrot backdrop when it is missing, the window resized materially, or the
+/// palette changed — never otherwise. The iterate + colour passes are pure CPU work, safe inside
+/// the ImGui frame; the resulting texture (re)creation + upload is deferred to the post-frame
+/// section via `needs_upload`. All failures are the pure buffer-size contract (impossible for our
+/// sizes) or a rejected viewport; they are logged and swallowed so the app keeps running.
+fn bakeOrbitBackdrop(orbit: *OrbitInspector, engine: *const engine_mod.Engine, target_side: u32) void {
+    const size_changed = orbit.baked_side == 0 or absDiff(orbit.baked_side, target_side) > orbit_rebake_threshold;
+    const palette_changed = orbit.last_color_passes != engine.color_passes;
+    if (!size_changed and !palette_changed) return;
+
+    const side = if (size_changed) target_side else orbit.baked_side;
+    const px: usize = @as(usize, side) * @as(usize, side);
+    const iter = orbit.iter[0..px];
+    const rgba = orbit.rgba[0 .. px * 4];
+
+    if (size_changed) {
+        const view = viewport.SquareView.fromCenterSide(.{ .re = orbit_view_center_re, .im = 0.0 }, orbit_view_side) catch |err| {
+            app_log.err("orbit backdrop viewport rejected ({s})", .{@errorName(err)});
+            return;
+        };
+        const vp = view.rectViewport(side, side);
+        iterbuf.iterateInto(iter, vp, orbit_max_iter) catch |err| {
+            app_log.err("orbit backdrop iterate failed ({s})", .{@errorName(err)});
+            return;
+        };
+    }
+    colorpass.colorInto(rgba, iter, &engine.lut, orbit_max_iter, engine.params, engine.interior) catch |err| {
+        app_log.err("orbit backdrop colour failed ({s})", .{@errorName(err)});
+        return;
+    };
+    orbit.baked_side = side;
+    orbit.last_color_passes = engine.color_passes;
+    orbit.needs_upload = true;
+}
+
+fn absDiff(a: u32, b: u32) u32 {
+    return if (a > b) a - b else b - a;
+}
+
+/// Draw the Orbit inspector as its OWN top-level window (NOT nested in the main window's
+/// Begin/End). Passing `&orbit.open` as `p_open` gives the window a close box that clears the flag
+/// (which T5's View-menu checkmark will read). The backdrop is baked/uploaded lazily; the orbit for
+/// the point under the pointer (freeze-on-leave) is overlaid with the draw list each frame. Uses
+/// only the already-uploaded texture handle — all GPU work is deferred to the post-frame section.
+fn drawOrbitWindow(orbit: *OrbitInspector, engine: *const engine_mod.Engine, hover_pt: ?viewport.ComplexHi) void {
+    if (!orbit.open) return;
+    if (ig.igBegin("Orbit inspector", &orbit.open, ig.window_flags_no_saved_settings)) {
+        _ = ig.igCheckbox("Connect points", &orbit.connect);
+
+        // The backdrop fills the remaining content area, letterboxed to a square (the view is
+        // square). `target_side` also drives the re-bake-on-resize decision.
+        var avail_w: f32 = 0.0;
+        var avail_h: f32 = 0.0;
+        c.ffImguiContentAvail(&avail_w, &avail_h);
+        const origin = ig.igGetCursorScreenPos();
+
+        const target_side = clampBackdropSide(@min(avail_w, avail_h));
+        bakeOrbitBackdrop(orbit, engine, target_side);
+
+        // The on-screen rect the backdrop occupies (and that the overlay maps points into). Since
+        // both the view and the baked texture are square, `fitImageRect` centres a square inside
+        // the content region — the same idiom the main image and the Julia preview use.
+        const rect = viewport.fitImageRect(
+            @intFromFloat(@max(origin.x, 0.0)),
+            @intFromFloat(@max(origin.y, 0.0)),
+            @intFromFloat(@max(avail_w, 0.0)),
+            @intFromFloat(@max(avail_h, 0.0)),
+            @max(orbit.baked_side, 1),
+            @max(orbit.baked_side, 1),
+        );
+
+        if (orbit.mini_tex) |tex| {
+            if (rect.w > 0 and rect.h > 0) {
+                c.ffImguiSetCursorScreenPos(@floatFromInt(rect.x), @floatFromInt(rect.y));
+                c.ffImguiImage(tex.handle, @floatFromInt(rect.w), @floatFromInt(rect.h));
+            }
+        }
+
+        drawOrbitOverlay(orbit, hover_pt, rect);
+    }
+    ig.igEnd();
+}
+
+/// Overlay the orbit of the point under the pointer onto the backdrop rect. Freeze-on-leave: a
+/// non-null `hover_pt` updates the plotted `c`, a null one keeps the last (`orbit.last_c`). Maps
+/// each complex orbit point through the SAME full-set view that fit the backdrop, so `z₀` lands at
+/// the plane origin and `z₁` at `c`. Draws filled dots per point, and — when "Connect points" is
+/// on — line segments between successive points. Escaping points that shoot off the view are
+/// clipped by the window's draw-list clip rect.
+fn drawOrbitOverlay(orbit: *OrbitInspector, hover_pt: ?viewport.ComplexHi, rect: viewport.ImageRect) void {
+    if (rect.w == 0 or rect.h == 0) return;
+
+    const c_pair: [2]f64 = if (hover_pt) |pt| blk: {
+        const lo = pt.lo();
+        break :blk .{ lo.re, lo.im };
+    } else orbit.last_c orelse return; // never hovered yet and pointer off the image: nothing to plot
+    orbit.last_c = c_pair;
+
+    var buf: [orbit_max_iter + 1][2]f64 = undefined;
+    const result = orbit_mod.compute(c_pair[0], c_pair[1], orbit_max_iter, &buf);
+    if (result.points_written == 0) return;
+
+    const view = viewport.SquareView.fromCenterSide(.{ .re = orbit_view_center_re, .im = 0.0 }, orbit_view_side) catch return;
+    const vp = view.rectViewport(rect.w, rect.h);
+    const ox: f32 = @floatFromInt(rect.x);
+    const oy: f32 = @floatFromInt(rect.y);
+
+    const draw_list = ig.igGetWindowDrawList() orelse return;
+
+    // Bright dots; a slightly translucent path so the backdrop stays readable underneath.
+    const dot_col: ig.ImU32 = 0xFFFFFFFF; // opaque white (0xAABBGGRR)
+    const line_col: ig.ImU32 = 0xC030FFFF; // translucent yellow
+
+    var prev: ig.ImVec2 = undefined;
+    var i: usize = 0;
+    while (i < result.points_written) : (i += 1) {
+        const p = vp.complexToPixel(.{ .re = buf[i][0], .im = buf[i][1] });
+        const sx: f32 = ox + @as(f32, @floatCast(p.x));
+        const sy: f32 = oy + @as(f32, @floatCast(p.y));
+        const here = ig.ImVec2{ .x = sx, .y = sy };
+        if (orbit.connect and i > 0) {
+            ig.ImDrawList_AddLine(draw_list, prev, here, line_col, 1.5);
+        }
+        ig.ImDrawList_AddCircleFilled(draw_list, here, 2.5, dot_col, 0);
+        prev = here;
+    }
+}
+
+/// Create (or re-create on a resize) the backdrop texture so it matches `baked_side`. Called from
+/// the deferred post-frame section only. On a texture error, log once and close the window rather
+/// than crash — the rest of the app keeps running without the inspector.
+fn ensureOrbitTexture(device: gpu.Device, orbit: *OrbitInspector) void {
+    const side = orbit.baked_side;
+    if (side == 0) return;
+    if (orbit.mini_tex) |tex| {
+        if (tex.width == side and tex.height == side) return;
+        tex.destroy(); // size changed on a resize: drop the old texture and re-create at the new side
+        orbit.mini_tex = null;
+    }
+    orbit.mini_tex = texture_mod.createRgbaTexture(device.handle, side, side) catch |err| {
+        app_log.err("orbit backdrop texture creation failed ({s}); closing the inspector", .{@errorName(err)});
+        orbit.open = false;
         return;
     };
 }
@@ -724,6 +959,7 @@ fn runLoop(
     view_editor: *editor_mod.ViewEditor,
     gallery: *const panels.SwatchGallery,
     julia: *JuliaInspector,
+    orbit: *OrbitInspector,
 ) void {
     var frame_timer: ?std.time.Timer = std.time.Timer.start() catch |err| blk: {
         app_log.warn("frame timer unavailable ({s}); frame ms will read 0", .{@errorName(err)});
@@ -1119,6 +1355,11 @@ fn runLoop(
         // on the GPU (upload happens in the deferred section after renderFrame).
         drawJuliaWindow(julia);
 
+        // Orbit inspector window (T4): its own top-level Begin/End. Bakes/re-bakes the mini-Mandelbrot
+        // backdrop (pure CPU; texture upload is deferred below) and overlays the orbit of the point
+        // under the pointer, freezing on leave like the Julia preview.
+        drawOrbitWindow(orbit, engine, hover_pt);
+
         ui.endFrame();
 
         // ── Coarse→fine pass dispatch ─────────────────────────────────────────
@@ -1168,9 +1409,25 @@ fn runLoop(
             julia.needs_upload = false;
         }
 
+        // Orbit backdrop upload (T4), also deferred past renderFrame for the same reason. The
+        // texture is created on first open and re-created only when a resize changed `baked_side`;
+        // `bakeOrbitBackdrop` sets `needs_upload` only when the backdrop actually changed.
+        var orbit_uploaded = false;
+        if (orbit.needs_upload) {
+            ensureOrbitTexture(device, orbit);
+            if (orbit.mini_tex) |tex| {
+                const px: usize = @as(usize, orbit.baked_side) * @as(usize, orbit.baked_side);
+                texture_mod.upload(device.handle, tex, orbit.rgba[0 .. px * 4]) catch |err| {
+                    app_log.err("orbit backdrop upload failed ({s})", .{@errorName(err)});
+                };
+                orbit_uploaded = true;
+            }
+            orbit.needs_upload = false;
+        }
+
         // An upload lands after this frame was presented, so the new pixels are owed one more
         // frame. Cleared automatically on that frame, which uploads nothing.
-        nav.needs_present = did_upload or julia_uploaded;
+        nav.needs_present = did_upload or julia_uploaded or orbit_uploaded;
 
         // ── File dialog result processing ─────────────────────────────────────
         if (dialog.takePending(&pending_dialog)) |result| {
