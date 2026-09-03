@@ -143,6 +143,19 @@ pub const ReferenceOrbit = struct {
     }
 };
 
+/// The smooth value a deep pixel escaped (or survived) with, PLUS the number of elementary
+/// iteration steps `iterateDeltaCounted` spent reaching it. The step count is the metric BLA
+/// (T2) is measured against: a plain-path pixel and a BLA pixel produce the same `value`, and
+/// BLA proves its worth by producing a far smaller `steps`.
+pub const StepResult = struct {
+    /// Exactly what `iterateDelta` returns for the same inputs (smooth escape value or
+    /// `mandelbrot.interior_sentinel`).
+    value: f32,
+    /// The honest per-iteration tally: one per exact perturbation step, plus one per rebasing
+    /// re-anchor — the real arithmetic work the loop did, not merely loop trips.
+    steps: u64,
+};
+
 /// Iterate ONE pixel of the deep path: the pixel sits at `c = C + δc` where `C` is
 /// `orbit`'s centre, so `dc_re`/`dc_im` is its offset from the view centre in `f64`.
 ///
@@ -153,12 +166,24 @@ pub const ReferenceOrbit = struct {
 ///
 /// `orbit` is taken BY VALUE: it is two slices and a length (40 bytes), not a copy of the
 /// data. `f64` throughout — no `f128` may enter this function.
+///
+/// This is a thin wrapper over `iterateDeltaCounted`, so its result is byte-identical to that
+/// core's `.value` for every input; the step count is simply discarded here.
 pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32) f32 {
+    return iterateDeltaCounted(orbit, dc_re, dc_im, max_iter).value;
+}
+
+/// `iterateDelta`'s loop, instrumented to also return the count of elementary iteration steps
+/// it takes — the plain-path metric AT1 measures BLA against. The maths is UNCHANGED from
+/// `iterateDelta`: only a `u64` counter is threaded through it (see the m10 precedent, where
+/// `mandelbrot.iterate` delegated to `iterateFrom` and stayed byte-identical). `f64`
+/// throughout — no `f128` may enter this function.
+pub fn iterateDeltaCounted(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32) StepResult {
     const orbit_len = orbit.len();
     // An orbit of only `Z_0 = 0` (computed with `max_iter = 0`) carries no `Z_1 = C`, so
     // there is nothing to iterate against and no way to recover the centre. Answer like an
-    // exhausted budget rather than reading past the end.
-    if (orbit_len < 2) return mandelbrot.interior_sentinel;
+    // exhausted budget rather than reading past the end. No step is taken, so the count is 0.
+    if (orbit_len < 2) return .{ .value = mandelbrot.interior_sentinel, .steps = 0 };
 
     // `m` is the orbit index the current value is anchored on: the invariant maintained
     // across the loop is `z_re/z_im == Z_m + δ` with `m < orbit_len`. `n` counts completed
@@ -168,6 +193,11 @@ pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32
     var d_im: f64 = 0.0;
     var z_re: f64 = 0.0; // Z_0 + δ_0 = 0 + 0
     var z_im: f64 = 0.0;
+
+    // Elementary iteration steps taken so far: incremented once per exact perturbation step
+    // below, and once more whenever the loop re-anchors (rebasing is real arithmetic the
+    // plain path pays for, so it is counted). This is the tally BLA (T2) must beat.
+    var steps: u64 = 0;
 
     var n: u32 = 0;
     var escaped = false;
@@ -191,6 +221,7 @@ pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32
             d_re = z_re;
             d_im = z_im;
             m = 0;
+            steps += 1;
         }
 
         // One perturbation step: δ ← 2·Z_m·δ + δ² + δc, advancing the anchor to Z_{m+1}.
@@ -204,6 +235,7 @@ pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32
         d_im = next_d_im;
         m += 1;
         n += 1;
+        steps += 1;
 
         // Restore the invariant, then escape-test on the FULL value like `mandelbrot.iterate`
         // does (after the step, so `n` is the count at the moment of crossing).
@@ -215,21 +247,24 @@ pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32
         }
     }
 
-    if (!escaped) return mandelbrot.interior_sentinel;
+    if (!escaped) return .{ .value = mandelbrot.interior_sentinel, .steps = steps };
 
     // The smooth tail runs on the ABSOLUTE value, in `f64`, through the one shared definition
     // of the colouring convention. `|z| > 2` here, so the pixel's `c` may be taken as
     // `Z_1 (= C, rounded to f64) + δc`: the ~1e-16 it drops cannot move a double-log of a
     // value that is about to be squared twice, and this is what keeps the deep path's values
     // comparable to `mandelbrot.iterate`'s at the threshold.
-    return mandelbrot.smoothEscapeValue(
-        f64,
-        z_re,
-        z_im,
-        orbit.re[1] + dc_re,
-        orbit.im[1] + dc_im,
-        n,
-    );
+    return .{
+        .value = mandelbrot.smoothEscapeValue(
+            f64,
+            z_re,
+            z_im,
+            orbit.re[1] + dc_re,
+            orbit.im[1] + dc_im,
+            n,
+        ),
+        .steps = steps,
+    };
 }
 
 const fallback_prefix = "GPU deep-zoom path skipped: ";
@@ -486,6 +521,56 @@ test "an orbit shorter than max_iter still classifies its neighbourhood correctl
             }
         }
     }
+}
+
+test "iterateDeltaCounted's value is byte-identical to iterateDelta over a deep grid" {
+    // The frozen-behaviour guard: refactoring `iterateDelta` into a counted core must not
+    // move a single bit of its result. Compared as raw bit patterns (not `expectEqual`) so a
+    // NaN would still be caught, though the deep path only ever yields finite-or-sentinel.
+    const max_iter: u32 = 4096;
+    var orbit = try ReferenceOrbit.compute(testing.allocator, deep_center, max_iter);
+    defer orbit.deinit(testing.allocator);
+
+    const side: f64 = 1.0e-25;
+    const n: usize = 8;
+    const n_f: f64 = @floatFromInt(n);
+    const scale = side / n_f;
+    for (0..n) |row| {
+        for (0..n) |col| {
+            const dc_re = (@as(f64, @floatFromInt(col)) + 0.5 - n_f / 2.0) * scale;
+            const dc_im = (n_f / 2.0 - @as(f64, @floatFromInt(row)) - 0.5) * scale;
+            const plain = iterateDelta(orbit, dc_re, dc_im, max_iter);
+            const counted = iterateDeltaCounted(orbit, dc_re, dc_im, max_iter);
+            try testing.expectEqual(
+                @as(u32, @bitCast(plain)),
+                @as(u32, @bitCast(counted.value)),
+            );
+        }
+    }
+}
+
+test "iterateDeltaCounted counts more than zero steps for an escaping pixel" {
+    // The escaping neighbour from the rebasing test: it escapes at ~2291 iterations, so it
+    // does real work and its step count must be positive (the sanity floor AT1 relies on).
+    const max_iter: u32 = 4096;
+    var orbit = try ReferenceOrbit.compute(testing.allocator, deep_center, max_iter);
+    defer orbit.deinit(testing.allocator);
+
+    const result = iterateDeltaCounted(orbit, -3.125e-8, 2.8125e-7, max_iter);
+    try testing.expect(result.value != mandelbrot.interior_sentinel); // it escaped
+    try testing.expect(result.steps > 0);
+}
+
+test "iterateDeltaCounted spends the full budget on a deep interior pixel" {
+    // A pixel that never escapes runs the whole `max_iter` budget, so its elementary-step
+    // tally is at least the cap (never fewer — every loop trip costs one perturbation step).
+    const max_iter: u32 = 2048;
+    var orbit = try ReferenceOrbit.compute(testing.allocator, deep_center, max_iter);
+    defer orbit.deinit(testing.allocator);
+
+    const result = iterateDeltaCounted(orbit, 0.0, 0.0, max_iter);
+    try testing.expectEqual(mandelbrot.interior_sentinel, result.value);
+    try testing.expect(result.steps >= max_iter);
 }
 
 test "compute on a centre that escapes at once records a two-entry orbit" {
