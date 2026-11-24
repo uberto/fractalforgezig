@@ -137,20 +137,66 @@ kernel void mandelbrot_iterate(
 // This is `fractal/perturb.zig: iterateDelta` transliterated: same rebasing rule, same escape
 // test on the FULL value, same colouring tail. Where it must differ it is called out inline —
 // keep the two in step, and prefer changing this file to diverging from the CPU definition.
-kernel void mandelbrot_iterate_deep(
-    constant MandelbrotDeepUniforms&  u        [[ buffer(0) ]],
-    const device float2*              orbit    [[ buffer(1) ]],
-    device float*                     iter_out [[ buffer(2) ]],
-    uint                              gid      [[ thread_position_in_grid ]]
-) {
-    uint total = u.width * u.band_rows;
-    if (gid >= total) return;
+// Match compute.zig's 48-byte GpuBlaBlock; keep the fields scalar.
+struct GpuBlaBlock {
+    float a_re;
+    float a_im;
+    float q_re;
+    float q_im;
+    float b_re;
+    float b_im;
+    float r;
+    float cubic;
+    float mixed;
+    float parameter_squared;
+    float delta_roundoff;
+    float parameter_roundoff;
+};
 
+#define BLA_ROUNDOFF (8.0f * FLT_EPSILON)
+
+// At the supported precision floor even normal deltas have subnormal squares.
+// Scale the norm and evaluate the polynomial with large coefficients first.
+static float bla_norm(float2 z) {
+    float largest = max(abs(z.x), abs(z.y));
+    float smallest = min(abs(z.x), abs(z.y));
+    if (largest == 0.0f) return 0.0f;
+    float ratio = smallest / largest;
+    return largest * sqrt(1.0f + ratio * ratio);
+}
+
+static float2 complex_mul(float2 x, float2 y) {
+    return float2(x.x * y.x - x.y * y.y, x.x * y.y + x.y * y.x);
+}
+
+static bool bla_smooth_escape_certified(float endpoint, float uncertainty, float parameter) {
+    if (uncertainty > 0.125f || parameter > 2.0f) return false;
+    float lower = (endpoint - uncertainty) * (1.0f - BLA_ROUNDOFF);
+    if (!(lower > 1.0f)) return false;
+    float relative_error = uncertainty / lower;
+    for (uint e = 0; e < EXTRA_ITERATIONS; e++) {
+        float squared = lower * lower;
+        lower = (squared - parameter) * (1.0f - BLA_ROUNDOFF);
+        if (!(lower > 1.0f)) return false;
+        relative_error *= (2.0f * squared / lower) * (1.0f + BLA_ROUNDOFF);
+    }
+    return relative_error * (1.0f + BLA_ROUNDOFF) / (log(2.0f) * log(lower)) < 0.5f;
+}
+
+// The caller restarts with the plain perturbation kernel's arithmetic if the uncertainty
+// envelope cannot resolve a rebase, escape or smooth value after a skip.
+template<bool accelerated>
+static float deep_pixel(
+    constant MandelbrotDeepUniforms& u,
+    const device float2* orbit,
+    const device GpuBlaBlock* table,
+    uint gid,
+    thread bool& replay
+) {
     // An orbit of only `Z_0 = 0` carries no `Z_1 = C`: nothing to iterate against, and no way
     // to recover the centre. Answer like an exhausted budget instead of reading past the end.
     if (u.orbit_len < 2) {
-        iter_out[gid] = INTERIOR_SENTINEL;
-        return;
+        return INTERIOR_SENTINEL;
     }
 
     uint col = gid % u.width;
@@ -173,6 +219,16 @@ kernel void mandelbrot_iterate_deep(
     bool escaped  = false;
     uint escape_n = 0;
 
+    float uncertainty = 0.0f;
+    float dc = 0.0f;
+    bool can_skip = false;
+    if (accelerated) {
+        dc = bla_norm(float2(dc_re, dc_im)) * (1.0f + BLA_ROUNDOFF);
+        // The first storage entry is the header. A valid nonempty tree has the
+        // expected total number of blocks for this orbit, checked by the uploader.
+        can_skip = table[0].r > 0.0f && dc <= table[0].r;
+    }
+
     while (n < u.max_iter) {
         // Rebasing (Zhuoran): re-anchor on Z_0 when the delta has grown to dominate the value
         // it corrects, or when the orbit has no next entry. EXACT, because Z_0 = 0.
@@ -186,13 +242,83 @@ kernel void mandelbrot_iterate_deep(
         // this stays a transliteration of `perturb.iterateDelta`, which is the one definition of
         // the rule. Do not "fix" the underflow without re-measuring.
         float d_mag_squared = d_re * d_re + d_im * d_im;
+        if (accelerated && uncertainty > 0.0f && m > 0 && m + 1 < u.orbit_len) {
+            float2 ref = orbit[m];
+            float z_abs = bla_norm(float2(z_re, z_im));
+            float rebase_margin = abs(dot(ref, ref + 2.0f * float2(d_re, d_im)));
+            // The existing GPU rule compares rounded squares. If neither
+            // component can change on addition of this anchor, both rounded
+            // sides are equal for the entire interval and the rule never rebases.
+            float2 min_delta = max(abs(float2(d_re, d_im)) - uncertainty, 0.0f);
+            bool anchor_rounds_away = all((ref == 0.0f) |
+                (abs(ref) < (0.25f * FLT_EPSILON) * min_delta));
+            if (!anchor_rounds_away &&
+                rebase_margin <= 2.0f * bla_norm(ref) * uncertainty +
+                BLA_ROUNDOFF * (z_abs * z_abs + d_mag_squared)) {
+                replay = true;
+                return INTERIOR_SENTINEL;
+            }
+        }
         if (z_re * z_re + z_im * z_im < d_mag_squared || m + 1 >= u.orbit_len) {
+            if (accelerated && uncertainty > 0.0f)
+                uncertainty += BLA_ROUNDOFF * bla_norm(float2(z_re, z_im));
             d_re = z_re;
             d_im = z_im;
             m = 0;
         }
 
         float2 ref = orbit[m];
+        if (accelerated && can_skip) {
+            float2 delta = float2(d_re, d_im);
+            float d = bla_norm(delta);
+            float input_bound = (d + uncertainty) * (1.0f + BLA_ROUNDOFF);
+            uint level_start = 1;
+            uint level_count = u.orbit_len - 1;
+            uint best_index = 0;
+            uint best_len = 1;
+            for (uint len = 1, index = m; level_count != 0;
+                 len <<= 1, index >>= 1) {
+                if (index >= level_count || len > u.max_iter - n) break;
+                const device GpuBlaBlock& candidate = table[level_start + index];
+                if (!(candidate.r > 0.0f && input_bound <= candidate.r)) break;
+                best_index = level_start + index;
+                best_len = len;
+                if ((index & 1) != 0) break;
+                level_start += level_count;
+                level_count >>= 1;
+            }
+            if (best_len > 1) {
+                const device GpuBlaBlock& block = table[best_index];
+                float2 a = float2(block.a_re, block.a_im);
+                float2 q = float2(block.q_re, block.q_im);
+                float2 b = float2(block.b_re, block.b_im);
+                float2 next_delta = complex_mul(a, delta) +
+                    complex_mul(complex_mul(q, delta), delta) + complex_mul(b, float2(dc_re, dc_im));
+                float2 next_z = orbit[m + best_len] + next_delta;
+                float a_abs = bla_norm(a), q_abs = bla_norm(q), b_abs = bla_norm(b);
+                float residual = ((block.cubic * input_bound * input_bound +
+                    block.mixed * dc + block.delta_roundoff) * input_bound +
+                    (block.parameter_squared * dc + block.parameter_roundoff) * dc) *
+                    (1.0f + BLA_ROUNDOFF);
+                float next_uncertainty = uncertainty * (a_abs + q_abs * (2.0f * d + uncertainty)) +
+                    residual + BLA_ROUNDOFF * (a_abs * d + q_abs * d * d + b_abs * dc);
+                if (bla_norm(next_z) + next_uncertainty <= 2.0f * (1.0f - BLA_ROUNDOFF)) {
+                    uncertainty = next_uncertainty;
+                    d_re = next_delta.x;
+                    d_im = next_delta.y;
+                    m += best_len;
+                    n += best_len;
+                    z_re = next_z.x;
+                    z_im = next_z.y;
+                    continue;
+                }
+            }
+            if (uncertainty > 0.0f) {
+                uncertainty = uncertainty * (2.0f * bla_norm(ref + delta) + uncertainty) +
+                    BLA_ROUNDOFF * (2.0f * bla_norm(ref) * input_bound +
+                    input_bound * input_bound + dc);
+            }
+        }
         float next_d_re = 2.0f * (ref.x * d_re - ref.y * d_im) +
             (d_re * d_re - d_im * d_im) + dc_re;
         float next_d_im = 2.0f * (ref.x * d_im + ref.y * d_re) +
@@ -207,7 +333,21 @@ kernel void mandelbrot_iterate_deep(
         float2 anchor = orbit[m];
         z_re = anchor.x + d_re;
         z_im = anchor.y + d_im;
+        float endpoint = 0.0f;
+        if (accelerated && uncertainty > 0.0f) {
+            endpoint = bla_norm(float2(z_re, z_im));
+            if (abs(endpoint - 2.0f) <= uncertainty + BLA_ROUNDOFF * endpoint) {
+                replay = true;
+                return INTERIOR_SENTINEL;
+            }
+        }
         if (z_re * z_re + z_im * z_im > BAIL_RADIUS_SQUARED) {
+            if (accelerated && uncertainty > 0.0f && !bla_smooth_escape_certified(
+                endpoint, uncertainty + BLA_ROUNDOFF * endpoint,
+                bla_norm(orbit[1] + float2(dc_re, dc_im)) * (1.0f + BLA_ROUNDOFF))) {
+                replay = true;
+                return INTERIOR_SENTINEL;
+            }
             escaped  = true;
             escape_n = n;
             break;
@@ -215,8 +355,7 @@ kernel void mandelbrot_iterate_deep(
     }
 
     if (!escaped) {
-        iter_out[gid] = INTERIOR_SENTINEL;
-        return;
+        return INTERIOR_SENTINEL;
     }
 
     // The colouring tail runs on the ABSOLUTE value. |z| > 2 here, so the pixel's `c` may be
@@ -242,5 +381,29 @@ kernel void mandelbrot_iterate_deep(
         smooth_val = float(escape_n);
     }
 
-    iter_out[gid] = smooth_val;
+    return smooth_val;
+}
+
+kernel void mandelbrot_iterate_deep(
+    constant MandelbrotDeepUniforms& u        [[ buffer(0) ]],
+    const device float2*             orbit    [[ buffer(1) ]],
+    device float*                    iter_out [[ buffer(2) ]],
+    uint                             gid      [[ thread_position_in_grid ]]
+) {
+    if (gid >= u.width * u.band_rows) return;
+    bool replay = false;
+    iter_out[gid] = deep_pixel<false>(u, orbit, nullptr, gid, replay);
+}
+
+kernel void mandelbrot_iterate_deep_bla(
+    constant MandelbrotDeepUniforms& u        [[ buffer(0) ]],
+    const device float2*             orbit    [[ buffer(1) ]],
+    const device GpuBlaBlock*        table    [[ buffer(2) ]],
+    device float*                    iter_out [[ buffer(3) ]],
+    uint                             gid      [[ thread_position_in_grid ]]
+) {
+    if (gid >= u.width * u.band_rows) return;
+    bool replay = false;
+    float value = deep_pixel<true>(u, orbit, table, gid, replay);
+    iter_out[gid] = replay ? deep_pixel<false>(u, orbit, nullptr, gid, replay) : value;
 }

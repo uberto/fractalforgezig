@@ -6,6 +6,7 @@
 //! it. The pure tier (`src/root.zig`) stays C-free and must not import this.
 const std = @import("std");
 const c = @import("c.zig").c;
+const bla = @import("fractal/bla.zig");
 
 test {
     _ = @import("gpu/texture.zig");
@@ -712,4 +713,99 @@ test "compute: GPU deep zoom at 1e-20 matches the CPU deep path" {
     try std.testing.expect(exterior > 0);
     const mean_abs_err = sum_abs_err / @as(f64, @floatFromInt(exterior));
     try std.testing.expect(mean_abs_err < 60.0);
+}
+
+test "compute: the accelerated deep kernel agrees with the CPU accelerated path at 1e-20" {
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    const pipeline = try compute.ComputePipeline.create(device);
+    defer pipeline.destroy();
+
+    const max_iter: u32 = 20000;
+    const view = try viewport.SquareView.fromCenterSide(deep_center, 1.0e-20);
+
+    var orbit = try perturb.ReferenceOrbit.compute(std.testing.allocator, view.center(), max_iter);
+    defer orbit.deinit(std.testing.allocator);
+
+    var table = try bla.BlaTable.build(std.testing.allocator, &orbit, view.side * @sqrt(0.5));
+    defer table.deinit(std.testing.allocator);
+
+    app.installComputePipeline(pipeline);
+    defer app.installComputePipeline(null);
+
+    var gpu_buf: [16 * 16]f32 = undefined;
+    var cpu_buf: [16 * 16]f32 = undefined;
+    // Drive the live callback over nonzero-offset bands against the full-image CPU oracle.
+    try app.gpuBlaIterFn(view, 16, 16, max_iter, 0, 5, gpu_buf[0 .. 5 * 16], &orbit, &table);
+    try app.gpuBlaIterFn(view, 16, 16, max_iter, 5, 11, gpu_buf[5 * 16 ..], &orbit, &table);
+    try iterbuf.iterateDeepBandBlaInto(&cpu_buf, view.rectViewport(16, 16), max_iter, 0, 16, &orbit, &table);
+
+    const per_pixel_tol: f64 = 0.01 * @as(f64, @floatFromInt(max_iter)); // 200 iterations
+    var class_mismatches: u32 = 0;
+    var over_tol: u32 = 0;
+    var exterior: u32 = 0;
+    var sum_abs_err: f64 = 0;
+    var worst: f64 = 0;
+    for (gpu_buf, cpu_buf) |g, cpu| {
+        const cpu_interior = cpu == mandelbrot_mod.interior_sentinel;
+        const gpu_interior = g == mandelbrot_mod.interior_sentinel;
+        if (cpu_interior != gpu_interior) {
+            class_mismatches += 1;
+            continue;
+        }
+        if (!cpu_interior) {
+            const delta = @abs(@as(f64, cpu) - @as(f64, g));
+            if (delta > worst) worst = delta;
+            if (delta > per_pixel_tol) over_tol += 1;
+            sum_abs_err += delta;
+            exterior += 1;
+        }
+    }
+    // NaN when nothing escaped, which the `exterior > 0` assertion below reports properly (and
+    // `NaN < 60.0` is false, so a vacuous tile cannot pass the mean check either way).
+    const mean_abs_err = sum_abs_err / @as(f64, @floatFromInt(exterior));
+    // Silent when green, and the numbers when red: `expect` prints no values, and this suite logs
+    // nothing at `info` under the test runner. `worst` rides along as a DIAGNOSTIC only.
+    errdefer std.log.warn(
+        "BLA agreement at 1e-20 FAILED: exterior={d}/256 class_mismatches={d} over_tol={d} mean={d:.4} worst={d:.2}",
+        .{ exterior, class_mismatches, over_tol, mean_abs_err, worst },
+    );
+    try std.testing.expect(class_mismatches <= 2);
+    try std.testing.expect(over_tol <= 16);
+    try std.testing.expect(exterior > 0);
+    try std.testing.expect(mean_abs_err < 60.0);
+}
+
+test "compute: the BLA table storage stride matches Metal" {
+    try expectMslLayoutMatches(compute.GpuBlaBlock, "GpuBlaBlock");
+}
+
+test "compute: the quadratic kernel finishes a stable deep pixel with skips" {
+    const alloc = std.testing.allocator;
+    // Substitute a work-count return into the same shader the app loads. Plain replay
+    // retains its sentinel, so merely dispatching the BLA pipeline cannot pass this test.
+    const counted = try std.mem.replaceOwned(u8, alloc, std.mem.span(compute.msl_source), "    float uncertainty = 0.0f;", "    uint saved_steps = 0;\n    float uncertainty = 0.0f;");
+    defer alloc.free(counted);
+    const with_skips = try std.mem.replaceOwned(u8, alloc, counted, "                    n += best_len;", "                    n += best_len;\n                    saved_steps += best_len - 1;");
+    defer alloc.free(with_skips);
+    const with_result = try std.mem.replaceOwned(u8, alloc, with_skips, "    if (!escaped) {\n        return INTERIOR_SENTINEL;", "    if (accelerated) return float(saved_steps);\n    if (!escaped) {\n        return INTERIOR_SENTINEL;");
+    defer alloc.free(with_result);
+    const source = try alloc.dupeZ(u8, with_result);
+    defer alloc.free(source);
+
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    const pipeline = try compute.ComputePipeline.createFromSource(device, source);
+    defer pipeline.destroy();
+
+    const max_iter = 4096;
+    const view = try viewport.SquareView.fromCenterSide(.{ .re = -0.1, .im = 0 }, 1.0e-20);
+    var orbit = try perturb.ReferenceOrbit.compute(alloc, view.center(), max_iter);
+    defer orbit.deinit(alloc);
+    var table = try bla.BlaTable.build(alloc, &orbit, view.side * @sqrt(0.5));
+    defer table.deinit(alloc);
+
+    var band: [2]f32 = undefined;
+    try compute.gpuIterateDeepBlaRows(pipeline, view, &orbit, &table, 2, 2, max_iter, 0, 1, &band);
+    for (band) |saved| try std.testing.expect(saved > max_iter / 2);
 }

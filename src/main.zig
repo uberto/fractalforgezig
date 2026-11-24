@@ -25,6 +25,7 @@ const editor_mod = @import("ui/editor.zig");
 const gesture = @import("ui/gesture.zig");
 const panels = @import("ui/panels.zig");
 const refine = @import("fractal/refine.zig");
+const bla = @import("fractal/bla.zig");
 const perturb = @import("fractal/perturb.zig");
 const persist = @import("fractal/persist.zig");
 const scheme = @import("fractal/scheme.zig");
@@ -71,6 +72,22 @@ pub fn gpuIterFn(
     } else {
         try compute_mod.gpuIterateRows(pl, view, w, h, max_iter, y0, rows, iter_band);
     }
+}
+
+/// Accelerated deep callback, sharing the installed device pipeline with gpuIterFn.
+pub fn gpuBlaIterFn(
+    view: viewport.SquareView,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
+    orbit: *const perturb.ReferenceOrbit,
+    table: *const bla.BlaTable,
+) anyerror!void {
+    const pl = g_compute_pipeline orelse return error.GpuPipelineNotReady;
+    try compute_mod.gpuIterateDeepBlaRows(pl, view, orbit, table, w, h, max_iter, y0, rows, iter_band);
 }
 
 const window_title = "fractalforge";
@@ -187,6 +204,7 @@ pub fn main() !void {
     // Wire GPU iteration function if the pipeline is available (M4).
     if (g_compute_pipeline != null) {
         engine.gpu_iter_fn = gpuIterFn;
+        engine.gpu_bla_iter_fn = gpuBlaIterFn;
     }
 
     var iterate_timer = std.time.Timer.start() catch null;

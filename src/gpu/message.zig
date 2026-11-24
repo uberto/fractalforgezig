@@ -37,8 +37,16 @@ pub fn gpuDeepIterateSummary(
     rows: u32,
     max_iter: u32,
     orbit_len: usize,
+    bla_blocks: ?usize,
     elapsed_ms: f64,
 ) ![]u8 {
+    if (bla_blocks) |blocks| {
+        return std.fmt.bufPrint(
+            buf,
+            "gpu deep BLA iterate: {d}x{d} rows {d}..{d}, max_iter={d}, orbit={d}, table={d} blocks, {d:.2} ms",
+            .{ width, height, y0, y0 + rows, max_iter, orbit_len, blocks, elapsed_ms },
+        );
+    }
     return std.fmt.bufPrint(
         buf,
         "gpu deep iterate: {d}x{d} rows {d}..{d}, max_iter={d}, orbit={d}, {d:.2} ms",
@@ -66,9 +74,18 @@ test "gpuIterateSummary formats side, max_iter, and elapsed ms" {
 
 test "gpuDeepIterateSummary names the deep path, the band, the orbit and the time" {
     var buf: [128]u8 = undefined;
-    const msg = try gpuDeepIterateSummary(&buf, 16, 16, 0, 16, 20000, 20001, 3.45);
+    const msg = try gpuDeepIterateSummary(&buf, 16, 16, 0, 16, 20000, 20001, null, 3.45);
     try std.testing.expectEqualStrings(
         "gpu deep iterate: 16x16 rows 0..16, max_iter=20000, orbit=20001, 3.45 ms",
+        msg,
+    );
+}
+
+test "gpuDeepIterateSummary identifies an accelerated Metal dispatch and table size" {
+    var buf: [160]u8 = undefined;
+    const msg = try gpuDeepIterateSummary(&buf, 16, 16, 5, 11, 20000, 20001, 39995, 3.45);
+    try std.testing.expectEqualStrings(
+        "gpu deep BLA iterate: 16x16 rows 5..16, max_iter=20000, orbit=20001, table=39995 blocks, 3.45 ms",
         msg,
     );
 }

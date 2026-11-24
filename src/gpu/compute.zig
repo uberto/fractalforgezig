@@ -25,6 +25,7 @@ const c = @import("../c.zig").c;
 const message = @import("message.zig");
 const viewport = @import("../fractal/viewport.zig");
 const perturb = @import("../fractal/perturb.zig");
+const bla = @import("../fractal/bla.zig");
 const engine = @import("../fractal/engine.zig");
 
 const log = std.log.scoped(.gpu);
@@ -93,20 +94,17 @@ pub const Error = error{
     /// The reference orbit is longer than `perturb.gpu_max_orbit_len`, i.e. too large to upload
     /// per dispatch. Also refused, for the same reason.
     OrbitTooLongForGpu,
+    BlaTableTooLongForGpu,
+    BlaTableOrbitSizeMismatch,
 };
 
-/// The compiled Metal compute pipelines: `mandelbrot_iterate` (shallow) and
-/// `mandelbrot_iterate_deep` (perturbation). Both are built from the one embedded MSL source,
-/// because a device that can run one can run the other and a half-initialised GPU path is worse
-/// than none: `create` succeeds with both or releases what it made and fails.
-///
-/// Copied BY VALUE everywhere (it is two pointers and a device); nothing mutates it after
-/// `create`, so no function here takes a mutable receiver. Call `create` once per device;
-/// `destroy` once during teardown, which releases both.
+/// Immutable Metal compute pipelines for shallow, deep and accelerated deep iteration.
+/// Create once per device, then release all handles once during teardown.
 pub const ComputePipeline = struct {
     handle: *c.SDL_GPUComputePipeline,
     /// The deep sibling of `handle`; used only by `dispatchDeep`.
     deep_handle: *c.SDL_GPUComputePipeline,
+    bla_handle: *c.SDL_GPUComputePipeline,
     device: *c.SDL_GPUDevice,
 
     /// Compile the embedded MSL source via SDL_GPU's Metal backend and return
@@ -170,13 +168,23 @@ pub const ComputePipeline = struct {
             return Error.ShaderCompilationFailed;
         };
 
-        return .{ .handle = handle, .deep_handle = deep_handle, .device = device };
+        var bla_info = deep_info;
+        bla_info.entrypoint = "mandelbrot_iterate_deep_bla";
+        bla_info.num_readonly_storage_buffers = 2;
+        const bla_handle = c.SDL_CreateGPUComputePipeline(device, &bla_info) orelse {
+            logSdlFailure("SDL_CreateGPUComputePipeline (BLA)");
+            c.SDL_ReleaseGPUComputePipeline(device, deep_handle);
+            c.SDL_ReleaseGPUComputePipeline(device, handle);
+            return Error.ShaderCompilationFailed;
+        };
+        return .{ .handle = handle, .deep_handle = deep_handle, .bla_handle = bla_handle, .device = device };
     }
 
-    /// Release both pipelines. Call exactly once during teardown.
+    /// Release all pipelines. Call exactly once during teardown.
     pub fn destroy(self: ComputePipeline) void {
         c.SDL_ReleaseGPUComputePipeline(self.device, self.handle);
         c.SDL_ReleaseGPUComputePipeline(self.device, self.deep_handle);
+        c.SDL_ReleaseGPUComputePipeline(self.device, self.bla_handle);
     }
 };
 
@@ -370,20 +378,71 @@ pub fn gpuIterate(
     try gpuIterateRows(pipeline, view, w, h, max_iter, 0, h, iter);
 }
 
-/// Run the DEEP (perturbation) compute shader for ONE BAND and download the results into
-/// `iter_out`, whose length must equal `uniforms.width * uniforms.band_rows` — the band alone,
-/// indexed from 0, exactly like `dispatch`.
-///
-/// The reference orbit is uploaded to a read-only storage buffer ON EVERY DISPATCH. That is the
-/// design, not a shortcut: the engine builds one orbit per render and frees it at every
-/// boundary, so there is no lifetime a GPU-side cache could safely key on, and the pipeline
-/// stays an immutable value that can be copied. The cost is bounded by
-/// `perturb.gpu_max_orbit_len` (2^17 entries = 1 MiB as `float2`, ~0.1 ms over PCIe-class
-/// bandwidth) against a dispatch that runs for tens of milliseconds.
+/// Storage ABI shared with Metal. Fields are scalar so both sides use a 48-byte stride.
+pub const GpuBlaBlock = extern struct {
+    a_re: f32 = 0,
+    a_im: f32 = 0,
+    q_re: f32 = 0,
+    q_im: f32 = 0,
+    b_re: f32 = 0,
+    b_im: f32 = 0,
+    r: f32 = 0,
+    cubic: f32 = 0,
+    mixed: f32 = 0,
+    parameter_squared: f32 = 0,
+    delta_roundoff: f32 = 0,
+    parameter_roundoff: f32 = 0,
+};
+
+fn packBlaTable(table: *const bla.BlaTable, dst: []GpuBlaBlock) void {
+    // Entry zero carries the parameter domain. Remaining entries are flattened low-to-high
+    // by level, so the shader can derive every index from the orbit length.
+    // Lift the propagated CPU roundoff terms to the shader precision.
+    const roundoff_ratio = @as(f64, std.math.floatEps(f32)) / std.math.floatEps(f64);
+    const margin = 1 - 8 * @as(f64, std.math.floatEps(f32));
+    dst[0] = .{ .r = if (dst.len > 1) @floatCast(table.max_dc * margin) else 0 };
+    var index: usize = 1;
+    for (table.levels) |level| {
+        for (level) |block| {
+            var packed_block = GpuBlaBlock{
+                .a_re = @floatCast(block.a_re),
+                .a_im = @floatCast(block.a_im),
+                .q_re = @floatCast(block.q_re),
+                .q_im = @floatCast(block.q_im),
+                .b_re = @floatCast(block.b_re),
+                .b_im = @floatCast(block.b_im),
+                .r = @floatCast(block.r * margin),
+                .cubic = @floatCast(block.remainder.cubic),
+                .mixed = @floatCast(block.remainder.mixed),
+                .parameter_squared = @floatCast(block.remainder.parameter_squared),
+                .delta_roundoff = @floatCast(block.remainder.delta_roundoff * roundoff_ratio),
+                .parameter_roundoff = @floatCast(block.remainder.parameter_roundoff * roundoff_ratio),
+            };
+            inline for (@typeInfo(GpuBlaBlock).@"struct".fields) |field| {
+                if (!std.math.isFinite(@field(packed_block, field.name))) packed_block = .{};
+            }
+            dst[index] = packed_block;
+            index += 1;
+        }
+    }
+    std.debug.assert(index == dst.len);
+}
+
+/// Upload the orbit, run the deep perturbation kernel for one row band, then read it back.
 pub fn dispatchDeep(
     pipeline: ComputePipeline,
     uniforms: MandelbrotDeepUniforms,
     orbit: *const perturb.ReferenceOrbit,
+    iter_out: []f32,
+) Error!void {
+    return dispatchDeepWithTable(pipeline, uniforms, orbit, null, iter_out);
+}
+
+fn dispatchDeepWithTable(
+    pipeline: ComputePipeline,
+    uniforms: MandelbrotDeepUniforms,
+    orbit: *const perturb.ReferenceOrbit,
+    table: ?*const bla.BlaTable,
     iter_out: []f32,
 ) Error!void {
     if (uniforms.row_offset + uniforms.band_rows > uniforms.height) {
@@ -442,6 +501,37 @@ pub fn dispatchDeep(
     };
     defer c.SDL_ReleaseGPUTransferBuffer(device, orbit_transfer);
 
+    const table_entries = if (table) |t| t.len() + 1 else 0;
+    const table_bytes: u32 = @intCast(table_entries * @sizeOf(GpuBlaBlock));
+    const table_buf = if (table == null) null else c.SDL_CreateGPUBuffer(device, &.{
+        .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ,
+        .size = table_bytes,
+        .props = 0,
+    }) orelse {
+        logSdlFailure("SDL_CreateGPUBuffer (BLA table)");
+        return Error.GpuBufferCreationFailed;
+    };
+    defer if (table_buf) |buf| c.SDL_ReleaseGPUBuffer(device, buf);
+
+    const table_transfer = if (table == null) null else c.SDL_CreateGPUTransferBuffer(device, &.{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = table_bytes,
+        .props = 0,
+    }) orelse {
+        logSdlFailure("SDL_CreateGPUTransferBuffer (BLA table)");
+        return Error.GpuTransferBufferCreationFailed;
+    };
+    defer if (table_transfer) |buf| c.SDL_ReleaseGPUTransferBuffer(device, buf);
+    if (table_transfer) |upload| {
+        const mapped = c.SDL_MapGPUTransferBuffer(device, upload, false) orelse {
+            logSdlFailure("SDL_MapGPUTransferBuffer (BLA table)");
+            return Error.GpuTransferBufferMapFailed;
+        };
+        const dst: [*]GpuBlaBlock = @ptrCast(@alignCast(mapped));
+        packBlaTable(table.?, dst[0..table_entries]);
+        c.SDL_UnmapGPUTransferBuffer(device, upload);
+    }
+
     // Transfer buffer for downloading the result to CPU.
     const transfer = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
         .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
@@ -478,7 +568,7 @@ pub fn dispatchDeep(
         return Error.GpuCommandBufferFailed;
     };
 
-    // --- Upload pass: orbit transfer buffer → orbit storage buffer ---
+    // --- Upload pass: transfer buffers → read-only orbit and optional BLA table ---
     // In the SAME command buffer as the compute pass below, and before it, so the upload is
     // ordered ahead of the dispatch that reads it without a second fence.
     {
@@ -497,6 +587,14 @@ pub fn dispatchDeep(
             .size = orbit_bytes,
         };
         c.SDL_UploadToGPUBuffer(upload_pass, &src_location, &dst_region, false);
+        if (table_transfer) |upload| {
+            c.SDL_UploadToGPUBuffer(
+                upload_pass,
+                &.{ .transfer_buffer = upload, .offset = 0 },
+                &.{ .buffer = table_buf.?, .offset = 0, .size = table_bytes },
+                false,
+            );
+        }
         c.SDL_EndGPUCopyPass(upload_pass);
     }
 
@@ -511,12 +609,12 @@ pub fn dispatchDeep(
         return Error.GpuCommandBufferFailed;
     };
 
-    c.SDL_BindGPUComputePipeline(pass, pipeline.deep_handle);
+    c.SDL_BindGPUComputePipeline(pass, if (table == null) pipeline.deep_handle else pipeline.bla_handle);
 
-    // Read-only storage slot 0 = MSL buffer(1) (the read-write output was bound by
-    // SDL_BeginGPUComputePass and lands at buffer(2), always last).
-    const orbit_ptr: *c.SDL_GPUBuffer = orbit_buf;
-    c.SDL_BindGPUComputeStorageBuffers(pass, 0, &orbit_ptr, 1);
+    // SDL places the writable result after every read-only buffer. Uniform and orbit
+    // remain at MSL slots 0 and 1. Output is at 2 for plain deep and 3 for BLA.
+    const reads = [_]*c.SDL_GPUBuffer{ orbit_buf, table_buf orelse orbit_buf };
+    c.SDL_BindGPUComputeStorageBuffers(pass, 0, &reads, if (table == null) 1 else 2);
 
     // Uniform slot 0 = MSL buffer(0); SDL counts uniform slots separately.
     c.SDL_PushGPUComputeUniformData(cmd, 0, &uniforms, @sizeOf(MandelbrotDeepUniforms));
@@ -527,13 +625,9 @@ pub fn dispatchDeep(
     c.SDL_EndGPUComputePass(pass);
 
     // --- Copy pass: storage buffer → transfer buffer ---
-    const copy_cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse {
-        logSdlFailure("SDL_AcquireGPUCommandBuffer (copy)");
-        return Error.GpuCommandBufferFailed;
-    };
-    const copy_pass = c.SDL_BeginGPUCopyPass(copy_cmd) orelse {
-        logSdlFailure("SDL_BeginGPUCopyPass");
-        _ = c.SDL_CancelGPUCommandBuffer(copy_cmd);
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse {
+        logSdlFailure("SDL_BeginGPUCopyPass (readback)");
+        _ = c.SDL_CancelGPUCommandBuffer(cmd);
         return Error.GpuCommandBufferFailed;
     };
 
@@ -549,12 +643,7 @@ pub fn dispatchDeep(
     c.SDL_DownloadFromGPUBuffer(copy_pass, &src_region, &dst_location);
     c.SDL_EndGPUCopyPass(copy_pass);
 
-    if (!c.SDL_SubmitGPUCommandBuffer(cmd)) {
-        logSdlFailure("SDL_SubmitGPUCommandBuffer (compute)");
-        return Error.GpuFenceSubmitFailed;
-    }
-
-    const fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(copy_cmd) orelse {
+    const fence = c.SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) orelse {
         logSdlFailure("SDL_SubmitGPUCommandBufferAndAcquireFence");
         return Error.GpuFenceSubmitFailed;
     };
@@ -584,6 +673,7 @@ pub fn dispatchDeep(
             uniforms.band_rows,
             uniforms.max_iter,
             orbit_len,
+            if (table != null) table_entries - 1 else null,
             elapsed_ms,
         ) catch return;
         log.info("{s}", .{msg});
@@ -602,6 +692,58 @@ pub fn gpuIterateDeepRows(
     pipeline: ComputePipeline,
     view: viewport.SquareView,
     orbit: *const perturb.ReferenceOrbit,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
+) Error!void {
+    return gpuIterateDeepRowsWithTable(pipeline, view, orbit, null, w, h, max_iter, y0, rows, iter_band);
+}
+
+/// Accelerated sibling of gpuIterateDeepRows, using this render's CPU-built BLA table.
+pub fn gpuIterateDeepBlaRows(
+    pipeline: ComputePipeline,
+    view: viewport.SquareView,
+    orbit: *const perturb.ReferenceOrbit,
+    table: *const bla.BlaTable,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
+) Error!void {
+    const blocks = table.len();
+    if (blocks > bla.gpu_max_table_len) {
+        emitErr("gpuIterateDeepBlaRows: table of {d} blocks exceeds the GPU budget of {d}; use CPU", .{
+            blocks, bla.gpu_max_table_len,
+        });
+        return Error.BlaTableTooLongForGpu;
+    }
+    if (blocks > 0 and !tableMatchesOrbit(table, orbit.len())) {
+        emitErr("gpuIterateDeepBlaRows: table dimensions do not match orbit length {d}; rebuild the table", .{orbit.len()});
+        return Error.BlaTableOrbitSizeMismatch;
+    }
+    return gpuIterateDeepRowsWithTable(pipeline, view, orbit, table, w, h, max_iter, y0, rows, iter_band);
+}
+
+// Shader offsets depend on the orbit length. Check each level before uploading.
+fn tableMatchesOrbit(table: *const bla.BlaTable, orbit_len: usize) bool {
+    var expected = orbit_len -| 1;
+    for (table.levels) |level| {
+        if (expected == 0 or level.len != expected) return false;
+        expected /= 2;
+    }
+    return expected == 0;
+}
+
+fn gpuIterateDeepRowsWithTable(
+    pipeline: ComputePipeline,
+    view: viewport.SquareView,
+    orbit: *const perturb.ReferenceOrbit,
+    table: ?*const bla.BlaTable,
     w: u32,
     h: u32,
     max_iter: u32,
@@ -638,7 +780,7 @@ pub fn gpuIterateDeepRows(
         .band_rows = rows,
         .orbit_len = @intCast(orbit.len()),
     };
-    try dispatchDeep(pipeline, uniforms, orbit, iter_band);
+    try dispatchDeepWithTable(pipeline, uniforms, orbit, table, iter_band);
 }
 
 fn logSdlFailure(call: []const u8) void {

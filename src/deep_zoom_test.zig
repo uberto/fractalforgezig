@@ -202,3 +202,42 @@ test "acceptance: BLA renders the same deep view in far fewer steps" {
         try testing.expect(steps_bla <= steps_plain / 3);
     }
 }
+
+test "an accelerated deep view whose table overflows the GPU budget renders on the CPU" {
+    const bla = @import("fractal/bla.zig");
+    const view = try viewport.SquareView.fromCenterSide(.{ .re = -0.1, .im = 0 }, 1.0e-20);
+    var eng = try engine.Engine.init(testing.allocator, view, 1, .{});
+    defer eng.deinit();
+    try eng.installPolicy(.{ .auto = false, .manual_value = @intCast(bla.gpu_max_table_len + 1) });
+    eng.use_bla = true;
+    eng.use_gpu = true;
+    eng.gpu_iter_fn = &countingIterFn;
+    eng.gpu_bla_iter_fn = &countingBlaIterFn;
+
+    gpu_calls = 0;
+    try eng.iterate();
+
+    try testing.expectEqual(@as(u32, 0), gpu_calls);
+    try testing.expectEqual(@as(u32, 1), eng.iteration_passes);
+    try testing.expectEqual(@as(u32, 1), eng.gpu_fallbacks);
+    try testing.expect(eng.last_cpu_deep_steps > 0);
+    try testing.expectEqual(mandelbrot.interior_sentinel, eng.iter[0]);
+    var buf: [bla.fallback_message_buf_len]u8 = undefined;
+    const msg = try bla.gpuFallbackMessage(&buf);
+    try testing.expect(std.mem.indexOf(u8, msg, "CPU") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "table") != null);
+}
+
+fn countingBlaIterFn(
+    view: viewport.SquareView,
+    w: u32,
+    h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    band: []f32,
+    orbit: *const perturb.ReferenceOrbit,
+    _: *const @import("fractal/bla.zig").BlaTable,
+) anyerror!void {
+    return countingIterFn(view, w, h, max_iter, y0, rows, band, orbit);
+}
