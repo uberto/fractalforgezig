@@ -2,11 +2,9 @@
 
 # src/fractal/ context
 
-Keep the core independent of SDL and GPU types. Register pure modules in
-`src/root.zig`. Return typed errors and use `engine.zig` to log render failures.
-Keep iteration separate from colouring. Reuse the `[]f32` iteration buffer on
-palette edits and rerun only `colorpass.colorInto` with the baked gradient LUT
-and mapping parameters.
+Keep the core independent of SDL and GPU. Register tests in `src/root.zig`.
+Return typed errors and log render failures in `engine.zig`. On palette edits,
+reuse the `[]f32` iteration buffer and rerun `colorpass.colorInto`.
 
 ## Geometry and iteration
 
@@ -15,18 +13,16 @@ Use `rectViewport` for render geometry and `fitImageRect` for display and cursor
 mapping. Sample pixel centres. Window y increases down, imaginary y up.
 Use `navigate` for view transforms and `autoiter.IterPolicy` for iteration limits.
 
-Use `mandelbrot.iterate` for direct iteration and `iterateJulia` for fixed-parameter
-Julia iteration. Share `smoothEscapeValue` and use `interior_sentinel` for bounded
-pixels. Reserve `iterateExact` for test comparisons. Use `orbit.compute` for the
-orbit inspector.
+Use `mandelbrot.iterate` and `iterateJulia` for direct iteration. Share
+`smoothEscapeValue` and mark bounded pixels with `interior_sentinel`. Reserve
+`iterateExact` for tests. Use `orbit.compute` for the inspector.
 
 ## Deep rendering
 
 Use `Engine.usesDeepPath` for the depth decision (side ≤ 1e-6).
-Compute the centre orbit once per render with `perturb.ReferenceOrbit.compute`
-in f128 and store its samples in f64. Run CPU pixel deltas in f64.
-Use `perturb.iterateDelta` for plain perturbation. Rebase on orbit exhaustion
-or when the combined point is smaller than the delta.
+Compute the f128 centre orbit once with `perturb.ReferenceOrbit.compute`.
+Store f64 samples and use f64 deltas in `perturb.iterateDelta`. Rebase on orbit
+exhaustion or when the combined point is smaller than the delta.
 
 With `Engine.use_bla`, build one `bla.BlaTable` for the orbit and largest sampled
 parameter delta. Merge quadratic maps while bounding omitted terms and both
@@ -64,3 +60,8 @@ through the pure API. Publish progress and log at the file or application edge.
 Encode each RGBA row to opaque PNG via `png.Encoder.init`, `writeRow` and
 `finish`. Borrow the destination writer through finish and close it before
 publication. Discard temporary output if encoding or writer flush fails.
+
+Use `image_export.save` for directory-relative atomic output. Pass
+`Control.overwrite_basename` only after approval. Pin `image_export.Worker` until
+joined and supply the exact approved path separately. Read `poll` for progress
+or terminal results. Call `cancel` before publication and `shutdown` at app exit.
