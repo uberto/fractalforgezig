@@ -4,18 +4,17 @@
 
 ## Purpose
 
-fractalforge renders the Mandelbrot set (CPU or Metal compute, uploaded as a texture) in a
-native macOS window with a Dear ImGui shell.
+Render Mandelbrot on CPU or Metal in a native macOS Dear ImGui window.
 
 ## Layout map
 
 - `main.zig` — executable entry: one window, SDL_GPU device + ImGui, event loop, clean teardown.
-  Keep it thin: push logic into pure modules. The loop NEVER blocks on a full-res render — input
-  shows a coarse preview, then `engine.stepPass()` refines one self-timed row band per
-  frame; the data panel stays disabled meanwhile.
-- `root.zig` — library/test root. Its top-level `test { ... }` block aggregates PURE submodule
-  tests via `_ = @import("...");` (never C edges). Also hosts small pure helpers
-  (e.g. `startupLine`).
+  Show a coarse preview, then refine one self-timed band per frame with `engine.stepPass()`.
+  Disable the data panel during refinement.
+  Capture PNG dimensions with the current draw rectangle and metadata from the uploaded
+  texture. `ui/export_panel.zig` owns the picker and progress. The worker owns its copied
+  snapshot and path. Keep ImGui and SDL calls on main.
+- `root.zig` — register pure tests and small pure helpers such as `startupLine`.
 - `c.zig` — the `@cImport` C-interop edge: SDL3 + SDL_GPU + the ImGui backend bridge,
   translated once. Only `gpu/`, `ui/`, `main.zig` import it.
 - `cimgui.zig` — hand-written `extern` decls for the Dear ImGui C API (bitfields defeat

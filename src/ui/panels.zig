@@ -89,6 +89,7 @@ pub const CtxAction = enum { none, zoom_in, zoom_out, center_here };
 /// main.zig opens the appropriate SDL dialog after the frame.
 pub const DrawResult = struct {
     ctx_action: CtxAction,
+    export_requested: bool,
     image_rect: viewport.ImageRect,
     render_w: u32 = 0,
     render_h: u32 = 0,
@@ -205,7 +206,6 @@ pub const SwatchGallery = struct {
 /// whole content region. A click on a View item comes back as a `toggle_*` flag in `DrawResult`
 /// for main.zig to apply after the frame; the panel never flips these itself.
 pub fn draw(
-    device: *c.SDL_GPUDevice,
     texture: texture_mod.Texture,
     max_iter: u32,
     s: stats.Stats,
@@ -224,9 +224,12 @@ pub fn draw(
     orbit_open: bool,
     fullscreen: bool,
     quit_requested: *bool,
+    file_dialog_available: bool,
+    export_available: bool,
 ) DrawResult {
     var ctx_action = CtxAction.none;
     var needs_rerender = false;
+    var export_requested = false;
     var save_requested = false;
     var open_requested = false;
     var save_scheme_requested = false;
@@ -245,8 +248,9 @@ pub fn draw(
 
     c.ffImguiFillMainViewport();
     if (ig.igBegin(window_name, null, window_flags)) {
-        const menu = drawMenuBar(quit_requested, julia_open, orbit_open, fullscreen);
+        const menu = drawMenuBar(quit_requested, julia_open, orbit_open, fullscreen, file_dialog_available, export_available);
         if (menu.open_about) ig.igOpenPopup_Str(about_popup, 0);
+        export_requested = menu.export_requested;
         if (menu.save_requested) save_requested = true;
         if (menu.open_requested) open_requested = true;
         if (menu.toggle_julia) toggle_julia = true;
@@ -317,7 +321,7 @@ pub fn draw(
             coord_request.input_mode = drawInputPanel(input_mode);
             ig.igSpacing();
             if (ig.igCollapsingHeader_TreeNodeFlags("Coloring", 0)) {
-                const pal = drawPalettePanel(device, texture, engine, editor, gallery);
+                const pal = drawPalettePanel(engine, editor, gallery, file_dialog_available);
                 if (pal.save_scheme) save_scheme_requested = true;
                 if (pal.load_scheme) load_scheme_requested = true;
             }
@@ -337,6 +341,7 @@ pub fn draw(
         .render_w = region_w,
         .render_h = region_h,
         .needs_rerender = needs_rerender,
+        .export_requested = export_requested,
         .save_requested = save_requested,
         .open_requested = open_requested,
         .save_scheme_requested = save_scheme_requested,
@@ -351,6 +356,7 @@ pub fn draw(
 }
 
 const MenuResult = struct {
+    export_requested: bool = false,
     open_about: bool = false,
     save_requested: bool = false,
     open_requested: bool = false,
@@ -368,12 +374,14 @@ const MenuResult = struct {
 /// Draw the menu bar. Sets `quit_requested.*` on File→Quit. `julia_open` / `orbit_open` /
 /// `fullscreen` are the CURRENT states, passed in as each View item's `selected` arg so the
 /// checkmark reflects live state; a click reports a toggle request for main.zig to apply.
-fn drawMenuBar(quit_requested: *bool, julia_open: bool, orbit_open: bool, fullscreen: bool) MenuResult {
+fn drawMenuBar(quit_requested: *bool, julia_open: bool, orbit_open: bool, fullscreen: bool, file_dialog_available: bool, export_available: bool) MenuResult {
     var result = MenuResult{};
     if (ig.igBeginMenuBar()) {
         if (ig.igBeginMenu("File", true)) {
-            if (ig.igMenuItem_Bool("Save\xe2\x80\xa6", null, false, true)) result.save_requested = true;
-            if (ig.igMenuItem_Bool("Open\xe2\x80\xa6", null, false, true)) result.open_requested = true;
+            if (ig.igMenuItem_Bool("Save\xe2\x80\xa6", null, false, file_dialog_available)) result.save_requested = true;
+            if (ig.igMenuItem_Bool("Open\xe2\x80\xa6", null, false, file_dialog_available)) result.open_requested = true;
+            ig.igSeparator();
+            if (ig.igMenuItem_Bool("Export PNG…", null, false, export_available)) result.export_requested = true;
             ig.igSeparator();
             if (ig.igMenuItem_Bool("Quit", null, false, true)) quit_requested.* = true;
             ig.igEndMenu();
@@ -810,16 +818,15 @@ const PaletteResult = struct {
 };
 
 fn drawPalettePanel(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     gallery: *const SwatchGallery,
+    file_dialog_available: bool,
 ) PaletteResult {
     var result = PaletteResult{};
     var edits = Edits{};
 
-    drawSwatchGallery(device, texture, engine, editor, gallery);
+    drawSwatchGallery(engine, editor, gallery);
 
     ig.igSeparatorText("Palette");
     var i: usize = 0;
@@ -867,12 +874,14 @@ fn drawPalettePanel(
         edits.interior = true;
     }
 
-    if (edits.any()) applyEdits(device, texture, engine, editor, edits);
+    if (edits.any()) applyEdits(engine, editor, edits);
 
     // Save / Load a portable colour scheme (`.fpal`). These only RAISE a request; main.zig opens
     // the OS dialog after the frame and does the file I/O (like File→Save…). They live here,
     // inside the caller's `igBeginDisabled(rendering)` block, so both grey out during a pass.
     ig.igSeparatorText("Scheme");
+    ig.igBeginDisabled(!file_dialog_available);
+    defer ig.igEndDisabled();
     if (ig.igSmallButton("Save scheme\xe2\x80\xa6")) result.save_scheme = true;
     ig.igSameLine(0, 8.0);
     if (ig.igSmallButton("Load scheme\xe2\x80\xa6")) result.load_scheme = true;
@@ -890,8 +899,6 @@ fn drawPalettePanel(
 /// a data-panel scrollbar appearing or disappearing can never feed back into the layout (the
 /// scrollbar↔ContentAvail oscillation recorded for this project).
 fn drawSwatchGallery(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     gallery: *const SwatchGallery,
@@ -908,7 +915,7 @@ fn drawSwatchGallery(
         defer ig.igPopID();
 
         c.ffImguiImage(gallery.textures[idx].handle, preview_w, preview_h);
-        if (ig.igIsItemClicked(0)) applyPreset(device, texture, engine, editor, preset);
+        if (ig.igIsItemClicked(0)) applyPreset(engine, editor, preset);
 
         // Name in a hover tooltip (kept off the grid so the swatches stay compact).
         if (ig.igBeginItemTooltip()) {
@@ -926,26 +933,22 @@ fn drawSwatchGallery(
 
 /// Apply a preset as an editable starting point: load it into the editor (`applyScheme`), then
 /// push the colouring to the engine as a COLOUR pass only (`applyEdits` → the same setters palette
-/// edits use, never re-iterating) and re-upload. Logs a one-line "applied preset <name>".
+/// edits use, never re-iterating). Logs a one-line "applied preset <name>".
 fn applyPreset(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     preset: presets_mod.Preset,
 ) void {
     editor.applyScheme(preset.scheme);
-    applyEdits(device, texture, engine, editor, .{ .gradient = true, .mapping = true, .interior = true });
+    applyEdits(engine, editor, .{ .gradient = true, .mapping = true, .interior = true });
     ui_log.info("applied preset {s}", .{preset.name});
 }
 
-/// Apply the frame's edits to the engine and re-upload the recolored buffer. Runs ONLY
-/// the color pass (never `iterate`). On an engine or upload failure logs `std.log.err`
+/// Apply the frame's edits to the engine. The loop uploads the recolored buffer after drawing.
+/// Runs the color pass (never `iterate`). On an engine failure logs `std.log.err`
 /// (scope `.ui`) with actionable context and skips the frame's update rather than
 /// crashing; on success logs the engine's one-line recolor summary.
 fn applyEdits(
-    device: *c.SDL_GPUDevice,
-    texture: texture_mod.Texture,
     engine: *engine_mod.Engine,
     editor: *editor_mod.Editor,
     edits: Edits,
@@ -960,11 +963,6 @@ fn applyEdits(
     };
     if (edits.interior) engine.setInterior(editor.interior) catch |err| {
         ui_log.err("interior edit rejected ({s}); keeping previous colors", .{@errorName(err)});
-        return;
-    };
-
-    texture_mod.upload(device, texture, engine.output()) catch |err| {
-        ui_log.err("re-upload of recolored buffer failed ({s})", .{@errorName(err)});
         return;
     };
 

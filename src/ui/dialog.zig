@@ -159,3 +159,30 @@ pub fn takePending(pending: *PendingDialog) ?PendingResult {
         .path = pending.path_buf[0..path_len],
     };
 }
+
+// SDL can deliver a native picker result off the main thread or after the
+// window starts shutting down. Keep callback storage alive for the process.
+const export_flow = @import("export_flow.zig");
+var png_picker: export_flow.Picker = .{};
+const png_filter = c.SDL_DialogFileFilter{ .name = "PNG images (*.png)", .pattern = "png" };
+
+pub fn showExportPng(window: *c.SDL_Window) void {
+    c.SDL_ShowSaveFileDialog(pngCallback, &png_picker, window, &png_filter, 1, null);
+}
+
+fn pngCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, filter: c_int) callconv(.c) void {
+    _ = filter;
+    const picker: *export_flow.Picker = @ptrCast(@alignCast(userdata orelse return));
+    if (filelist == null) {
+        log.err("PNG save dialog failed: sdl_error={s}", .{std.mem.span(c.SDL_GetError())});
+        picker.complete(null);
+        return;
+    }
+    picker.complete(if (filelist[0]) |path| std.mem.span(path) else "");
+}
+
+/// The chosen path can be read until the next PNG picker opens.
+pub fn takeExportPng() ?struct { outcome: export_flow.Outcome, path: []const u8 } {
+    const outcome = png_picker.take() orelse return null;
+    return .{ .outcome = outcome, .path = if (outcome == .chosen) png_picker.buf[0..png_picker.len] else "" };
+}

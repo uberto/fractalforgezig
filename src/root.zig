@@ -37,6 +37,7 @@ test {
     _ = @import("ui/editor.zig");
     // M7: pure per-frame gesture reduction (pinch/wheel -> one Intent per frame).
     _ = @import("ui/gesture.zig");
+    _ = @import("ui/export_flow.zig");
     _ = @import("fractal/refine.zig");
     _ = @import("fractal/progressive.zig");
     _ = @import("fractal/persist.zig");

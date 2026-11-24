@@ -29,6 +29,9 @@ const bla = @import("fractal/bla.zig");
 const perturb = @import("fractal/perturb.zig");
 const persist = @import("fractal/persist.zig");
 const scheme = @import("fractal/scheme.zig");
+const export_flow = @import("ui/export_flow.zig");
+const export_panel = @import("ui/export_panel.zig");
+const export_render = @import("fractal/export_render.zig");
 const dialog = @import("ui/dialog.zig");
 
 const app_log = std.log.scoped(.app);
@@ -316,6 +319,7 @@ const NavState = struct {
     /// Set when engine output changed and needs to be uploaded to the GPU texture.
     /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
     needs_upload: bool = false,
+    export_scene_valid: bool = true,
     /// Set for the ONE frame after an upload: the pixels went to the texture *after* the frame
     /// that was presented, so what the user sees is one frame stale. The loop must draw once
     /// more before it is allowed to block on events — otherwise a render that finishes in a
@@ -743,13 +747,26 @@ fn historyRedo(
 
 // ─── View-change helpers ───────────────────────────────────────────────────────
 
-/// Recreate the GPU texture if its dimensions differ from engine.image_w × engine.image_h.
-fn syncTexture(device: gpu.Device, texture: *texture_mod.Texture, engine: *engine_mod.Engine) void {
-    if (texture.width == engine.image_w and texture.height == engine.image_h) return;
+/// Keep the old pixels and metadata if creating or uploading a replacement fails.
+fn uploadFractal(device: gpu.Device, texture: *texture_mod.Texture, engine: *const engine_mod.Engine) !void {
+    if (texture.width == engine.image_w and texture.height == engine.image_h) {
+        return texture_mod.upload(device.handle, texture.*, engine.output());
+    }
+    const replacement = try texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h);
+    errdefer replacement.destroy();
+    try texture_mod.upload(device.handle, replacement, engine.output());
     texture.destroy();
-    texture.* = texture_mod.createRgbaTexture(device.handle, engine.image_w, engine.image_h) catch |err| {
-        app_log.err("texture sync to {d}×{d} failed ({s})", .{ engine.image_w, engine.image_h, @errorName(err) });
-        return;
+    texture.* = replacement;
+}
+
+fn exportScene(engine: *const engine_mod.Engine) export_render.Snapshot {
+    return .{
+        .view = engine.view,
+        .source = .{ .width = engine.image_w, .height = engine.image_h },
+        .lut = engine.lut,
+        .params = engine.params,
+        .interior = engine.interior,
+        .max_iter = engine.max_iter,
     };
 }
 
@@ -871,10 +888,13 @@ fn renderCoarse(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h:
             "coarse pass at {d}×{d} failed ({s}); display keeps the previous image",
             .{ coarse_w, coarse_h, @errorName(err) },
         );
+        nav.needs_upload = false;
+        nav.export_scene_valid = false;
         return;
     };
     if (t) |*timer| nav.last_render_ns = timer.read();
     nav.needs_upload = true;
+    nav.export_scene_valid = true;
 }
 
 /// Arm the coarse→fine promotion: the loop's idle check (`refine.decidePass`) starts the
@@ -923,6 +943,8 @@ fn beginFullPass(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h
         );
         nav.full_pass_done = true;
         nav.rendering = false;
+        nav.needs_upload = false;
+        nav.export_scene_valid = false;
         return;
     };
     nav.needs_upload = true;
@@ -943,6 +965,7 @@ fn stepPassChunk(engine: *engine_mod.Engine, nav: *NavState, app_stats: *stats_m
     if (t) |*timer| nav.pass_ns += timer.read();
     nav.needs_upload = true;
     if (!finished) return;
+    nav.export_scene_valid = true;
 
     nav.full_pass_done = true;
     nav.rendering = false;
@@ -988,6 +1011,11 @@ fn runLoop(
     // frame reports the region size and the idle check promotes it to a full-res pass.
     var nav = NavState{ .idle_timer = std.time.Timer.start() catch null };
     var pending_dialog = dialog.PendingDialog{};
+    var png_export: export_panel.Panel = .{};
+    defer png_export.worker.shutdown();
+    // Initialized from the uploaded startup frame. CPU state can move ahead of this
+    // value before draw and may never reach the screen if an upload fails.
+    var displayed: export_flow.Displayed = .{ .scene = exportScene(engine) };
     // The FULL-RESOLUTION target: the fractal region's live pixel size, reported by
     // `panels.draw` each frame. Tracked separately from `engine.image_w/h`, which is at the
     // coarse preview size while a navigation is in flight.
@@ -1022,8 +1050,8 @@ fn runLoop(
         //   * otherwise the image is final AND on screen → block until something happens,
         //     keeping the CPU idle instead of spinning.
         var event: c.SDL_Event = undefined;
-        const owes_full_pass = !nav.full_pass_done or pending_dialog.kind != dialog.Kind.none;
-        const wait_ms: i32 = if (owes_full_pass) 16 else -1;
+        const owes_full_pass = !nav.full_pass_done or pending_dialog.kind != .none or png_export.pickerOpen();
+        const wait_ms = export_flow.waitMs(owes_full_pass, png_export.needsPoll());
         const got_event = if (engine.pass != null or nav.needs_present)
             c.SDL_PollEvent(&event)
         else
@@ -1053,7 +1081,7 @@ fn runLoop(
                     // ignored it too, and `gesture.wheelSample` says why reacting to it would
                     // invert the existing wheel zoom on a default macOS setup, invisibly.
                     c.SDL_EVENT_MOUSE_WHEEL => {
-                        nav.gestures.addWheel(
+                        if (!png_export.hovered) nav.gestures.addWheel(
                             gesture.wheelSample(event.wheel.x, event.wheel.y, event.wheel.integer_y),
                             nav.input_mode,
                         );
@@ -1087,7 +1115,7 @@ fn runLoop(
                             // in `ui/gesture.zig`, whose product semantics that immutable test
                             // pins. Nothing else about the reduction (the scale→side-factor
                             // inversion in particular) belongs at this call site.
-                            nav.gestures.addPinch(event.pinch.scale);
+                            if (!png_export.hovered) nav.gestures.addPinch(event.pinch.scale);
                         }
                     },
                     c.SDL_EVENT_PINCH_END => {
@@ -1099,7 +1127,7 @@ fn runLoop(
                     },
                     // Right mouse button down: stash the cursor point for the context menu.
                     c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
-                        if (event.button.button == c.SDL_BUTTON_RIGHT) {
+                        if (event.button.button == c.SDL_BUTTON_RIGHT and !png_export.hovered) {
                             const cursor = engine.view.cursorCoord(@floatCast(event.button.x), @floatCast(event.button.y), image_rect.*);
                             if (cursor) |pt| {
                                 nav.right_click_pt = pt;
@@ -1279,10 +1307,12 @@ fn runLoop(
         // user's own half-typed text.
         if (view_editor.iterFieldReadOnly()) view_editor.syncFromPolicy(engine.policy, engine.max_iter);
 
+        png_export.poll();
+        const file_dialog_available = pending_dialog.kind == .none and !png_export.pickerOpen();
+        const color_passes_before_draw = engine.color_passes;
         var quit_requested = false;
         // open_ctx_menu and right_click_pt are consumed inside draw (popup lives there).
         const draw_result = panels.draw(
-            device.handle,
             texture.*,
             engine.max_iter,
             app_stats.*,
@@ -1301,7 +1331,12 @@ fn runLoop(
             orbit.open,
             fullscreen,
             &quit_requested,
+            file_dialog_available,
+            file_dialog_available and png_export.available(),
         );
+        if (engine.color_passes != color_passes_before_draw) nav.needs_upload = true;
+        if (draw_result.export_requested) png_export.open(draw_result.image_rect);
+        const export_action = png_export.draw(file_dialog_available);
         // Update image_rect from the live ImGui geometry every frame so coordinate
         // mapping uses the actual on-screen image (not the OS window size).
         if (draw_result.image_rect.side > 0) image_rect.* = draw_result.image_rect;
@@ -1368,12 +1403,6 @@ fn runLoop(
             armFullPass(&nav);
         }
 
-        // Open file dialogs when menu items were clicked (after the ImGui frame).
-        if (draw_result.save_requested) dialog.showSave(window, &pending_dialog);
-        if (draw_result.open_requested) dialog.showOpen(window, &pending_dialog);
-        if (draw_result.save_scheme_requested) dialog.showSaveScheme(window, &pending_dialog);
-        if (draw_result.load_scheme_requested) dialog.showOpenScheme(window, &pending_dialog);
-
         // Act on the context-menu selection.
         if (draw_result.ctx_action != .none) {
             const pt = nav.right_click_pt;
@@ -1400,7 +1429,7 @@ fn runLoop(
         if (draw_result.coord.input_mode) |m| nav.input_mode = m;
 
         // Navigation ImGui input: box-select and pan.
-        handleNavInput(engine, &nav, image_rect.*, real_w, real_h, real_s, view_editor);
+        handleNavInput(engine, &nav, image_rect.*, real_w, real_h, real_s, view_editor, !png_export.hovered);
 
         // Julia inspector window (T3): its own top-level Begin/End, drawn from the texture already
         // on the GPU (upload happens in the deferred section after renderFrame).
@@ -1412,6 +1441,14 @@ fn runLoop(
         drawOrbitWindow(orbit, engine, hover_pt);
 
         ui.endFrame();
+        if (running) png_export.apply(export_action, window, draw_result.image_rect, displayed.scene);
+
+        if (running and !png_export.pickerOpen()) {
+            if (draw_result.save_requested) dialog.showSave(window, &pending_dialog);
+            if (draw_result.open_requested) dialog.showOpen(window, &pending_dialog);
+            if (draw_result.save_scheme_requested) dialog.showSaveScheme(window, &pending_dialog);
+            if (draw_result.load_scheme_requested) dialog.showOpenScheme(window, &pending_dialog);
+        }
 
         // ── Coarse→fine pass dispatch ─────────────────────────────────────────
         // A pass already in flight advances by one chunk per frame; otherwise the pure
@@ -1436,12 +1473,15 @@ fn runLoop(
         // MUST be after renderFrame: ImGui submits the GPU commands (including
         // the sampler binding for the fractal texture) inside renderFrame.
         // Only after submission is it safe to destroy and recreate the texture.
-        const did_upload = nav.needs_upload;
+        var did_upload = false;
         if (nav.needs_upload) {
-            syncTexture(device, texture, engine);
-            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-                app_log.err("texture upload failed ({s})", .{@errorName(err)});
-            };
+            if (uploadFractal(device, texture, engine)) {
+                did_upload = true;
+                displayed.uploaded(if (nav.export_scene_valid) exportScene(engine) else null);
+            } else |err| {
+                displayed.uploaded(err);
+                app_log.err("texture upload failed ({s}); display keeps the previous image", .{@errorName(err)});
+            }
             nav.needs_upload = false;
         }
 
@@ -1482,7 +1522,7 @@ fn runLoop(
 
         // ── File dialog result processing ─────────────────────────────────────
         if (dialog.takePending(&pending_dialog)) |result| {
-            handleDialogResult(result, device, texture, engine, &nav, real_w, real_h, editor, view_editor);
+            handleDialogResult(result, engine, &nav, real_w, real_h, editor, view_editor);
         }
 
         // Only update frame_ms when the fractal actually re-rendered; skip mouse-move frames.
@@ -1499,8 +1539,6 @@ fn runLoop(
 /// Process a completed file-dialog result: save state to disk or load from disk.
 fn handleDialogResult(
     result: dialog.PendingResult,
-    device: gpu.Device,
-    texture: *texture_mod.Texture,
     engine: *engine_mod.Engine,
     nav: *NavState,
     real_w: u32,
@@ -1569,11 +1607,12 @@ fn handleDialogResult(
             renderCoarse(engine, nav, real_w, real_h);
 
             persist.applyToEngine(state, engine) catch |err| {
+                nav.needs_upload = false;
+                nav.export_scene_valid = false;
                 app_log.err("open: applyToEngine failed for '{s}' ({s})", .{ path, @errorName(err) });
                 return;
             };
 
-            syncTexture(device, texture, engine);
             view_editor.syncFromView(engine.view);
             view_editor.syncFromPolicy(engine.policy, engine.max_iter);
             // The load replaced the engine's colouring; resync the palette panel so it shows
@@ -1581,6 +1620,8 @@ fn handleDialogResult(
             // restores the palette panel").
             editor.syncFromColouring(engine.gradient, engine.params, engine.interior);
             nav.needs_upload = true;
+            nav.needs_present = true;
+            nav.export_scene_valid = true;
             armFullPass(nav);
             app_log.info("state loaded from '{s}'", .{path});
         },
@@ -1644,11 +1685,9 @@ fn handleDialogResult(
 
             // Show the loaded colouring in the palette panel (requirement "Loading restores the
             // palette panel"). The image was recoloured in place — same size, so no texture
-            // resize — so upload it and owe one more present frame to put it on screen.
+            // resize. Let the main upload path update both pixels and export metadata.
             editor.syncFromColouring(engine.gradient, engine.params, engine.interior);
-            texture_mod.upload(device.handle, texture.*, engine.output()) catch |err| {
-                app_log.err("load scheme: re-upload of recoloured buffer failed ({s})", .{@errorName(err)});
-            };
+            nav.needs_upload = true;
             nav.needs_present = true;
             app_log.info("colour scheme loaded from '{s}' ({d} stops)", .{ path, s.stops.len });
         },
@@ -1670,13 +1709,14 @@ fn handleNavInput(
     real_h: u32,
     real_s: u32,
     view_editor: *editor_mod.ViewEditor,
+    image_input: bool,
 ) void {
     const space_held = ig.igIsKeyDown_Nil(ig.key_space);
 
     // ── Pan: middle-drag or Space+left-drag ───────────────────────────────────
     const mid_dragging = ig.igIsMouseDragging(ig.mouse_button_middle, -1.0);
     const space_left_dragging = space_held and ig.igIsMouseDragging(ig.mouse_button_left, -1.0);
-    if (mid_dragging or space_left_dragging) {
+    if (image_input and (mid_dragging or space_left_dragging)) {
         const btn: c_int = if (mid_dragging) ig.mouse_button_middle else ig.mouse_button_left;
         const delta = ig.igGetMouseDragDelta(btn, -1.0);
         // Navigate.panByPixels: "pass the NEGATED mouse delta" so content follows cursor.
@@ -1703,7 +1743,7 @@ fn handleNavInput(
         const left_dragging = ig.igIsMouseDragging(ig.mouse_button_left, -1.0);
 
         // Start: button just went down and the cursor is on the image.
-        if (left_down and !left_dragging and nav.drag_state == .none) {
+        if (image_input and left_down and !left_dragging and nav.drag_state == .none) {
             var mx: f32 = 0.0;
             var my: f32 = 0.0;
             _ = c.SDL_GetMouseState(&mx, &my);

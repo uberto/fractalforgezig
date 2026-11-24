@@ -29,6 +29,7 @@ pub const window_flags_no_title_bar: WindowFlags = 1 << 0;
 pub const window_flags_no_resize: WindowFlags = 1 << 1;
 pub const window_flags_no_move: WindowFlags = 1 << 2;
 pub const window_flags_no_collapse: WindowFlags = 1 << 5;
+pub const window_flags_always_auto_resize: WindowFlags = 1 << 6;
 pub const window_flags_no_saved_settings: WindowFlags = 1 << 8;
 pub const window_flags_menu_bar: WindowFlags = 1 << 10;
 pub const window_flags_no_bring_to_front: WindowFlags = 1 << 13;
@@ -42,6 +43,8 @@ pub extern fn igBegin(name: [*:0]const u8, p_open: ?*bool, flags: WindowFlags) b
 pub extern fn igEnd() void;
 pub extern fn igText(fmt: [*:0]const u8, ...) void;
 pub extern fn igTextUnformatted(text: [*:0]const u8, text_end: ?[*:0]const u8) void;
+pub extern fn igPushTextWrapPos(wrap_local_pos_x: f32) void;
+pub extern fn igPopTextWrapPos() void;
 pub extern fn igSeparator() void;
 pub extern fn igSpacing() void;
 pub extern fn igSameLine(offset_from_start_x: f32, spacing: f32) void;

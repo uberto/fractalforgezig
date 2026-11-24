@@ -4,23 +4,22 @@
 
 ## Purpose
 
-Own Dear ImGui: context, SDL3+SDL_GPU backends, cycle, layout, palette editor; keep ImGui/SDL types behind `../c.zig`/`../cimgui.zig`.
+Keep Dear ImGui and SDL types behind `../c.zig` and `../cimgui.zig`.
 
 ## Aspect + resize
 
 Render target=fractal REGION (`render_w/render_h`); `main.zig` targets it full-res, re-arming
 on change. `viewport.fitImageRect` letterboxes, NEVER stretches, IS the coordinate-mapping rect.
-Keep `no_scrollbar`: cut a `ContentAvail`→region→content oscillation that cancelled passes.
+Keep `no_scrollbar` to avoid resize oscillation.
 
 ## Layout: single window, two fixed regions
 
 `panels.zig`—`draw(…)→DrawResult{ctx_action,image_rect,render_w,render_h,needs_rerender,
 save_requested,open_requested,coord,toggle_julia/orbit/fullscreen}`:`image_rect`=fitted ON-SCREEN
-rect(mapping),`render_w/h`=REGION size. `rendering` freezes data panel(`igBeginDisabled`),leaving
-image+wheel/pinch+status-bar live. Pass the live inspector and full-screen flags to `drawMenuBar`. Let main apply
-`DrawResult` toggles and Cancel/Render requests. Keep the status bar enabled during rendering. Status-bar lookup:`engine.renderViewport().pixelIndex(pt.lo())`(rect stride),NOT square map.
-Left image,right data+coord+palette. Palette edits stops/mode/period/banded/interior;
-`applyEdits`→setter→re-upload,NEVER re-iterates. `drawPalettePanel` draws preset
+rect(mapping),`render_w/h`=REGION size. `rendering` freezes data panel(`igBeginDisabled`),leaving image navigation and the status bar enabled. Pass inspector and full-screen flags to
+`drawMenuBar`. Apply `DrawResult` requests in main. Status-bar lookup:`engine.renderViewport().pixelIndex(pt.lo())`(rect stride),NOT square map.
+Palette edits stops/mode/period/banded/interior;
+`applyEdits`→setter→deferred main upload,NEVER re-iterates. `drawPalettePanel` draws preset
 grid(`drawSwatchGallery`):`SwatchGallery` bakes each `presets.gradientOf` to a texture ONCE,
 click→`applyPreset`. `editor.zig`(PURE):`Editor{…,banded}`+`params()`(carries `banded`)+`toGradient`
 +`addStop`/`removeStop`+`syncFromColouring`+`applyScheme`+`indexToInputMode`.
@@ -32,11 +31,6 @@ Two OWN top-level `igBegin`/`igEnd`(`p_open`⇒T5 close box). `JuliaInspector`:2
 +`colorInto`,freeze-on-leave. `OrbitInspector`:full-set backdrop baked ONCE(re-bake on
 resize/palette),overlays `orbit.compute` via `ImDrawList_AddCircleFilled`/`_AddLine`(cimgui);
 `connect` toggles path. Texture upload DEFERRED.
-
-## Frame setup
-
-Use the cimgui extern declarations and the bridge for by-value `ImVec2` calls.
-Call `newFrame`, build the UI, call `endFrame`, and prepare draw data before the render pass.
 
 ## Navigation + progressive render (main.zig)
 
@@ -56,8 +50,8 @@ view/policy change→`applyViewCoarse`/`showViewCoarse`/`showPolicyCoarse`:`canc
 `beginFullPass`;`stepPassChunk` runs one `engine.stepPass()`/frame. m9 Cancel:`requestCancel`(status
 Cancel OR Escape while `rendering`)⇒`cancelPass`+`rendering=false`,`full_pass_done`/`cancelled=true`,
 logs `render cancelled at NN%`;`cancelled` suppresses promotion(no re-arm loop). Render⇒`armFullPass`
-clears `cancelled`,as does every view change. Pump:`engine.pass!=null`→`SDL_PollEvent`,else
-`SDL_WaitEventTimeout(16)` if owed/`-1` idle.
+clears `cancelled`,as does every view change. Pump: live pass/present owed → poll. Otherwise use `export_flow.waitMs` (16 ms
+for live work or pickers, 50 ms for an active export, indefinite while idle).
 
 ## Coord panel + ViewEditor
 
@@ -74,20 +68,23 @@ IN USE (ramp under Auto); `iterFieldReadOnly()`(=`auto_iter`)⇒read-only+greyed
 `drawCoordPanel` REQUESTS (returns `CoordRequest{view,policy,input_mode}`), never applies; parse
 failure logs `.err` and re-syncs.
 
-## File dialog: dialog.zig
+## Pickers and PNG export
 
-`PendingDialog{kind,path_buf,path_len}`—stack-alloc in `runLoop`, outlives callbacks.
-`showSave`/`showOpen`(+`…Scheme` variants)`(window,pending)` no-op unless `kind==.none`.
-`takePending`→`?PendingResult`, `null` on cancel. Filters `.fractal`/`.fpal`(colour-only). Scheme
-Save/Load: BUTTONS in the Coloring header, inside `igBeginDisabled(rendering)`; load
-`scheme.fromJson`→`applyToEngine`(setters, no re-iterate)→`syncFromColouring`, bad file refused.
+`dialog.zig` owns native filters and callbacks. Legacy `PendingDialog` manages fractal and
+scheme dialogs. PNG uses process-lifetime `export_flow.Picker` to copy complete paths and publish
+terminal outcomes atomically when SDL invokes the callback off-thread.
+
+`export_panel.Panel` stays on main; hold one `Capture` from dimensions through picker and optional
+exact-path overwrite confirmation. Use the fresh fitted rect for defaults and `Displayed.scene`
+for render geometry, view and colors. Only successful texture uploads replace the displayed
+metadata. Poll `image_export.Worker` while active; keep SDL and ImGui on main. Scheme load uses
+`scheme.applyToEngine`→`syncFromColouring`→deferred upload.
 
 ## Testing
 
-Visual=manual smoke+logs. `stats.zig`/`editor.zig`/`gesture.zig` PURE+unit-tested; `dialog.zig`
+`stats.zig`/`editor.zig`/`gesture.zig` PURE+unit-tested; `dialog.zig`
 glue. `panels.zig` imports `c.zig`⇒OUT of `root.zig`, tests NEVER run—keep pure logic in
-`editor.zig`/`stats.zig`/`gesture.zig`. View menu + full screen are pilot-only glue.
+`editor.zig`/`stats.zig`/`gesture.zig`. Pilot View menu and full screen.
 
-In `drawDataPanel`, bind BLA beside GPU to `engine.use_bla` and report toggle changes through
-`needs_rerender`. Disable BLA and show the deep-zoom hint when `engine.usesDeepPath()` is false.
-Verify the control by hand.
+Bind BLA to `engine.use_bla` in `drawDataPanel` and report `needs_rerender`. Disable BLA
+when `engine.usesDeepPath()` is false.
