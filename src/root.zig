@@ -51,6 +51,7 @@ test {
     _ = @import("deep_zoom_test.zig");
     // Cross-module acceptance tests for M7 trackpad gestures (pure tier: no window, no GPU).
     _ = @import("gesture_test.zig");
+    _ = @import("image_export_test.zig");
     std.testing.refAllDecls(@This());
 }
 
