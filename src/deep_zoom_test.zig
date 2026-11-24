@@ -155,3 +155,50 @@ test "acceptance: a cursor-anchored zoom at 1e-25 keeps full precision" {
     try testing.expect(zoomed.center_re != v.center_re);
     try testing.expect(zoomed.center_re > v.center_re);
 }
+
+test "acceptance: BLA renders the same deep view in far fewer steps" {
+    const alloc = testing.allocator;
+    const side: f64 = 1.0e-25;
+    inline for ([_]u32{ 8, 64 }) |image_side| {
+        const view = try viewport.SquareView.fromCenterSide(deep_center, side);
+
+        var eng = try engine.Engine.init(alloc, view, image_side, .{});
+        defer eng.deinit();
+
+        // Pin a high cap so the deep path has real runs to skip, and force the CPU path so the step
+        // counts are well-defined and deterministic (the GPU path does not count elementary steps).
+        // `installPolicy` sets the cap WITHOUT re-iterating, so each `iterate` below is a clean render.
+        try eng.installPolicy(.{ .auto = false, .manual_value = 65536 });
+        eng.use_gpu = false;
+
+        // Plain perturbation render.
+        eng.use_bla = false;
+        try eng.iterate();
+        const steps_plain = eng.last_cpu_deep_steps;
+        var plain: [image_side * image_side]f32 = undefined;
+        @memcpy(plain[0..], eng.iter);
+
+        // Accelerated render of the SAME view.
+        eng.use_bla = true;
+        try eng.iterate();
+        const steps_bla = eng.last_cpu_deep_steps;
+
+        var smooth_mismatches: usize = 0;
+        for (plain, eng.iter) |p, b| {
+            const p_interior = p == mandelbrot.interior_sentinel;
+            const b_interior = b == mandelbrot.interior_sentinel;
+            try testing.expectEqual(p_interior, b_interior);
+            const smooth_matches = p_interior or @abs(p - b) <= 1.0;
+            if (!smooth_matches) smooth_mismatches += 1;
+        }
+
+        errdefer std.log.warn(
+            "BLA acceptance failed on {d}×{d}: smooth_mismatches={d} steps_plain={d} steps_bla={d}",
+            .{ image_side, image_side, smooth_mismatches, steps_plain, steps_bla },
+        );
+        try testing.expect(smooth_mismatches <= plain.len / 100);
+        try testing.expect(steps_plain > 0);
+        try testing.expect(steps_bla > 0);
+        try testing.expect(steps_bla <= steps_plain / 3);
+    }
+}
