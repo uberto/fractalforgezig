@@ -2733,8 +2733,17 @@ test "BLA progressive bands reuse the table and free it at completion" {
 }
 
 test "an oversized BLA table skips both GPU backends and reports one budget warning" {
-    const view = try SquareView.fromCenterSide(.{ .re = 0, .im = 0 }, 1.0e-15);
-    var e = try Engine.init(testing.allocator, view, 1, try IterPolicy.manual(@intCast(bla.gpu_max_table_len + 1)));
+    const view = try SquareView.fromCenterSide(.{ .re = -0.1, .im = 0 }, 1.0e-15);
+    const policy = try IterPolicy.manual(@intCast(bla.gpu_max_table_len + 1));
+    var cpu = try Engine.init(testing.allocator, view, 2, policy);
+    defer cpu.deinit();
+    try cpu.iterate();
+    const plain_steps = cpu.last_cpu_deep_steps;
+    cpu.use_bla = true;
+    try cpu.iterate();
+    try testing.expect(cpu.last_cpu_deep_steps < plain_steps);
+
+    var e = try Engine.init(testing.allocator, view, 2, policy);
     defer e.deinit();
     e.use_bla = true;
     e.use_gpu = true;
@@ -2749,7 +2758,8 @@ test "an oversized BLA table skips both GPU backends and reports one budget warn
     try testing.expectEqual(@as(u32, 0), gpu_stub_calls);
     try testing.expectEqual(@as(u32, 1), e.iteration_passes);
     try testing.expectEqual(@as(u32, 1), e.gpu_fallbacks);
-    try testing.expectEqual(@as(f32, -1.0), e.iter[0]);
+    try testing.expectEqual(cpu.last_cpu_deep_steps, e.last_cpu_deep_steps);
+    try testing.expectEqualSlices(f32, cpu.iter, e.iter);
 }
 
 test "BLA does not change the shallow image or count deep work" {
