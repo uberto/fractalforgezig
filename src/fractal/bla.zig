@@ -462,24 +462,16 @@ fn smoothEscapeCertified(endpoint: f64, uncertainty: f64, parameter: f64, n: u32
     return relative_error * (1 + roundoff) / (@log(2.0) * @log(lower)) < 0.5;
 }
 
-const fallback_prefix = "GPU BLA path skipped: ";
-const fallback_reason = std.fmt.comptimePrint(
-    "the acceleration table is larger than the GPU budget of {d} blocks",
-    .{gpu_max_table_len},
-);
-const fallback_suffix = "; the CPU completed this render";
+const fallback_format = "GPU BLA path skipped: the acceleration table has {d} blocks, " ++
+    "exceeding the GPU budget of {d} blocks; the CPU completed this render";
 
-/// Buffer size that fits `gpuFallbackMessage`: fully known at comptime (no runtime value is
-/// interpolated), so this is the exact worst case, pinned by a test. A shorter buffer refuses.
+/// Capacity for any table block count on this platform.
 pub const fallback_message_buf_len: usize =
-    fallback_prefix.len + fallback_reason.len + fallback_suffix.len;
+    (std.fmt.comptimePrint(fallback_format, .{ std.math.maxInt(usize), gpu_max_table_len })).len;
 
-/// The warning for a deep BLA render whose table overflows the GPU budget: names the CPU and the
-/// table budget so an operator reading a slow render's log knows why it fell back and that the
-/// image is real. Mirrors `perturb.gpuFallbackMessage`; pure, so its wording is unit-tested once
-/// and T3/T4's call site logs it. Pass a `[fallback_message_buf_len]u8`.
-pub fn gpuFallbackMessage(buf: []u8) error{NoSpaceLeft}![]u8 {
-    return std.fmt.bufPrint(buf, fallback_prefix ++ fallback_reason ++ fallback_suffix, .{});
+/// Report the size that ruled out GPU acceleration and the CPU completion.
+pub fn gpuFallbackMessage(buf: []u8, blocks: usize) error{NoSpaceLeft}![]u8 {
+    return std.fmt.bufPrint(buf, fallback_format, .{ blocks, gpu_max_table_len });
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -702,17 +694,18 @@ fn buildAndFree(alloc: std.mem.Allocator, orbit: *const perturb.ReferenceOrbit) 
 
 test "gpuFallbackMessage names the CPU and the table budget" {
     var buf: [fallback_message_buf_len]u8 = undefined;
-    const msg = try gpuFallbackMessage(&buf);
+    const msg = try gpuFallbackMessage(&buf, gpu_max_table_len + 1);
     try testing.expect(std.mem.indexOf(u8, msg, "CPU") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "table") != null);
 }
 
-test "fallback_message_buf_len is exactly the message length, and a shorter buffer is refused" {
+test "fallback_message_buf_len fits the largest block count exactly" {
     var exact: [fallback_message_buf_len]u8 = undefined;
     var short: [fallback_message_buf_len - 1]u8 = undefined;
-    const msg = try gpuFallbackMessage(&exact);
+    const blocks = std.math.maxInt(usize);
+    const msg = try gpuFallbackMessage(&exact, blocks);
     try testing.expectEqual(fallback_message_buf_len, msg.len);
-    try testing.expectError(error.NoSpaceLeft, gpuFallbackMessage(&short));
+    try testing.expectError(error.NoSpaceLeft, gpuFallbackMessage(&short, blocks));
 }
 
 test "gpu_max_table_len is twice the orbit budget, enough for a full tree over the longest orbit" {

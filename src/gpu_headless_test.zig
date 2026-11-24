@@ -809,3 +809,46 @@ test "compute: the quadratic kernel finishes a stable deep pixel with skips" {
     try compute.gpuIterateDeepBlaRows(pipeline, view, &orbit, &table, 2, 2, max_iter, 0, 1, &band);
     for (band) |saved| try std.testing.expect(saved > max_iter / 2);
 }
+
+test "compute: the quadratic kernel matches CPU exterior values after skips without replay" {
+    const alloc = std.testing.allocator;
+    const device = try openHeadlessDevice();
+    defer closeHeadlessDevice(device);
+    // Preserve the calculated smooth result, marking any replay or no-skip pixel
+    // invalid at the dispatch boundary so neither path can satisfy parity.
+    const shader = std.mem.span(compute.msl_source);
+    const tracked = try replaceShaderOnce(alloc, shader, "    float uncertainty = 0.0f;", "    bool took_skip = false;\n    float uncertainty = 0.0f;");
+    defer alloc.free(tracked);
+    const marked = try replaceShaderOnce(alloc, tracked, "                    n += best_len;", "                    n += best_len;\n                    took_skip = true;");
+    defer alloc.free(marked);
+    const checked = try replaceShaderOnce(alloc, marked, "    return smooth_val;\n}\n\nkernel void mandelbrot_iterate_deep(", "    if (accelerated && !took_skip) replay = true;\n    return smooth_val;\n}\n\nkernel void mandelbrot_iterate_deep(");
+    defer alloc.free(checked);
+    const no_replay = try replaceShaderOnce(alloc, checked, "replay ? deep_pixel<false>(u, orbit, nullptr, gid, replay) : value", "replay ? INTERIOR_SENTINEL : value");
+    defer alloc.free(no_replay);
+    const source = try alloc.dupeZ(u8, no_replay);
+    defer alloc.free(source);
+    const pipeline = try compute.ComputePipeline.createFromSource(device, source);
+    defer pipeline.destroy();
+
+    const max_iter = 128;
+    const view = try viewport.SquareView.fromCenterSide(.{ .re = 0.27, .im = 0 }, 1.0e-20);
+    var orbit = try perturb.ReferenceOrbit.compute(alloc, view.center(), max_iter);
+    defer orbit.deinit(alloc);
+    var table = try bla.BlaTable.build(alloc, &orbit, view.side * @sqrt(0.5));
+    defer table.deinit(alloc);
+
+    var gpu_band: [2]f32 = undefined;
+    var cpu_band: [2]f32 = undefined;
+    try compute.gpuIterateDeepBlaRows(pipeline, view, &orbit, &table, 2, 2, max_iter, 0, 1, &gpu_band);
+    try iterbuf.iterateDeepBandBlaInto(&cpu_band, view.rectViewport(2, 2), max_iter, 0, 1, &orbit, &table);
+
+    for (gpu_band, cpu_band) |gpu_value, cpu_value| {
+        try std.testing.expect(cpu_value != mandelbrot_mod.interior_sentinel);
+        try std.testing.expectApproxEqAbs(cpu_value, gpu_value, 0.01);
+    }
+}
+
+fn replaceShaderOnce(alloc: std.mem.Allocator, shader: []const u8, before: []const u8, after: []const u8) ![]u8 {
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, shader, before));
+    return std.mem.replaceOwned(u8, alloc, shader, before, after);
+}

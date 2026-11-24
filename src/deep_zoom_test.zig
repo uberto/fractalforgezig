@@ -213,6 +213,8 @@ test "an accelerated deep view whose table overflows the GPU budget renders on t
     eng.use_gpu = true;
     eng.gpu_iter_fn = &countingIterFn;
     eng.gpu_bla_iter_fn = &countingBlaIterFn;
+    eng.gpu_fallback_warn_fn = &captureGpuFallbackWarning;
+    gpu_fallback_warnings = 0;
 
     gpu_calls = 0;
     try eng.iterate();
@@ -222,10 +224,26 @@ test "an accelerated deep view whose table overflows the GPU budget renders on t
     try testing.expectEqual(@as(u32, 1), eng.gpu_fallbacks);
     try testing.expect(eng.last_cpu_deep_steps > 0);
     try testing.expectEqual(mandelbrot.interior_sentinel, eng.iter[0]);
-    var buf: [bla.fallback_message_buf_len]u8 = undefined;
-    const msg = try bla.gpuFallbackMessage(&buf);
-    try testing.expect(std.mem.indexOf(u8, msg, "CPU") != null);
-    try testing.expect(std.mem.indexOf(u8, msg, "table") != null);
+    // The orbit has one table leaf per manual iteration. Summing the sizes
+    // of the successively halved levels gives twice the leaves minus their popcount.
+    const leaves = bla.gpu_max_table_len + 1;
+    const blocks = 2 * leaves - @popCount(leaves);
+    const expected = std.fmt.comptimePrint(
+        "GPU BLA path skipped: the acceleration table has {d} blocks, exceeding the GPU budget of {d} blocks; the CPU completed this render",
+        .{ blocks, bla.gpu_max_table_len },
+    );
+    try testing.expectEqual(@as(usize, 1), gpu_fallback_warnings);
+    try testing.expectEqualStrings(expected, gpu_fallback_warning[0..gpu_fallback_warning_len]);
+}
+
+var gpu_fallback_warning: [256]u8 = undefined;
+var gpu_fallback_warning_len: usize = 0;
+var gpu_fallback_warnings: usize = 0;
+
+fn captureGpuFallbackWarning(message: []const u8) void {
+    gpu_fallback_warnings += 1;
+    gpu_fallback_warning_len = @min(message.len, gpu_fallback_warning.len);
+    @memcpy(gpu_fallback_warning[0..gpu_fallback_warning_len], message[0..gpu_fallback_warning_len]);
 }
 
 fn countingBlaIterFn(

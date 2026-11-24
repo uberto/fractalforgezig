@@ -77,7 +77,7 @@ ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,`mandelbrot.iterateExact`.
   both child domains. Apply a skip only when the full delta bound fits its
   radius and certifies the endpoint. `iterateDeltaBlaCounted` includes
   rejected skips and exact replay when escape or rebase is uncertain.
-  Check `gpu_max_table_len` and use `gpuFallbackMessage` when exceeded.
+  Check `gpu_max_table_len` and pass the observed count to `gpuFallbackMessage(buf, blocks)` when exceeded.
 - `gradient.zig`—`Stop{pos:f32∈[0,1],color:Rgba8}`;ASCENDING,cap `max_stops`=32:
   `fromStops`,`stops()`,`bakeLut(g,out:*[lut_size=1024]Rgba8)`,`default()`.
 - `mapping.zig`—`Mode{linear,log,cyclic}`;`Params{mode,period=default_period(32.0),banded=false}`

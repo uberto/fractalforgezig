@@ -85,6 +85,10 @@ const IterPolicy = autoiter.IterPolicy;
 /// The fractal core's log scope (see the file header for why this module may log at all).
 const log = std.log.scoped(.fractal);
 
+fn logGpuFallbackWarning(message: []const u8) void {
+    log.warn("{s}", .{message});
+}
+
 /// Reused verbatim from `color.zig` (M0). Channel order R, G, B, A. Do not redefine.
 pub const Rgba8 = color.Rgba8;
 
@@ -242,6 +246,8 @@ pub const Engine = struct {
     /// How many times this engine has reported that a deep render could not use the GPU (M6/T6).
     /// Bumped once per render when a GPU budget or precision warning is logged.
     gpu_fallbacks: u32,
+    /// Receives each routed fallback warning. The default sink logs at warning level.
+    gpu_fallback_warn_fn: *const fn ([]const u8) void = logGpuFallbackWarning,
     /// Reference-orbit or precision limit that ruled out the GPU. A BLA table budget warning
     /// is tracked by `gpu_fallbacks` and names its own limit in the log.
     gpu_fallback_reason: ?perturb.FallbackReason,
@@ -437,14 +443,12 @@ pub const Engine = struct {
         if (!self.use_gpu) return false;
         const result = if (self.bla_table) |*table| blk: {
             // Check the table first: an oversized table can also exceed the orbit budget.
-            if (table.len() > bla.gpu_max_table_len) {
+            const blocks = table.len();
+            if (blocks > bla.gpu_max_table_len) {
                 if (self.recordGpuFallback()) {
                     var buf: [bla.fallback_message_buf_len]u8 = undefined;
-                    if (bla.gpuFallbackMessage(&buf)) |message| {
-                        log.warn("{s}", .{message});
-                    } else |err| {
-                        log.warn("GPU acceleration table exceeds its budget; falling back to CPU ({s})", .{@errorName(err)});
-                    }
+                    const message = bla.gpuFallbackMessage(&buf, blocks) catch unreachable;
+                    self.gpu_fallback_warn_fn(message);
                 }
                 return false;
             }
@@ -495,7 +499,7 @@ pub const Engine = struct {
         if (!self.recordGpuFallback()) return;
         var buf: [perturb.fallback_message_buf_len]u8 = undefined;
         if (perturb.gpuFallbackMessage(&buf, reason)) |line| {
-            log.warn("{s}", .{line});
+            self.gpu_fallback_warn_fn(line);
         } else |err| {
             log.warn("GPU deep-zoom path skipped ({s}); the CPU completed this render", .{@errorName(err)});
         }
