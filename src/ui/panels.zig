@@ -527,8 +527,7 @@ fn drawNavContextMenu(right_click_pt: viewport.ComplexHi) CtxAction {
     return action;
 }
 
-/// Render stats + GPU/CPU toggle panel. Returns true when the GPU toggle was flipped
-/// so main.zig can re-iterate and upload after the frame (never do GPU work inside ImGui).
+/// Return true when a render setting changes so main.zig can re-iterate and upload after the frame.
 fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *engine_mod.Engine) bool {
     const w: f64 = @floatFromInt(vp.width);
     const h: f64 = @floatFromInt(vp.height);
@@ -551,8 +550,15 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
     // Flipping this sets needs_rerender=true so main.zig does the actual iterate+upload.
     const gpu_available = engine.gpu_iter_fn != null;
     ig.igBeginDisabled(!gpu_available);
-    const toggled = ig.igCheckbox("GPU", &engine.use_gpu);
+    const gpu_toggled = ig.igCheckbox("GPU", &engine.use_gpu);
     ig.igEndDisabled();
+
+    ig.igSameLine(0, -1);
+    const deep = engine.usesDeepPath();
+    ig.igBeginDisabled(!deep);
+    const bla_toggled = ig.igCheckbox("BLA", &engine.use_bla);
+    ig.igEndDisabled();
+    if (!deep) ig.igTextUnformatted("BLA applies only at deep zoom.", null);
 
     ig.igSpacing();
     ig.igTextUnformatted("Viewport", null);
@@ -561,7 +567,7 @@ fn drawDataPanel(vp: viewport.Viewport, max_iter: u32, s: stats.Stats, engine: *
     textf("im: [{d:.4}, {d:.4}]", .{ im_min, im_max });
     textf("max_iter: {d}", .{max_iter});
 
-    return toggled;
+    return gpu_toggled or bla_toggled;
 }
 
 /// Width (px) for one coordinate input: enough to SHOW `coord_field_chars` characters, capped by

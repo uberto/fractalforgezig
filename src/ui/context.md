@@ -98,3 +98,7 @@ Save/Load: BUTTONS in the Coloring header, inside `igBeginDisabled(rendering)`; 
 Visual=manual smoke+logs. `stats.zig`/`editor.zig`/`gesture.zig` PURE+unit-tested; `dialog.zig`
 glue. `panels.zig` imports `c.zig`⇒OUT of `root.zig`, tests NEVER run—keep pure logic in
 `editor.zig`/`stats.zig`/`gesture.zig`. View menu + full screen are pilot-only glue.
+
+In `drawDataPanel`, bind BLA beside GPU to `engine.use_bla` and report toggle changes through
+`needs_rerender`. Disable BLA and show the deep-zoom hint when `engine.usesDeepPath()` is false.
+Verify the control by hand.
