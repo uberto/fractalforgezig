@@ -77,8 +77,8 @@ terminal outcomes atomically when SDL invokes the callback off-thread.
 `export_panel.Panel` stays on main; hold one `Capture` from dimensions through picker and optional
 exact-path overwrite confirmation. Use the fresh fitted rect for defaults and `Displayed.scene`
 for render geometry, view and colors. Only successful texture uploads replace the displayed
-metadata. Poll `image_export.Worker` while active; keep SDL and ImGui on main. Scheme load uses
-`scheme.applyToEngine`→`syncFromColouring`→deferred upload.
+metadata. `beginSeededPass` defers capture across aspect changes until refinement completes.
+Poll `image_export.Worker` on main. Scheme load uses `scheme.applyToEngine`→deferred upload.
 
 ## Testing
 

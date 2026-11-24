@@ -1,5 +1,6 @@
 const std = @import("std");
 const render = @import("../fractal/export_render.zig");
+const engine_mod = @import("../fractal/engine.zig");
 const viewport = @import("../fractal/viewport.zig");
 const image_export = @import("../fractal/image_export.zig");
 
@@ -26,6 +27,46 @@ test "failed uploads preserve the old scene and incoherent uploads clear it" {
     try std.testing.expectEqual(first.view, displayed.scene.?.view);
     displayed.uploaded(null);
     try std.testing.expectEqual(@as(?render.Snapshot, null), displayed.scene);
+}
+
+test "an aspect-changing seed and its mixed rows cannot be captured until refinement finishes" {
+    var engine = try engine_mod.Engine.initRect(std.testing.allocator, testScene().view, 8, 4, .{});
+    defer engine.deinit();
+    try engine.iterate();
+    var displayed: Displayed = .{ .scene = snapshot(&engine, true) };
+    const wide_rect = viewport.fitImageRect(0, 0, 8, 4, 8, 4);
+    _ = try Capture.commit("5", "5", wide_rect, displayed.scene);
+
+    const square_rect = viewport.fitImageRect(0, 0, 8, 8, 8, 8);
+    const seed_coherent = try beginSeededPass(&engine, true, 8, 8);
+    displayed.uploaded(snapshot(&engine, seed_coherent));
+    try std.testing.expectError(error.NoDisplayedScene, Capture.commit("5", "5", square_rect, displayed.scene));
+
+    const partial_finished = try engine.stepPassRows(1);
+    try std.testing.expect(!partial_finished);
+    displayed.uploaded(snapshot(&engine, seed_coherent or partial_finished));
+    try std.testing.expectError(error.NoDisplayedScene, Capture.commit("5", "5", square_rect, displayed.scene));
+
+    engine.cancelPass();
+    const restarted_coherent = try beginSeededPass(&engine, seed_coherent, 8, 8);
+    displayed.uploaded(snapshot(&engine, restarted_coherent));
+    try std.testing.expectError(error.NoDisplayedScene, Capture.commit("5", "5", square_rect, displayed.scene));
+
+    const finished = try engine.stepPassRows(8);
+    try std.testing.expect(finished);
+    displayed.uploaded(snapshot(&engine, restarted_coherent or finished));
+    const captured = try Capture.commit("5", "5", square_rect, displayed.scene);
+    try std.testing.expectEqual(render.Size{ .width = 8, .height = 8 }, captured.scene.source);
+}
+
+test "a same-aspect refinement seed stays eligible for capture" {
+    var engine = try engine_mod.Engine.initRect(std.testing.allocator, testScene().view, 8, 4, .{});
+    defer engine.deinit();
+    try engine.iterate();
+
+    const coherent = try beginSeededPass(&engine, true, 16, 8);
+    const rect = viewport.fitImageRect(0, 0, 16, 8, 16, 8);
+    _ = try Capture.commit("5", "5", rect, snapshot(&engine, coherent));
 }
 
 test "an empty rectangle or unavailable displayed scene cannot dispatch" {
@@ -107,6 +148,25 @@ pub const Displayed = struct {
     }
 };
 
+pub fn snapshot(engine: *const engine_mod.Engine, coherent: bool) ?render.Snapshot {
+    if (!coherent) return null;
+    return .{
+        .view = engine.view,
+        .source = .{ .width = engine.image_w, .height = engine.image_h },
+        .lut = engine.lut,
+        .params = engine.params,
+        .interior = engine.interior,
+        .max_iter = engine.max_iter,
+    };
+}
+
+/// Upsampling preserves the complex-plane spans only when the aspect stays the same.
+pub fn beginSeededPass(engine: *engine_mod.Engine, coherent: bool, width: u32, height: u32) engine_mod.ResizeError!bool {
+    const same_aspect = @as(u64, engine.image_w) * height == @as(u64, engine.image_h) * width;
+    try engine.beginPass(width, height);
+    return coherent and same_aspect;
+}
+
 pub const Capture = struct {
     size: render.Size,
     scene: render.Snapshot,
@@ -185,7 +245,7 @@ pub fn waitMs(owes_live_or_dialog: bool, owes_export: bool) i32 {
 pub fn failureMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidDimensions => limits,
-        error.NoDisplayedScene, error.InvalidSnapshot => "No coherent image to export. Wait for the viewport to finish rendering and retry.",
+        error.NoDisplayedScene, error.InvalidSnapshot => "No coherent image to export. If rendering was canceled, select Render. Retry when rendering finishes.",
         error.PathTooLong => "The destination path is too long. Choose a shorter folder or filename.",
         error.InvalidDestination => "Choose an absolute path with a valid PNG filename.",
         error.PickerFailed => "Could not open the PNG save dialog. Reopen File → Export PNG and retry.",

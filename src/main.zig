@@ -31,7 +31,6 @@ const persist = @import("fractal/persist.zig");
 const scheme = @import("fractal/scheme.zig");
 const export_flow = @import("ui/export_flow.zig");
 const export_panel = @import("ui/export_panel.zig");
-const export_render = @import("fractal/export_render.zig");
 const dialog = @import("ui/dialog.zig");
 
 const app_log = std.log.scoped(.app);
@@ -319,6 +318,7 @@ const NavState = struct {
     /// Set when engine output changed and needs to be uploaded to the GPU texture.
     /// Upload is deferred to after ui.endFrame() so ImGui never sees a destroyed handle.
     needs_upload: bool = false,
+    /// Whether the CPU pixels share the current export mapping, including any seed rows.
     export_scene_valid: bool = true,
     /// Set for the ONE frame after an upload: the pixels went to the texture *after* the frame
     /// that was presented, so what the user sees is one frame stale. The loop must draw once
@@ -759,17 +759,6 @@ fn uploadFractal(device: gpu.Device, texture: *texture_mod.Texture, engine: *con
     texture.* = replacement;
 }
 
-fn exportScene(engine: *const engine_mod.Engine) export_render.Snapshot {
-    return .{
-        .view = engine.view,
-        .source = .{ .width = engine.image_w, .height = engine.image_h },
-        .lut = engine.lut,
-        .params = engine.params,
-        .interior = engine.interior,
-        .max_iter = engine.max_iter,
-    };
-}
-
 /// Apply a new view: push the old one on the undo stack, then show it (see `showViewCoarse`).
 /// Every USER navigation (gesture, context menu, coord panel) comes through here; undo/redo
 /// and file-load skip the history push and call `showViewCoarse` directly.
@@ -933,10 +922,11 @@ fn requestCancel(engine: *engine_mod.Engine, nav: *NavState) void {
 /// Start the full-resolution progressive pass for the current view at the fractal region's
 /// real, rectangular size. `beginPass` reallocates the buffers and seeds them with a
 /// nearest-neighbour upsample of the coarse image, so the very first frame already shows the
-/// right framing as a BLOCKY preview that then sharpens band by band.
+/// BLOCKY preview that then sharpens band by band. An aspect change mixes mappings
+/// until the final band lands.
 fn beginFullPass(engine: *engine_mod.Engine, nav: *NavState, real_w: u32, real_h: u32) void {
     nav.pass_ns = 0;
-    engine.beginPass(real_w, real_h) catch |err| {
+    nav.export_scene_valid = export_flow.beginSeededPass(engine, nav.export_scene_valid, real_w, real_h) catch |err| {
         app_log.err(
             "full-res pass at {d}×{d} could not start ({s}); display stays coarse",
             .{ real_w, real_h, @errorName(err) },
@@ -1015,7 +1005,7 @@ fn runLoop(
     defer png_export.worker.shutdown();
     // Initialized from the uploaded startup frame. CPU state can move ahead of this
     // value before draw and may never reach the screen if an upload fails.
-    var displayed: export_flow.Displayed = .{ .scene = exportScene(engine) };
+    var displayed: export_flow.Displayed = .{ .scene = export_flow.snapshot(engine, true) };
     // The FULL-RESOLUTION target: the fractal region's live pixel size, reported by
     // `panels.draw` each frame. Tracked separately from `engine.image_w/h`, which is at the
     // coarse preview size while a navigation is in flight.
@@ -1477,7 +1467,7 @@ fn runLoop(
         if (nav.needs_upload) {
             if (uploadFractal(device, texture, engine)) {
                 did_upload = true;
-                displayed.uploaded(if (nav.export_scene_valid) exportScene(engine) else null);
+                displayed.uploaded(export_flow.snapshot(engine, nav.export_scene_valid));
             } else |err| {
                 displayed.uploaded(err);
                 app_log.err("texture upload failed ({s}); display keeps the previous image", .{@errorName(err)});
