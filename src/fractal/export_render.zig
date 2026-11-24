@@ -272,18 +272,27 @@ const Stop = struct {
     }
 };
 
+// Complete after 1,025 steps so a checkpoint later than 1,024 is never reached.
+const cancellation_test_steps = 1025;
+
 test "cancellation interrupts reference orbit preparation" {
     var scene = fixture();
     scene.view = try geometry.SquareView.fromCenterSide(.{ .re = 0, .im = 0 }, 1e-30);
-    scene.max_iter = 4096;
+    scene.max_iter = cancellation_test_steps;
     var stop = Stop{ .remaining_checks = 2 };
-    try std.testing.expectError(error.Cancelled, BandRenderer.init(std.testing.allocator, scene, .{ .width = 1, .height = 1 }, stop.control()));
+    const result = BandRenderer.init(std.testing.allocator, scene, .{ .width = 1, .height = 1 }, stop.control());
+    const preparation: anyerror!void = if (result) |renderer| done: {
+        var completed = renderer;
+        completed.deinit();
+        break :done {};
+    } else |err| err;
+    try std.testing.expectError(error.Cancelled, preparation);
 }
 
 fn expectPixelCancelled(deep: bool) !void {
     var scene = fixture();
     scene.view = try geometry.SquareView.fromCenterSide(.{ .re = 0, .im = 0 }, if (deep) 1e-30 else 1.0);
-    scene.max_iter = 4096;
+    scene.max_iter = cancellation_test_steps;
     var renderer = try BandRenderer.init(std.testing.allocator, scene, .{ .width = 1, .height = 1 }, null);
     defer renderer.deinit();
     var stop = Stop{ .remaining_checks = 2 };
