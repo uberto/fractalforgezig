@@ -76,6 +76,7 @@ const color = @import("color.zig");
 const autoiter = @import("autoiter.zig");
 const progressive = @import("progressive.zig");
 const perturb = @import("perturb.zig");
+const bla = @import("bla.zig");
 
 const Viewport = viewport.Viewport;
 const SquareView = viewport.SquareView;
@@ -156,6 +157,19 @@ pub const IterFn = *const fn (
     orbit: ?*const perturb.ReferenceOrbit,
 ) anyerror!void;
 
+/// GPU band backend for an accelerated deep view. Both borrowed inputs are required.
+pub const BlaIterFn = *const fn (
+    view: SquareView,
+    image_w: u32,
+    image_h: u32,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    iter_band: []f32,
+    orbit: *const perturb.ReferenceOrbit,
+    table: *const bla.BlaTable,
+) anyerror!void;
+
 /// The persistent render state + decoupling counters. The app allocates one via `init`,
 /// drives it (`iterate` once, then `setViewport`/`setPolicy`/`resize` on navigation and
 /// `setGradient`/`setMapping`/`setInterior` on palette edits), reads `output()` to upload,
@@ -204,6 +218,12 @@ pub const Engine = struct {
     /// Optional GPU iteration function set by `main.zig` after pipeline creation.
     /// Null until wired; `iterate` falls back to CPU when null.
     gpu_iter_fn: ?IterFn,
+    use_bla: bool = false,
+    gpu_bla_iter_fn: ?BlaIterFn = null,
+    /// CPU elementary steps charged to the current or most recent deep render.
+    last_cpu_deep_steps: u64 = 0,
+    /// Borrowed by each band and released with the reference orbit.
+    bla_table: ?bla.BlaTable = null,
     /// The in-flight progressive pass (M5), or null when the image is final. Non-null means
     /// rows `pass.rows_done ..` still show the seeded preview, so the UI must report
     /// "rendering" and freeze the edit panels. Owned by `beginPass`/`stepPass`; read it
@@ -220,13 +240,10 @@ pub const Engine = struct {
     orbit_center: viewport.ComplexHi,
     orbit_max_iter: u32,
     /// How many times this engine has reported that a deep render could not use the GPU (M6/T6).
-    /// Bumped in the ONE place `perturb.gpuFallbackMessage` is logged (`reportGpuFallback`), so it
-    /// IS that call count: a progressive deep render of N chunks outside the GPU envelope must
-    /// bump it by ONE, not by N.
+    /// Bumped once per render when a GPU budget or precision warning is logged.
     gpu_fallbacks: u32,
-    /// Why the current (or most recent) render skipped the GPU deep path, or null when it did
-    /// not skip it. Cleared at the start of every render, so it always describes the render whose
-    /// image is on screen.
+    /// Reference-orbit or precision limit that ruled out the GPU. A BLA table budget warning
+    /// is tracked by `gpu_fallbacks` and names its own limit in the log.
     gpu_fallback_reason: ?perturb.FallbackReason,
     /// Whether the CURRENT render has already reported its GPU fallback — what makes the warning
     /// once-per-render instead of once-per-chunk. Reset by the two render starts (`iterate`,
@@ -366,6 +383,23 @@ pub const Engine = struct {
             self.orbit_max_iter = self.max_iter;
             self.orbit_computations += 1;
         }
+        if (self.use_bla) {
+            const vp = self.renderViewport();
+            const half_w = 0.5 * vp.scale * @as(f64, @floatFromInt(vp.width));
+            const half_h = 0.5 * vp.scale * @as(f64, @floatFromInt(vp.height));
+            const max_dc = std.math.hypot(half_w, half_h);
+            if (self.bla_table == null or self.bla_table.?.max_dc != max_dc) {
+                self.releaseBlaTable();
+                self.bla_table = bla.BlaTable.build(self.alloc, &self.orbit.?, max_dc) catch |err| {
+                    emitErr("BLA table allocation failed ({s}), side={e}, max_iter={d}; lower the iteration cap and retry", .{
+                        @errorName(err), self.view.side, self.max_iter,
+                    });
+                    return err;
+                };
+            }
+        } else {
+            self.releaseBlaTable();
+        }
         return self.orbitPtr();
     }
 
@@ -381,32 +415,72 @@ pub const Engine = struct {
     /// — including `cancelPass`, so abandoning a deep pass mid-flight hands the memory back
     /// immediately instead of holding `max_iter + 1` f64 pairs until the next render.
     fn releaseOrbit(self: *Engine) void {
+        self.releaseBlaTable();
         if (self.orbit) |*o| o.deinit(self.alloc);
         self.orbit = null;
         self.orbit_max_iter = 0;
     }
 
-    /// The GPU backend to use for THIS render's bands, or null when the render belongs on the
-    /// CPU. Null covers three cases: the toggle is off, no backend is wired, and — M6/T6 — a
-    /// deep view outside the GPU's envelope (`gpuDeepFallbackReason`), which is reported once
-    /// and NOT dispatched.
-    ///
-    /// The decision happens HERE, before the call, on purpose: an approved acceptance test
-    /// asserts the backend is invoked ZERO times below the GPU floor, so a try-then-refuse flow
-    /// (dispatch, get an error back, fall back) is wrong however correct its image is. The
-    /// band-level `catch` at both call sites stays as the safety net for genuine GPU failures at
-    /// depths the GPU does support.
-    fn gpuBackendFor(self: *Engine, orbit: ?*const perturb.ReferenceOrbit) ?IterFn {
-        if (!self.use_gpu) return null;
-        const iter_fn = self.gpu_iter_fn orelse return null;
-        // A null orbit is a shallow view: the GPU's direct kernel has no precision floor of its
-        // own to respect beyond the one the deep path exists to replace.
-        const o = orbit orelse return iter_fn;
-        if (gpuDeepFallbackReason(self.view.side, o.len())) |reason| {
+    fn releaseBlaTable(self: *Engine) void {
+        if (self.bla_table) |*table| table.deinit(self.alloc);
+        self.bla_table = null;
+    }
+
+    /// Return false before dispatch if this band belongs on the CPU.
+    fn gpuIterateBand(
+        self: *Engine,
+        band: []f32,
+        y0: u32,
+        rows: u32,
+        orbit: ?*const perturb.ReferenceOrbit,
+    ) bool {
+        if (!self.use_gpu) return false;
+        const result = if (self.bla_table) |*table| blk: {
+            // Check the table first: an oversized table can also exceed the orbit budget.
+            if (table.len() > bla.gpu_max_table_len) {
+                if (self.recordGpuFallback()) {
+                    var buf: [bla.fallback_message_buf_len]u8 = undefined;
+                    if (bla.gpuFallbackMessage(&buf)) |message| {
+                        log.warn("{s}", .{message});
+                    } else |err| {
+                        log.warn("GPU acceleration table exceeds its budget; falling back to CPU ({s})", .{@errorName(err)});
+                    }
+                }
+                return false;
+            }
+            const iter_fn = self.gpu_bla_iter_fn orelse return false;
+            const o = orbit orelse return false;
+            if (!self.gpuOrbitFits(o)) return false;
+            break :blk iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, rows, band, o, table);
+        } else blk: {
+            const iter_fn = self.gpu_iter_fn orelse return false;
+            if (orbit) |o| {
+                if (!self.gpuOrbitFits(o)) return false;
+            }
+            break :blk iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, rows, band, orbit);
+        };
+        result catch |err| {
+            log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
+                @errorName(err), y0, y0 + rows,
+            });
+            return false;
+        };
+        return true;
+    }
+
+    fn gpuOrbitFits(self: *Engine, orbit: *const perturb.ReferenceOrbit) bool {
+        if (gpuDeepFallbackReason(self.view.side, orbit.len())) |reason| {
             self.reportGpuFallback(reason);
-            return null;
+            return false;
         }
-        return iter_fn;
+        return true;
+    }
+
+    fn recordGpuFallback(self: *Engine) bool {
+        if (self.gpu_fallback_reported) return false;
+        self.gpu_fallback_reported = true;
+        self.gpu_fallbacks += 1;
+        return true;
     }
 
     /// Report — ONCE per render — that this deep view is being rendered on the CPU, naming the
@@ -418,9 +492,7 @@ pub const Engine = struct {
     /// `.warn`, not `.err`: the render still happens and the image is correct — only slower.
     fn reportGpuFallback(self: *Engine, reason: perturb.FallbackReason) void {
         self.gpu_fallback_reason = reason;
-        if (self.gpu_fallback_reported) return;
-        self.gpu_fallback_reported = true;
-        self.gpu_fallbacks += 1;
+        if (!self.recordGpuFallback()) return;
         var buf: [perturb.fallback_message_buf_len]u8 = undefined;
         if (perturb.gpuFallbackMessage(&buf, reason)) |line| {
             log.warn("{s}", .{line});
@@ -429,11 +501,11 @@ pub const Engine = struct {
         }
     }
 
-    /// Forget the previous render's GPU-fallback report. Called by both render starts so the
-    /// flag scopes a RENDER and every render that falls back says so.
-    fn resetGpuFallback(self: *Engine) void {
+    /// Scope GPU fallback warnings and CPU step accounting to one render.
+    fn resetRenderMetrics(self: *Engine) void {
         self.gpu_fallback_reported = false;
         self.gpu_fallback_reason = null;
+        self.last_cpu_deep_steps = 0;
     }
 
     /// Iterate rows `y0 .. y0+rows` of the persistent buffer ON THE CPU, through whichever
@@ -453,7 +525,11 @@ pub const Engine = struct {
         const count: usize = @as(usize, rows) * @as(usize, self.image_w);
         if (start + count > self.iter.len) return EngineError.BufferSizeMismatch;
         // The deep path is band-LOCAL (row `y0` at index 0), like the GPU's contract.
-        try iterbuf.iterateDeepBandInto(self.iter[start..][0..count], vp, self.max_iter, y0, rows, o);
+        const band = self.iter[start..][0..count];
+        self.last_cpu_deep_steps += if (self.bla_table) |*table|
+            try iterbuf.iterateDeepBandBlaCountedInto(band, vp, self.max_iter, y0, rows, o, table)
+        else
+            try iterbuf.iterateDeepBandCountedInto(band, vp, self.max_iter, y0, rows, o);
     }
 
     /// (Re)run the EXPENSIVE stage for the current view / image side / policy: refresh
@@ -466,19 +542,14 @@ pub const Engine = struct {
         // that pass's orbit with it, which is for a view this render may not share.
         self.pass = null;
         self.releaseOrbit();
-        self.resetGpuFallback();
+        self.resetRenderMetrics();
         try validateGeometry(self.view, self.image_side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
         const vp = self.renderViewport();
         // One orbit, for this render only: freed when the render ends, success or failure.
-        const orbit = try self.ensureOrbit();
         defer self.releaseOrbit();
-        if (self.gpuBackendFor(orbit)) |iter_fn| {
-            iter_fn(self.view, self.image_w, self.image_h, self.max_iter, 0, self.image_h, self.iter, orbit) catch |err| {
-                log.warn("GPU iterate failed ({s}), falling back to CPU", .{@errorName(err)});
-                try self.cpuIterateBand(vp, 0, self.image_h, orbit);
-            };
-        } else {
+        const orbit = try self.ensureOrbit();
+        if (!self.gpuIterateBand(self.iter, 0, self.image_h, orbit)) {
             try self.cpuIterateBand(vp, 0, self.image_h, orbit);
         }
         self.iteration_passes += 1;
@@ -596,7 +667,7 @@ pub const Engine = struct {
         // A new pass supersedes the previous render, orbit included: the first chunk that needs
         // one computes it for THIS view.
         self.releaseOrbit();
-        self.resetGpuFallback();
+        self.resetRenderMetrics();
         const side = @min(w, h);
         try validateGeometry(self.view, side);
         self.max_iter = try effectiveMaxIter(self.view, self.policy);
@@ -670,24 +741,15 @@ pub const Engine = struct {
 
         const chunk = @min(rows, p.rows_total - @min(p.rows_done, p.rows_total));
         const y0 = p.rows_done;
-        var done_on_gpu = false;
-        if (self.gpuBackendFor(orbit)) |iter_fn| {
-            const band_start: usize = @as(usize, y0) * @as(usize, self.image_w);
-            const band_len: usize = @as(usize, chunk) * @as(usize, self.image_w);
-            if (band_start + band_len <= self.iter.len) {
-                const band = self.iter[band_start..][0..band_len];
-                if (iter_fn(self.view, self.image_w, self.image_h, self.max_iter, y0, chunk, band, orbit)) |_| {
-                    done_on_gpu = true;
-                } else |err| {
-                    log.warn("GPU iterate failed ({s}), falling back to CPU for rows {d}..{d}", .{
-                        @errorName(err),
-                        y0,
-                        y0 + chunk,
-                    });
-                }
-            }
+        const band_start: usize = @as(usize, y0) * self.image_w;
+        const band_len: usize = @as(usize, chunk) * self.image_w;
+        const steps_before = self.last_cpu_deep_steps;
+        errdefer self.last_cpu_deep_steps = steps_before;
+        if (band_start + band_len > self.iter.len or
+            !self.gpuIterateBand(self.iter[band_start..][0..band_len], y0, chunk, orbit))
+        {
+            try self.cpuIterateBand(vp, y0, chunk, orbit);
         }
-        if (!done_on_gpu) try self.cpuIterateBand(vp, y0, chunk, orbit);
         try self.recolorRows(y0, chunk);
         p.rows_done += chunk;
         self.pass = p;
@@ -804,7 +866,10 @@ pub const Engine = struct {
     /// Write this engine's re-iterate summary line into `buf` (see `iteratePassSummary`).
     /// Pass a `[iterate_summary_buf_len]u8`.
     pub fn iterateSummary(self: *const Engine, buf: []u8) ![]u8 {
-        return iteratePassSummary(buf, self.iteration_passes, self.view, self.image_side, self.policy);
+        const line = try iteratePassSummary(buf, self.iteration_passes, self.view, self.image_side, self.policy);
+        if (self.last_cpu_deep_steps == 0) return line;
+        const suffix = try std.fmt.bufPrint(buf[line.len..], ", cpu_deep_steps={d}", .{self.last_cpu_deep_steps});
+        return buf[0 .. line.len + suffix.len];
     }
 
     /// Write WHICH iteration path this engine's current view uses into `buf` (T3's
@@ -858,7 +923,7 @@ pub const Engine = struct {
 /// holds `orbit_len` entries — the ONE definition of the GPU deep-zoom envelope, keyed on T3's
 /// `perturb.gpu_floor_side` and `perturb.gpu_max_orbit_len`. `null` means the GPU may render it.
 ///
-/// Consulted TWICE, deliberately. `Engine.gpuBackendFor` consults it BEFORE calling
+/// Consulted TWICE, deliberately. `Engine.gpuIterateBand` consults it BEFORE calling
 /// `gpu_iter_fn`, which is what makes the backend's invocation count zero outside the envelope;
 /// `gpu/compute.zig`'s `gpuIterateDeepRows` consults it again as defence in depth, so a future
 /// caller that skips the pre-check gets a typed error instead of a quantized image. It lives
@@ -980,7 +1045,7 @@ const max_u64_digits: usize = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u64
 
 const iterate_prefix = "iterate pass ";
 
-/// Buffer size that fits ANY `iteratePassSummary` result. An UPPER bound rather than the
+/// Buffer size for `iteratePassSummary` plus the deep CPU step total. An UPPER bound rather than the
 /// exact worst case, because `viewport.coord_buf_len` (the center readout) is itself a
 /// bound; pinned by a test that the widest realistic line fits with room to spare. A
 /// shorter buffer returns `error.NoSpaceLeft`.
@@ -988,7 +1053,8 @@ pub const iterate_summary_buf_len: usize = iterate_prefix.len + max_u32_digits +
     ": center=".len + viewport.coord_buf_len +
     ", mag=".len + viewport.max_float_chars +
     ", ".len + autoiter.summary_buf_len +
-    ", S=".len + max_u32_digits + "px".len;
+    ", S=".len + max_u32_digits + "px".len +
+    ", cpu_deep_steps=".len + max_u64_digits;
 
 /// The success summary for one iteration pass:
 /// `"iterate pass 3: center=-0.7500 + 0.0000i, mag=2.0203050891044214e-1, max_iter=512 (auto), S=900px"`.
@@ -2640,4 +2706,85 @@ test "orbit_message_buf_len fits the worst-case message" {
 test "orbitFailureMessage reports NoSpaceLeft rather than truncating into a shorter buffer" {
     var buf: [8]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, orbitFailureMessage(&buf, error.OutOfMemory, 1.0e-30, 512));
+}
+
+test "plain CPU deep rendering reports the independent counted total" {
+    var e = try deepEngine(1.0e-20, 512);
+    defer e.deinit();
+    var orbit = try perturb.ReferenceOrbit.compute(testing.allocator, e.view.center(), e.max_iter);
+    defer orbit.deinit(testing.allocator);
+    var expected: [deep_side * deep_side]f32 = undefined;
+    const steps = try iterbuf.iterateDeepBandCountedInto(&expected, e.renderViewport(), e.max_iter, 0, deep_side, &orbit);
+    try e.iterate();
+    try testing.expectEqual(steps, e.last_cpu_deep_steps);
+}
+
+test "BLA progressive bands reuse the table and free it at completion" {
+    var e = try deepEngine(1.0e-20, 512);
+    defer e.deinit();
+    e.use_bla = true;
+    try e.beginPass(golden_side, golden_side);
+    _ = try e.stepPassRows(1);
+    const levels = e.bla_table.?.levels.ptr;
+    _ = try e.stepPassRows(1);
+    try testing.expectEqual(levels, e.bla_table.?.levels.ptr);
+    _ = try e.stepPassRows(golden_side);
+    try testing.expect(e.bla_table == null);
+}
+
+test "an oversized BLA table skips both GPU backends and reports one budget warning" {
+    const view = try SquareView.fromCenterSide(.{ .re = 0, .im = 0 }, 1.0e-15);
+    var e = try Engine.init(testing.allocator, view, 1, try IterPolicy.manual(@intCast(bla.gpu_max_table_len + 1)));
+    defer e.deinit();
+    e.use_bla = true;
+    e.use_gpu = true;
+    e.gpu_iter_fn = countingStub;
+    e.gpu_bla_iter_fn = struct {
+        fn unexpected(_: SquareView, _: u32, _: u32, _: u32, _: u32, _: u32, _: []f32, _: *const perturb.ReferenceOrbit, _: *const bla.BlaTable) anyerror!void {
+            gpu_stub_calls += 1;
+        }
+    }.unexpected;
+    gpu_stub_calls = 0;
+    try e.iterate();
+    try testing.expectEqual(@as(u32, 0), gpu_stub_calls);
+    try testing.expectEqual(@as(u32, 1), e.iteration_passes);
+    try testing.expectEqual(@as(u32, 1), e.gpu_fallbacks);
+    try testing.expectEqual(@as(f32, -1.0), e.iter[0]);
+}
+
+test "BLA does not change the shallow image or count deep work" {
+    var e = try testEngine();
+    defer e.deinit();
+    try e.iterate();
+    var expected: [golden_side * golden_side]f32 = undefined;
+    @memcpy(&expected, e.iter);
+    e.use_bla = true;
+    try e.iterate();
+    try testing.expectEqualSlices(f32, &expected, e.iter);
+    try testing.expectEqual(@as(u64, 0), e.last_cpu_deep_steps);
+}
+
+test "a CPU deep pass summary includes the elementary step count" {
+    var e = try deepEngine(1.0e-20, 512);
+    defer e.deinit();
+    try e.iterate();
+    var buf: [iterate_summary_buf_len]u8 = undefined;
+    var expected: [64]u8 = undefined;
+    const suffix = try std.fmt.bufPrint(&expected, "cpu_deep_steps={d}", .{e.last_cpu_deep_steps});
+    try testing.expect(std.mem.endsWith(u8, try e.iterateSummary(&buf), suffix));
+}
+
+test "a deep BLA band inside the GPU budgets uses the accelerated backend" {
+    var e = try deepEngine(1.0e-20, 512);
+    defer e.deinit();
+    e.use_bla = true;
+    e.use_gpu = true;
+    e.gpu_bla_iter_fn = struct {
+        fn iterate(_: SquareView, _: u32, _: u32, _: u32, _: u32, _: u32, band: []f32, orbit: *const perturb.ReferenceOrbit, table: *const bla.BlaTable) anyerror!void {
+            try testing.expect(table.len() >= orbit.len() - 1);
+            @memset(band, 42.0);
+        }
+    }.iterate;
+    try e.iterate();
+    try testing.expectEqual(@as(f32, 42.0), e.iter[0]);
 }

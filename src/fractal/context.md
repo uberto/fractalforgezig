@@ -96,7 +96,7 @@ ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,`mandelbrot.iterateExact`.
   `iterateDeltaCounted.steps`);`iterateDeepBandInto` delegates to it,discards count.
   `iterateDeepBandBlaInto(…,orbit,table:*const bla.BlaTable)`=BLA twin(each pixel via
   `bla.iterateDeltaBla`);`iterateDeepBandBlaCountedInto(…,orbit,table) !u64`=BLA band+step total
-  (comparable to the plain counted total). T3's engine renders+accumulates via the counted pair.
+  (comparable to the plain counted total).
 - `progressive.zig`—PURE chunk scheduler+upsampler.
   `Pass{rows_total,rows_done,chunk_rows}`:`fraction()`,`done()`,`nextChunk()`(never 0),
   `advance(rows,elapsed_ns)`. `adaptChunkRows(rows,elapsed_ns,target_ns)`→
@@ -109,6 +109,8 @@ ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,`mandelbrot.iterateExact`.
   `iter:[]f32`/`rgba:[]u8`,`gradient`+`lut`,`params`,`interior`,`iteration_passes`/`color_passes`.
   `use_gpu`+`gpu_iter_fn:?IterFn(view,w,h,max_iter,y0,rows,band,orbit)`=one BAND/call;
   BOTH backends chunk;a failed band→CPU.`init` does NOT iterate.
+  Opt in with `use_bla`; `gpu_bla_iter_fn` borrows orbit+table. Free the table with the
+  orbit; over-budget tables run on CPU. Read `last_cpu_deep_steps` after a render.
   PATH CHOICE HERE:`usesDeepPath()`;`iterate`+`stepPassRows` dispatch via ONE private
   `cpuIterateBand`.`ensureOrbit` builds ONE `ReferenceOrbit` per render(lazy;`orbit_computations`
   counts),`orbitPtr()` borrows it,EVERY boundary(`iterate`,`beginPass`,`cancelPass`,`finishPass`,
