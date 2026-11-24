@@ -114,7 +114,88 @@ box-select gestures, so navigation at depth does not silently snap back to doubl
 - **Test**: `src/deep_zoom_test.zig::acceptance: a cursor-anchored zoom at 1e-25 keeps full precision`
 - **Test**: `src/fractal/navigate.zig::zoomAbout at depth still pins the anchor to its pixel`
 
+### Requirement: BLA iteration acceleration
+
+The system SHALL provide an opt-in acceleration for the deep (perturbation) render path that,
+when enabled, produces an image indistinguishable in interior/exterior classification from the
+plain perturbation path while performing materially fewer elementary iteration steps, by skipping
+runs of iterations along the reference orbit with local approximations that are only applied
+where they are provably valid.
+
+#### Scenario: The accelerated path draws the same picture with far fewer steps
+
+- **WHEN** a deep view is iterated with the acceleration on and with it off, over the same grid of
+  pixels (64×64 in AT1, with a supplemental 8×8 grid)
+- **THEN** every pixel gets the same interior/exterior classification, at least 99% of all pixels
+  get a smooth value within one iteration of the plain path, and the accelerated path performs
+  at most one third as many elementary iteration steps as the plain path over the grid
+- **Test**: `src/deep_zoom_test.zig::acceptance: BLA renders the same deep view in far fewer steps`
+
+#### Scenario: The acceleration is never applied outside a step's validity radius
+
+- **WHEN** a pixel whose delta grows large enough to force repeated rebasing is iterated with the
+  acceleration on
+- **THEN** its result still matches the plain perturbation path within one iteration, because an
+  approximation skip is taken only while the pixel's value stays inside the skipped run's safety
+  radius and a single exact perturbation step is taken otherwise
+- **Test**: `src/fractal/bla.zig::a large-delta pixel matches plain perturbation`
+
+### Requirement: Accelerated deep zoom on the GPU
+
+The system SHALL apply the same acceleration on the GPU deep path wherever the GPU can carry it,
+uploading the table the CPU built and agreeing with the CPU accelerated path to the tolerance the
+deep-zoom GPU agreement already holds; where the table exceeds the GPU's budget the render SHALL be
+completed on the CPU with a logged warning, so an accelerated deep view always renders.
+
+> The CPU pixel agreement is measured against plain CPU perturbation on the same grid.
+> GPU agreement is measured against the CPU accelerated path using the existing cross-device
+> tolerances of the plain deep GPU path.
+
+#### Scenario: The GPU accelerated path agrees with the CPU
+
+- **WHEN** a deep view at side 1e-20 is rendered on the GPU and on the CPU, both with the
+  acceleration on and iterating the same reference orbit and table
+- **THEN** the accelerated GPU image diverges from the CPU accelerated image by no more than the
+  plain deep GPU path already diverges from the CPU at that depth — the same interior/exterior
+  classification except for the negligible escape-boundary margin the f32 GPU path inherently
+  carries, and a mean absolute smooth-value difference within that same pre-existing bound; the
+  acceleration itself adds no divergence
+- **Test**: `src/gpu_headless_test.zig::compute: the accelerated deep kernel agrees with the CPU accelerated path at 1e-20`
+
+#### Scenario: A table too large for the GPU is finished on the CPU
+
+- **WHEN** the acceleration is on and the table a deep view needs is larger than the GPU budget
+- **THEN** the render is completed by the CPU accelerated path, a warning is logged naming the
+  budget that was hit, and the resulting image is the CPU image
+- **Test**: `src/deep_zoom_test.zig::an accelerated deep view whose table overflows the GPU budget renders on the CPU`
+
+### Requirement: Accelerated deep zoom is a saved, deep-only setting
+
+The system SHALL expose the acceleration as a user setting that is off by default, saved with the
+view, and inert on shallow views: a view saved with the setting on restores with it on, a picture
+saved before the setting existed restores with it off, and toggling it on a view too shallow for
+the deep path changes nothing about the rendered image.
+
+#### Scenario: The setting round-trips and defaults off for older files
+
+- **WHEN** an app state with the acceleration on is written and read back, and separately a saved
+  picture that predates the setting is read
+- **THEN** the first restores with the acceleration on and the second restores with it off, without
+  the read failing
+- **Test**: `src/fractal/persist.zig::the BLA setting round-trips and is off when absent`
+
+#### Scenario: On a shallow view the setting has no effect and the control says so
+
+- **WHEN** the acceleration is toggled on while the current view is shallow (side above the deep
+  threshold, so no reference orbit is in play)
+- **THEN** the rendered image is unchanged and the control is shown inactive with a hint that the
+  acceleration engages only at depth
+- **Test**: _Manual pilot pending_ — verify the disabled data-panel checkbox, its depth hint,
+  and the unchanged shallow render.
+
 ## Notes
+
+- BLA supersedes Series Approximation, which is outside this app’s scope.
 
 - The switch between direct and deep iteration, the reference orbit's lifetime, the GPU's own
   precision floor and orbit budget, and the extended-precision centre type are implementation:

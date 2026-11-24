@@ -30,8 +30,9 @@ and escape smoothing across the two kernels.
 Call `gpuIterateDeepBlaRows` with the orbit and the BLA table built for it. Upload a level-ordered
 sequence of 48-byte `GpuBlaBlock` entries. The header holds the parameter radius. Each block holds
 the three complex coefficients, validity radius and residual bounds as f32. Apply the quadratic
-map only within the admissible radius and iteration budget. Replay ambiguous pixels using plain
-GPU perturbation.
+map only within the admissible radius and iteration budget. Check the rounded parameter delta against the table header. If it exceeds the
+header radius, take exact steps for that pixel. Replay pixels using plain GPU perturbation
+when uncertainty prevents certifying rebase, escape or smooth value.
 
 Upload the orbit and optional BLA table each dispatch. The engine owns their render lifetime.
 Check precision floor and orbit budget via `engine.gpuDeepFallbackReason` before allocating GPU

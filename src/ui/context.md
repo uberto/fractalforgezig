@@ -17,16 +17,8 @@ Keep `no_scrollbar`: cut a `ContentAvail`→region→content oscillation that ca
 `panels.zig`—`draw(…)→DrawResult{ctx_action,image_rect,render_w,render_h,needs_rerender,
 save_requested,open_requested,coord,toggle_julia/orbit/fullscreen}`:`image_rect`=fitted ON-SCREEN
 rect(mapping),`render_w/h`=REGION size. `rendering` freezes data panel(`igBeginDisabled`),leaving
-image+wheel/pinch+status-bar live. `drawMenuBar` View menu(Julia/Orbit inspector,sep,Full screen
-"F11"):each item's `selected`=CURRENT `julia_open`/`orbit_open`/`fullscreen` passed INTO
-`draw`(checkmark mirrors live state);a click reports `toggle_*`,main.zig owns+flips the bool after
-the frame. `fullscreen`⇒layout SKIPS data-panel child+disabled block,fractal fills content;main.zig
-drives `SDL_SetWindowFullscreen`(borderless)+F11,NEVER Escape(m9). Status
-bar(`drawStatusBar`,OUTSIDE the disabled block) shows what
-`progressive.statusControl(rendering,cancelled)` picks:`.cancel`⇒`igProgressBar`
-(+`progressLabel`,`progress`=`engine.passFraction()`) sharing its line with Cancel;`.render`⇒Render
-button;`.none`⇒hover readout. Buttons→`DrawResult.cancel_requested/render_requested`,main.zig acts
-after. Status-bar lookup:`engine.renderViewport().pixelIndex(pt.lo())`(rect stride),NOT square map.
+image+wheel/pinch+status-bar live. Pass the live inspector and full-screen flags to `drawMenuBar`. Let main apply
+`DrawResult` toggles and Cancel/Render requests. Keep the status bar enabled during rendering. Status-bar lookup:`engine.renderViewport().pixelIndex(pt.lo())`(rect stride),NOT square map.
 Left image,right data+coord+palette. Palette edits stops/mode/period/banded/interior;
 `applyEdits`→setter→re-upload,NEVER re-iterates. `drawPalettePanel` draws preset
 grid(`drawSwatchGallery`):`SwatchGallery` bakes each `presets.gradientOf` to a texture ONCE,
@@ -41,13 +33,10 @@ Two OWN top-level `igBegin`/`igEnd`(`p_open`⇒T5 close box). `JuliaInspector`:2
 resize/palette),overlays `orbit.compute` via `ImDrawList_AddCircleFilled`/`_AddLine`(cimgui);
 `connect` toggles path. Texture upload DEFERRED.
 
-## Stack, bridge, `Ui` (imgui.zig)
+## Frame setup
 
-`build.zig` vendors cimgui+ImGui docking+SDL3/SDLGPU3 backends. `../cimgui.zig` holds
-`extern` decls, NOT `@cImport cimgui.h` (docking bitfields→`opaque{}`). Bridge
-(`vendor/bridge`) wraps by-value `ImVec2` calls (`ffImgui*`). Per frame:
-`newFrame()`→build→`endFrame()`→`prepareDrawData(cmd)` BEFORE the render
-pass→`renderDrawData(cmd,pass)`. Init: `SDL_Init`→`CreateWindow`→`Device.create`→`Ui.init`.
+Use the cimgui extern declarations and the bridge for by-value `ImVec2` calls.
+Call `newFrame`, build the UI, call `endFrame`, and prepare draw data before the render pass.
 
 ## Navigation + progressive render (main.zig)
 
