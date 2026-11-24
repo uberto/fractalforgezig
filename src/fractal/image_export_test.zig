@@ -7,6 +7,7 @@ const testing = std.testing;
 const name = "poster.png";
 const old = "original content";
 const size: images.Size = .{ .width = 2, .height = 3 };
+const checkpoint_timeout = 5 * std.time.ns_per_s;
 
 fn snapshot() render.Snapshot {
     return .{
@@ -188,9 +189,9 @@ test "cancel just before publication claim wins and preserves the original" {
     var worker: images.Worker = .{ .publication_hooks = .{ .context = &barrier, .before = Barrier.pause } };
     defer worker.shutdown();
     try worker.start(path, path, snapshot(), size);
-    barrier.reached.wait();
     {
         defer barrier.release.set();
+        try barrier.reached.timedWait(checkpoint_timeout);
         try testing.expectEqual(size.height, worker.poll().running);
         try testing.expectEqual(.accepted, worker.cancel());
     }
@@ -209,9 +210,9 @@ test "publication claim wins against subsequent cancellation and replaces the or
     var worker: images.Worker = .{ .publication_hooks = .{ .context = &barrier, .after = Barrier.pause } };
     defer worker.shutdown();
     try worker.start(path, path, snapshot(), size);
-    barrier.reached.wait();
     {
         defer barrier.release.set();
+        try barrier.reached.timedWait(checkpoint_timeout);
         try testing.expectEqual(.publishing, std.meta.activeTag(worker.poll()));
         try testing.expectEqual(.too_late, worker.cancel());
     }
@@ -230,9 +231,9 @@ test "a late cancellation leaves publication failure as the terminal result" {
     var worker: images.Worker = .{ .publication_hooks = .{ .context = &barrier, .after = Barrier.pause } };
     defer worker.shutdown();
     try worker.start(path, null, snapshot(), size);
-    barrier.reached.wait();
     {
         defer barrier.release.set();
+        try barrier.reached.timedWait(checkpoint_timeout);
         try tmp.dir.writeFile(.{ .sub_path = name, .data = old, .flags = .{ .exclusive = true } });
         try testing.expectEqual(.too_late, worker.cancel());
     }
@@ -243,13 +244,20 @@ test "a late cancellation leaves publication failure as the terminal result" {
 
 const Shutdown = struct {
     worker: *images.Worker,
+    timer: std.time.Timer,
+    timed_out: bool = false,
     reached: std.Thread.ResetEvent = .{},
 
     fn waitForCancellation(context: ?*anyopaque) void {
         const self: *Shutdown = @ptrCast(@alignCast(context.?));
+        self.timer.reset();
         self.reached.set();
         while (std.meta.activeTag(self.worker.poll()) == .running) {
-            std.Thread.yield() catch {};
+            if (self.timer.read() >= checkpoint_timeout) {
+                self.timed_out = true;
+                return;
+            }
+            std.Thread.sleep(std.time.ns_per_ms);
         }
     }
 };
@@ -261,11 +269,13 @@ test "shutdown requests cancellation and joins the active export" {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try fullPath(tmp.dir, &path_buffer, name);
     var worker: images.Worker = .{};
-    var shutdown: Shutdown = .{ .worker = &worker };
+    var shutdown: Shutdown = .{ .worker = &worker, .timer = try std.time.Timer.start() };
+    defer worker.shutdown();
     worker.publication_hooks = .{ .context = &shutdown, .before = Shutdown.waitForCancellation };
     try worker.start(path, path, snapshot(), size);
-    shutdown.reached.wait();
+    try shutdown.reached.timedWait(checkpoint_timeout);
     worker.shutdown();
+    try testing.expect(!shutdown.timed_out);
     try testing.expectEqual(.cancelled, std.meta.activeTag(worker.poll()));
     try expectOld(tmp.dir);
 }
