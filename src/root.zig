@@ -22,6 +22,8 @@ test {
     // M10: pure orbit sequence for the orbit inspector (complex-plane only).
     _ = @import("fractal/orbit.zig");
     _ = @import("fractal/perturb.zig");
+    // M11: BLA acceleration for the deep path — binary tree of linear blocks over the orbit.
+    _ = @import("fractal/bla.zig");
     _ = @import("fractal/color.zig");
     _ = @import("fractal/gradient.zig");
     _ = @import("fractal/mapping.zig");

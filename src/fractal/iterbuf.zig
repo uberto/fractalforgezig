@@ -38,6 +38,7 @@ const std = @import("std");
 const viewport = @import("viewport.zig");
 const mandelbrot = @import("mandelbrot.zig");
 const perturb = @import("perturb.zig");
+const bla = @import("bla.zig");
 
 const Viewport = viewport.Viewport;
 
@@ -208,22 +209,95 @@ pub fn iterateDeepBandInto(
     rows: u32,
     orbit: *const perturb.ReferenceOrbit,
 ) IterError!void {
+    // Delegate to the counted variant and discard the tally — the two share one loop, so the
+    // plain band and the step-counting band can never drift apart.
+    _ = try iterateDeepBandCountedInto(band, vp, max_iter, y0, rows, orbit);
+}
+
+/// The step-COUNTING sibling of `iterateDeepBandInto`: fills `band` with the SAME smooth values
+/// and RETURNS the total elementary iteration steps the plain deep path spent over the band (the
+/// sum of `perturb.iterateDeltaCounted(...).steps`). T3's engine calls this to accumulate the
+/// per-render `last_cpu_deep_steps` the acceleration is measured against. Same band-local
+/// contract as `iterateDeepBandInto` (`BufferSizeMismatch` / `RowRangeOutOfBounds`, `rows == 0`
+/// a legal no-op). PURE, deterministic, `f64` end to end (no `f128`).
+pub fn iterateDeepBandCountedInto(
+    band: []f32,
+    vp: Viewport,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    orbit: *const perturb.ReferenceOrbit,
+) IterError!u64 {
     if (band.len != @as(usize, rows) * @as(usize, vp.width)) return IterError.BufferSizeMismatch;
     const end = @as(u64, y0) + @as(u64, rows);
     if (end > @as(u64, vp.height)) return IterError.RowRangeOutOfBounds;
 
+    var total: u64 = 0;
     var y: u32 = 0;
     while (y < rows) : (y += 1) {
         var x: u32 = 0;
         while (x < vp.width) : (x += 1) {
             const off = pixelOffset(vp, x, y0 + y);
-            const smooth = perturb.iterateDelta(orbit.*, off.re, off.im, max_iter);
+            const r = perturb.iterateDeltaCounted(orbit.*, off.re, off.im, max_iter);
+            total += r.steps;
 
             const idx = @as(usize, y) * @as(usize, vp.width) + @as(usize, x);
             std.debug.assert(idx < band.len);
-            band[idx] = smooth;
+            band[idx] = r.value;
         }
     }
+    return total;
+}
+
+/// The BLA-accelerated sibling of `iterateDeepBandInto`: identical band-local contract and pixel
+/// geometry, but each pixel is iterated by `bla.iterateDeltaBla` against the caller-built `table`
+/// instead of `perturb.iterateDelta`. The engine (T3) builds one table per render and passes it
+/// here. PURE, deterministic, `f64` end to end.
+pub fn iterateDeepBandBlaInto(
+    band: []f32,
+    vp: Viewport,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    orbit: *const perturb.ReferenceOrbit,
+    table: *const bla.BlaTable,
+) IterError!void {
+    _ = try iterateDeepBandBlaCountedInto(band, vp, max_iter, y0, rows, orbit, table);
+}
+
+/// The step-COUNTING sibling of `iterateDeepBandBlaInto`: fills `band` with the accelerated smooth
+/// values and RETURNS the total elementary steps the BLA path spent (sum of
+/// `bla.iterateDeltaBlaCounted(...).steps`, each taken skip counting as one). Directly comparable
+/// to `iterateDeepBandCountedInto`'s total, so T3 can weigh the two per-render tallies. Same
+/// band-local contract; PURE, deterministic, `f64` end to end.
+pub fn iterateDeepBandBlaCountedInto(
+    band: []f32,
+    vp: Viewport,
+    max_iter: u32,
+    y0: u32,
+    rows: u32,
+    orbit: *const perturb.ReferenceOrbit,
+    table: *const bla.BlaTable,
+) IterError!u64 {
+    if (band.len != @as(usize, rows) * @as(usize, vp.width)) return IterError.BufferSizeMismatch;
+    const end = @as(u64, y0) + @as(u64, rows);
+    if (end > @as(u64, vp.height)) return IterError.RowRangeOutOfBounds;
+
+    var total: u64 = 0;
+    var y: u32 = 0;
+    while (y < rows) : (y += 1) {
+        var x: u32 = 0;
+        while (x < vp.width) : (x += 1) {
+            const off = pixelOffset(vp, x, y0 + y);
+            const r = bla.iterateDeltaBlaCounted(orbit, table, off.re, off.im, max_iter);
+            total += r.steps;
+
+            const idx = @as(usize, y) * @as(usize, vp.width) + @as(usize, x);
+            std.debug.assert(idx < band.len);
+            band[idx] = r.value;
+        }
+    }
+    return total;
 }
 
 /// Allocate an f32 smooth-value buffer for `vp`, iterate into it, and return it
@@ -684,4 +758,71 @@ test "iterateDeepBandInto resolves distinct values at side 1e-30, where the shal
 
     try std.testing.expectEqual(@as(u32, 1), shallow_distinct.count());
     try std.testing.expect(deep_distinct.count() >= 224); // 256 pixels; AT1's ratio (56/64)
+}
+
+test "iterateDeepBandCountedInto returns the sum of its pixels' steps" {
+    const max_iter: u32 = 4096;
+    var f = try deepFixture(1.0e-15, max_iter);
+    defer f.orbit.deinit(std.testing.allocator);
+
+    const y0 = 2;
+    var band: [deep_w * 2]f32 = undefined;
+    var expected: u64 = 0;
+    for (0..band.len) |i| {
+        const off = pixelOffset(f.vp, @intCast(i % deep_w), @intCast(y0 + i / deep_w));
+        expected += perturb.iterateDeltaCounted(f.orbit, off.re, off.im, max_iter).steps;
+    }
+    try std.testing.expectEqual(expected, try iterateDeepBandCountedInto(&band, f.vp, max_iter, y0, 2, &f.orbit));
+}
+
+test "iterateDeepBandBlaInto draws the same band as the plain deep band, in fewer steps" {
+    // The band-level equivalence T3 renders through: same classification and smooth value within
+    // one iteration for every pixel, at a materially smaller elementary-step total. A genuinely
+    // deep grid (side 1e-25, 65536) whose pixels escape, where BLA has long runs to skip.
+    const max_iter: u32 = 65536;
+    var f = try deepFixture(1.0e-25, max_iter);
+    defer f.orbit.deinit(std.testing.allocator);
+    const max_dc = f.vp.scale * @as(f64, @floatFromInt(@max(deep_w, deep_h))) * std.math.sqrt2 / 2.0;
+    var table = try bla.BlaTable.build(std.testing.allocator, &f.orbit, max_dc);
+    defer table.deinit(std.testing.allocator);
+
+    var plain: [deep_w * deep_h]f32 = undefined;
+    const plain_steps = try iterateDeepBandCountedInto(&plain, f.vp, max_iter, 0, deep_h, &f.orbit);
+    var accel: [deep_w * deep_h]f32 = undefined;
+    const bla_steps = try iterateDeepBandBlaCountedInto(&accel, f.vp, max_iter, 0, deep_h, &f.orbit, &table);
+
+    var compared: u32 = 0;
+    for (plain, accel) |p, b| {
+        const p_int = p == mandelbrot.interior_sentinel;
+        const b_int = b == mandelbrot.interior_sentinel;
+        try std.testing.expectEqual(p_int, b_int);
+        if (!p_int) {
+            try std.testing.expectApproxEqAbs(p, b, 1.0);
+            compared += 1;
+        }
+    }
+    try std.testing.expect(compared > 0);
+    try std.testing.expect(bla_steps > 0);
+    try std.testing.expect(bla_steps < plain_steps);
+}
+
+test "iterateDeepBandBlaInto and its plain sibling reject a mis-sized band and an out-of-range row" {
+    // The band-local contract holds for the accelerated bands too: a wrong length and a row past
+    // the last are rejected, never clamped.
+    const max_iter: u32 = 256;
+    var f = try deepFixture(1.0e-15, max_iter);
+    defer f.orbit.deinit(std.testing.allocator);
+    var table = try bla.BlaTable.build(std.testing.allocator, &f.orbit, 1.0e-15);
+    defer table.deinit(std.testing.allocator);
+
+    var wrong: [deep_w * 2 + 1]f32 = undefined;
+    try std.testing.expectError(
+        IterError.BufferSizeMismatch,
+        iterateDeepBandBlaInto(&wrong, f.vp, max_iter, 0, 2, &f.orbit, &table),
+    );
+    var band: [deep_w * 3]f32 = undefined;
+    try std.testing.expectError(
+        IterError.RowRangeOutOfBounds,
+        iterateDeepBandBlaCountedInto(&band, f.vp, max_iter, deep_h - 2, 3, &f.orbit, &table),
+    );
 }

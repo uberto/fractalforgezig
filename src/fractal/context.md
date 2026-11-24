@@ -72,6 +72,12 @@ ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,`mandelbrot.iterateExact`.
   orbit/render. `pathSummary(buf,side,used_deep)`/`path_summary_buf_len`.
   GPU:`gpu_floor_side`(1e-20),`gpu_max_orbit_len`(2^17),`FallbackReason`+
   `gpuFallbackMessage(buf,reason)`/`fallback_message_buf_len`.
+- `bla.zig`—Build/deinit one `BlaTable` per orbit. Supply the largest pixel
+  delta to `build`. Merge quadratic maps while bounding omitted terms and
+  both child domains. Apply a skip only when the full delta bound fits its
+  radius and certifies the endpoint. `iterateDeltaBlaCounted` includes
+  rejected skips and exact replay when escape or rebase is uncertain.
+  Check `gpu_max_table_len` and use `gpuFallbackMessage` when exceeded.
 - `gradient.zig`—`Stop{pos:f32∈[0,1],color:Rgba8}`;ASCENDING,cap `max_stops`=32:
   `fromStops`,`stops()`,`bakeLut(g,out:*[lut_size=1024]Rgba8)`,`default()`.
 - `mapping.zig`—`Mode{linear,log,cyclic}`;`Params{mode,period=default_period(32.0),banded=false}`
@@ -86,6 +92,11 @@ ONLY 2 f128 sites:`perturb.ReferenceOrbit.compute`,`mandelbrot.iterateExact`.
   `iterateDeepBandInto(band,vp,max_iter,y0,rows,orbit:*const perturb.ReferenceOrbit)`=DEEP
   twin:SAME band-local contract/errors,offsets f64 ONLY(NEVER f128),`perturb.iterateDelta` per
   pixel,SAME sample points as `iterateBandInto`(test-pinned).
+  `iterateDeepBandCountedInto(…,orbit) !u64`=same band,RETURNS total elementary steps(Σ
+  `iterateDeltaCounted.steps`);`iterateDeepBandInto` delegates to it,discards count.
+  `iterateDeepBandBlaInto(…,orbit,table:*const bla.BlaTable)`=BLA twin(each pixel via
+  `bla.iterateDeltaBla`);`iterateDeepBandBlaCountedInto(…,orbit,table) !u64`=BLA band+step total
+  (comparable to the plain counted total). T3's engine renders+accumulates via the counted pair.
 - `progressive.zig`—PURE chunk scheduler+upsampler.
   `Pass{rows_total,rows_done,chunk_rows}`:`fraction()`,`done()`,`nextChunk()`(never 0),
   `advance(rows,elapsed_ns)`. `adaptChunkRows(rows,elapsed_ns,target_ns)`→
