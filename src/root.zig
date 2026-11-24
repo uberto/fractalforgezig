@@ -30,6 +30,7 @@ test {
     _ = @import("fractal/iterbuf.zig");
     _ = @import("fractal/colorpass.zig");
     _ = @import("fractal/export_render.zig");
+    _ = @import("fractal/png.zig");
     _ = @import("fractal/engine.zig");
     _ = @import("ui/stats.zig");
     _ = @import("ui/editor.zig");

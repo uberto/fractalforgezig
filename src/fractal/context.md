@@ -61,3 +61,6 @@ LUT, mapping, interior color and resolved iteration limit by value. Use
 `Snapshot.viewport` for diagonal-preserving geometry. Reuse a `BandRenderer`
 across sequential output bands. Keep cancellation and typed errors available
 through the pure API. Publish progress and log at the file or application edge.
+Encode each RGBA row to opaque PNG via `png.Encoder.init`, `writeRow` and
+`finish`. Borrow the destination writer through finish and close it before
+publication. Discard temporary output if encoding or writer flush fails.
