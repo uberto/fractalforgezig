@@ -56,6 +56,7 @@ pub const AppState = struct {
     /// `mapping_mod.Params.banded`: a `.fractal` file written before this field existed carries no
     /// `banded` key and loads as smooth (see `Wire.banded` and `fromJson`).
     banded: bool = false,
+    use_bla: bool = false,
     interior_r: u8,
     interior_g: u8,
     interior_b: u8,
@@ -219,6 +220,8 @@ const Wire = struct {
     /// Optional so a pre-M8 file (no `banded` key) is NOT a `MissingField`: absent means smooth.
     /// This is the whole of the field's backwards compatibility — there is no version field.
     banded: ?bool = null,
+    /// Older pictures omit this key and restore with acceleration off.
+    use_bla: ?bool = null,
     interior_r: ?u8 = null,
     interior_g: ?u8 = null,
     interior_b: ?u8 = null,
@@ -256,6 +259,7 @@ pub fn toJson(state: AppState, buf: []u8) WriteError![]u8 {
         .mapping_mode = state.mapping_mode,
         .mapping_period = state.mapping_period,
         .banded = state.banded,
+        .use_bla = state.use_bla,
         .interior_r = state.interior_r,
         .interior_g = state.interior_g,
         .interior_b = state.interior_b,
@@ -290,6 +294,7 @@ pub fn fromJson(json: []const u8, alloc: std.mem.Allocator) ParseError!AppState 
     const mapping_period = w.mapping_period orelse return ParseError.MissingField;
     // Optional, never MissingField: a pre-M8 file with no `banded` key loads as smooth.
     const banded = w.banded orelse false;
+    const use_bla = w.use_bla orelse false;
     const interior_r = w.interior_r orelse return ParseError.MissingField;
     const interior_g = w.interior_g orelse return ParseError.MissingField;
     const interior_b = w.interior_b orelse return ParseError.MissingField;
@@ -340,6 +345,7 @@ pub fn fromJson(json: []const u8, alloc: std.mem.Allocator) ParseError!AppState 
         .mapping_mode = mode_copy,
         .mapping_period = mapping_period,
         .banded = banded,
+        .use_bla = use_bla,
         .interior_r = interior_r,
         .interior_g = interior_g,
         .interior_b = interior_b,
@@ -377,6 +383,7 @@ pub fn fromEngine(engine: *const engine_mod.Engine, alloc: std.mem.Allocator) er
         .mapping_mode = mode_copy,
         .mapping_period = engine.params.period,
         .banded = engine.params.banded,
+        .use_bla = engine.use_bla,
         .interior_r = engine.interior[0],
         .interior_g = engine.interior[1],
         .interior_b = engine.interior[2],
@@ -419,6 +426,7 @@ pub fn applyToEngine(state: AppState, engine: *engine_mod.Engine) ApplyError!voi
         .{ .re = state.center_re, .im = state.center_im },
         state.side,
     );
+    engine.use_bla = state.use_bla;
     try engine.setViewport(view);
 }
 
@@ -457,7 +465,53 @@ test "round-trip: fromEngine → toJson → fromJson fields match" {
     try testing.expectEqual(state.stops.len, loaded.stops.len);
     try testing.expectEqualStrings(state.mapping_mode, loaded.mapping_mode);
     try testing.expectApproxEqAbs(state.mapping_period, loaded.mapping_period, 1e-6);
+    try testing.expectEqual(state.use_bla, loaded.use_bla);
     try testing.expectEqual(state.interior_r, loaded.interior_r);
+}
+
+test "the BLA setting round-trips and is off when absent" {
+    const alloc = testing.allocator;
+    const legacy_json =
+        \\{"center_re":"-0.75","center_im":"0","side":1.0,
+        \\"policy_auto":true,"policy_manual_value":512,
+        \\"stops":[{"pos":0,"r":0,"g":0,"b":0,"a":255}],
+        \\"mapping_mode":"linear","mapping_period":32.0,
+        \\"interior_r":0,"interior_g":0,"interior_b":0,"interior_a":255}
+    ;
+    var state = try fromJson(legacy_json, alloc);
+    defer freeState(state, alloc);
+    try testing.expect(!state.use_bla);
+
+    state.use_bla = true;
+    var buf: [min_json_buf_len]u8 = undefined;
+    const loaded = try fromJson(try toJson(state, &buf), alloc);
+    defer freeState(loaded, alloc);
+    try testing.expect(loaded.use_bla);
+}
+
+test "fromEngine captures the enabled BLA setting" {
+    const alloc = testing.allocator;
+    var engine = try engine_mod.Engine.init(alloc, viewport.SquareView.defaultView(), 2, .{});
+    defer engine.deinit();
+    engine.use_bla = true;
+
+    const state = try fromEngine(&engine, alloc);
+    defer freeState(state, alloc);
+    try testing.expect(state.use_bla);
+}
+
+test "applyToEngine replaces the current BLA setting" {
+    const alloc = testing.allocator;
+    var engine = try engine_mod.Engine.init(alloc, viewport.SquareView.defaultView(), 2, .{});
+    defer engine.deinit();
+    var stops = oneStop();
+
+    var state = deepState(-0.75, 0.0, 1.0, &stops);
+    for ([_]bool{ true, false }) |enabled| {
+        state.use_bla = enabled;
+        try applyToEngine(state, &engine);
+        try testing.expectEqual(enabled, engine.use_bla);
+    }
 }
 
 test "fromJson: not-JSON returns InvalidJson" {
@@ -879,10 +933,8 @@ test "a loaded deep centre is not the f64 rounding of itself" {
     try testing.expect(loaded.center_re != narrowed);
 }
 
-test "the saved bytes differ from the base format ONLY in the centre's two lines" {
-    // Byte-for-byte what the base commit wrote for this state, with the centre re-spelled as a
-    // quoted decimal string. Asserted against a literal so an accidental reformat of ANY other
-    // field — key order, indentation, number spelling — fails here.
+test "the saved bytes preserve the field layout including BLA" {
+    // Pin the key order, indentation, and spelling of the saved fields.
     const expected =
         \\{
         \\  "center_re": "-0.75",
@@ -909,6 +961,7 @@ test "the saved bytes differ from the base format ONLY in the centre's two lines
         \\  "mapping_mode": "cyclic",
         \\  "mapping_period": 16,
         \\  "banded": false,
+        \\  "use_bla": false,
         \\  "interior_r": 1,
         \\  "interior_g": 2,
         \\  "interior_b": 3,
