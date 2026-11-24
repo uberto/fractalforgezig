@@ -30,6 +30,7 @@
 //! `threshold_side` (T4), and a difference in the *colouring* convention would show as a
 //! visible seam even with perfect iteration counts.
 const std = @import("std");
+const cancellation = @import("render_cancel.zig");
 const mandelbrot = @import("mandelbrot.zig");
 const viewport = @import("viewport.zig");
 
@@ -97,12 +98,30 @@ pub const ReferenceOrbit = struct {
         center: viewport.ComplexHi,
         max_iter: u32,
     ) (std.mem.Allocator.Error || OrbitError)!ReferenceOrbit {
+        return computeOrbit(alloc, center, max_iter, null);
+    }
+
+    pub fn computeCancellable(
+        alloc: std.mem.Allocator,
+        center: viewport.ComplexHi,
+        max_iter: u32,
+        cancel: ?cancellation.Cancel,
+    ) (std.mem.Allocator.Error || OrbitError || error{Cancelled})!ReferenceOrbit {
+        return computeOrbit(alloc, center, max_iter, cancel);
+    }
+
+    fn computeOrbit(
+        alloc: std.mem.Allocator,
+        center: viewport.ComplexHi,
+        max_iter: u32,
+        cancel: anytype,
+    ) (std.mem.Allocator.Error || OrbitError || if (@TypeOf(cancel) == @TypeOf(null)) error{} else error{Cancelled})!ReferenceOrbit {
         if (!std.math.isFinite(center.re) or !std.math.isFinite(center.im)) {
             return OrbitError.NonFiniteCenter;
         }
 
         // `max_iter` steps produce `Z_1 … Z_max_iter`, plus `Z_0 = 0` at index 0.
-        const capacity = @as(usize, max_iter) + 1;
+        const capacity = std.math.add(usize, max_iter, 1) catch return error.OutOfMemory;
         const re = try alloc.alloc(f64, capacity);
         errdefer alloc.free(re);
         const im = try alloc.alloc(f64, capacity);
@@ -115,6 +134,8 @@ pub const ReferenceOrbit = struct {
 
         var count: usize = 1;
         while (count < capacity) {
+            if (@TypeOf(cancel) != @TypeOf(null) and (count - 1) != 0 and (count - 1) % cancellation.iteration_interval == 0)
+                try cancellation.Cancel.check(cancel);
             const next_re = z_re * z_re - z_im * z_im + center.re;
             const next_im = 2.0 * z_re * z_im + center.im;
             z_re = next_re;
@@ -179,6 +200,14 @@ pub fn iterateDelta(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32
 /// `mandelbrot.iterate` delegated to `iterateFrom` and stayed byte-identical). `f64`
 /// throughout — no `f128` may enter this function.
 pub fn iterateDeltaCounted(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32) StepResult {
+    return iterateDeltaCore(orbit, dc_re, dc_im, max_iter, null);
+}
+
+pub fn iterateDeltaCancellable(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32, cancel: ?cancellation.Cancel) error{Cancelled}!f32 {
+    return (try iterateDeltaCore(orbit, dc_re, dc_im, max_iter, cancel)).value;
+}
+
+fn iterateDeltaCore(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_iter: u32, cancel: anytype) if (@TypeOf(cancel) == @TypeOf(null)) StepResult else error{Cancelled}!StepResult {
     const orbit_len = orbit.len();
     // An orbit of only `Z_0 = 0` (computed with `max_iter = 0`) carries no `Z_1 = C`, so
     // there is nothing to iterate against and no way to recover the centre. Answer like an
@@ -202,6 +231,8 @@ pub fn iterateDeltaCounted(orbit: ReferenceOrbit, dc_re: f64, dc_im: f64, max_it
     var n: u32 = 0;
     var escaped = false;
     while (n < max_iter) {
+        if (@TypeOf(cancel) != @TypeOf(null) and n != 0 and n % cancellation.iteration_interval == 0)
+            try cancellation.Cancel.check(cancel);
         // ─── Rebasing (Zhuoran's method) ──────────────────────────────────────
         // Re-anchor the delta on `Z_0` when either
         //   * the delta has grown to dominate the value it is a correction to

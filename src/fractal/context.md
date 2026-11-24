@@ -53,3 +53,11 @@ Use `persist.fromEngine`, `toJson`, `fromJson` and `applyToEngine`; release owne
 state via `freeState`. Write exact decimal-string centres and keep legacy numeric
 centre decoding. Default an absent `use_bla` field to false. Use `scheme` for
 colour-only files and `presets.all` for built-in colourings.
+
+## Image export
+
+Use `export_render.Snapshot` to carry rendered size, full-precision view, baked
+LUT, mapping, interior color and resolved iteration limit by value. Use
+`Snapshot.viewport` for diagonal-preserving geometry. Reuse a `BandRenderer`
+across sequential output bands. Keep cancellation and typed errors available
+through the pure API. Publish progress and log at the file or application edge.

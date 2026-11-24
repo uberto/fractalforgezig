@@ -24,6 +24,7 @@
 //!     escaping. Distinct from every escaped value (escaped values are ≥ 0 for the
 //!     fixed viewport's `|c| ≤ ~2.8`; see the NaN/Inf guard for pathological `c`).
 const std = @import("std");
+const cancellation = @import("render_cancel.zig");
 
 /// Escape threshold on the SQUARED modulus — avoids a sqrt in the hot loop.
 /// Bail radius 2 ⇒ `|z|² > 4`. Shared with M1's shader.
@@ -75,7 +76,7 @@ pub fn iterateExact(c_re: f128, c_im: f128, max_iter: u32) f32 {
 /// in the initial `z` and the Julia preview colours by the very same convention as the main
 /// image. Pure and deterministic: no allocation, no global state, no I/O.
 pub fn iterateJulia(z0_re: f64, z0_im: f64, c_re: f64, c_im: f64, max_iter: u32) f32 {
-    return iterateFrom(f64, z0_re, z0_im, c_re, c_im, max_iter);
+    return iterateFrom(f64, z0_re, z0_im, c_re, c_im, max_iter, null);
 }
 
 /// `iterate`'s body, parameterized on the float type so `iterateExact` is the same
@@ -83,14 +84,19 @@ pub fn iterateJulia(z0_re: f64, z0_im: f64, c_re: f64, c_im: f64, max_iter: u32)
 /// the render path and `f128` for the test ground truth. Iterates from `z = 0` (the
 /// Mandelbrot seed); the shared loop lives in `iterateFrom`.
 fn iterateIn(comptime F: type, c_re: F, c_im: F, max_iter: u32) f32 {
-    return iterateFrom(F, 0.0, 0.0, c_re, c_im, max_iter);
+    return iterateFrom(F, 0.0, 0.0, c_re, c_im, max_iter, null);
+}
+
+/// Iterate a Mandelbrot pixel with periodic cancellation checks for export.
+pub fn iterateCancellable(c_re: f64, c_im: f64, max_iter: u32, cancel: ?cancellation.Cancel) error{Cancelled}!f32 {
+    return iterateFrom(f64, 0.0, 0.0, c_re, c_im, max_iter, cancel);
 }
 
 /// The shared escape loop for BOTH the Mandelbrot map (`iterateIn`, seed `z₀ = 0`) and the
 /// Julia map (`iterateJulia`, seed = the pixel). Iterate `z = z² + c` from `(z0_re, z0_im)`
 /// with `c` fixed; the escape test and the smooth-value tail are identical to what `iterate`
 /// has always done, so the Mandelbrot path is unchanged byte-for-byte when `z₀ = 0`.
-fn iterateFrom(comptime F: type, z0_re: F, z0_im: F, c_re: F, c_im: F, max_iter: u32) f32 {
+fn iterateFrom(comptime F: type, z0_re: F, z0_im: F, c_re: F, c_im: F, max_iter: u32, cancel: anytype) if (@TypeOf(cancel) == @TypeOf(null)) f32 else error{Cancelled}!f32 {
     var z_re: F = z0_re;
     var z_im: F = z0_im;
 
@@ -99,6 +105,8 @@ fn iterateFrom(comptime F: type, z0_re: F, z0_im: F, c_re: F, c_im: F, max_iter:
     var n: u32 = 0;
     var escaped = false;
     while (n < max_iter) {
+        if (@TypeOf(cancel) != @TypeOf(null) and n != 0 and n % cancellation.iteration_interval == 0)
+            try cancellation.Cancel.check(cancel);
         const next_re = z_re * z_re - z_im * z_im + c_re;
         const next_im = 2.0 * z_re * z_im + c_im;
         z_re = next_re;

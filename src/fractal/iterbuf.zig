@@ -176,7 +176,7 @@ pub fn iterateBandInto(band: []f32, vp: Viewport, max_iter: u32, y0: u32, rows: 
 /// while `im` grows UP. `row` is the GLOBAL image row, so a band is anchored on the image and
 /// never on itself. `f64` — and it must stay `f64`: this is the value the deep path spends
 /// its precision on, and `f128` here would be ~100× slower for nothing (see `perturb.zig`).
-fn pixelOffset(vp: Viewport, x: u32, row: u32) struct { re: f64, im: f64 } {
+pub fn pixelOffset(vp: Viewport, x: u32, row: u32) struct { re: f64, im: f64 } {
     const w: f64 = @floatFromInt(vp.width);
     const h: f64 = @floatFromInt(vp.height);
     const px = @as(f64, @floatFromInt(x)) + 0.5;
