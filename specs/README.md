@@ -23,6 +23,7 @@ scenarios and a pointer to the test that pins it. Implementation detail belongs 
 | [persistence](persistence/spec.md) | Saving and reopening the complete render state as a `.fractal` JSON file, and refusing a corrupt one. |
 | [app-shell](app-shell/spec.md) | The window and its two-region layout, the status bar, progress reporting, stopping and restarting a render in progress, render statistics, the file dialogs, the View menu, full-screen presentation, startup and failure logging. |
 | [inspectors](inspectors/spec.md) | The live Julia inspector window that tracks the point under the pointer and freezes on leave, and the orbit inspector that plots a point's iterates over a mini-Mandelbrot with an optional connecting path. |
+| [image-export](image-export/spec.md) | Custom-size PNGs, fixed-diagonal framing, captured view and colouring, bounded rendering, cancellation and atomic publication. |
 
 ## Provenance
 

@@ -54,10 +54,11 @@ colour-only files and `presets.all` for built-in colourings.
 
 Use `export_render.Snapshot` to carry rendered size, full-precision view, baked
 LUT, mapping, interior color and resolved iteration limit by value. Use
-`Snapshot.viewport` for diagonal-preserving geometry. Reuse a `BandRenderer`
-across sequential output bands. Keep cancellation and typed errors available
-through the pure API. Publish progress and log at the file or application edge.
-Encode each RGBA row to opaque PNG via `png.Encoder.init`, `writeRow` and
+`Snapshot.viewport` for diagonal-preserving geometry. Reuse `BandRenderer` across eight-row bands and reuse the reference orbit.
+Preserve the resolved iteration cap and use CPU direct iteration or plain
+perturbation as the output scale requires. Relay cancellation and typed errors
+through the core. Log progress at the edge.
+Encode RGBA input as opaque RGB with stored DEFLATE via `png.Encoder.init`, `writeRow` and
 `finish`. Borrow the destination writer through finish and close it before
 publication. Discard temporary output if encoding or writer flush fails.
 

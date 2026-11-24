@@ -14,6 +14,25 @@ zig build run
 
 Run `zig build test` for the full suite or `zig build test-gpu --summary all` for the headless Metal suite. Device-dependent tests skip when a Metal device is unavailable. See the [feature specifications](specs/README.md) for behavior and acceptance tests.
 
+## Export a PNG
+
+1. Choose **File → Export PNG…**. The width and height default to the fitted fractal image.
+2. Enter the output dimensions and choose a filename. The app appends a missing `.png` suffix and asks before replacing an existing file.
+3. Watch the row progress. Cancel before publication to preserve an existing destination. Completion shows the filename and dimensions.
+
+Export rerenders the captured Mandelbrot view with its full-precision center, coloring and iteration limit. The center and complex-plane diagonal stay fixed. A different aspect ratio can crop one axis and reveal more on the other. The CPU runs one export at a time, and you can continue navigating while it works.
+
+Each axis accepts 1–16,384 pixels, with at most 100,000,000 pixels total. The opaque RGB PNG uses stored DEFLATE blocks and takes about 3 bytes per pixel plus format overhead. A 7,200 × 10,800 headless export produced a 233,474,475-byte file (about 233 MB). Publication stages the full PNG alongside the destination, so allow room for both files when replacing one. Deep zooms and higher iteration counts can take longer. Print density can be set in the printing application.
+
+## Manual PNG export checks
+
+The headless suite and poster-sized worker export passed. User GUI verification is pending.
+
+1. Launch with `zig build run` and choose a disposable directory. Letterbox the view and verify the dimension defaults match the fitted image. Export a custom palette at 1,200 × 800 and check it with `sips -g pixelWidth -g pixelHeight <file>`. Try a different aspect ratio and check center, orientation and framing at fixed diagonal.
+2. Export a deep custom-colored view at 2,400 × 1,600. Move the live view after choosing the path. Let it settle and check that progress updates while idle, the result keeps the captured view and detail, and the completion message shows the filename and dimensions.
+3. Choose an existing destination, omitting its suffix if the picker permits. Decline replacement, then repeat, authorize replacement and cancel after some rows have finished. Compare the original file hash and directory contents after both attempts.
+4. Try publishing to a path occupied by a directory named `blocked.png`. If the picker prevents selecting it, create that directory at the exact target during a large export. Check the failure message, preservation of the directory and removal of the temporary sibling.
+
 ## Deep-zoom acceleration
 
 Use **BLA** next to **GPU** in the Data panel to enable Bivariate Linear Approximation. At a view side of `1e-6` or smaller, toggling BLA starts a new render. At wider views the control is disabled and shows a deep-zoom hint. Saved `.fractal` pictures retain the setting. Pictures saved before BLA load with it off.
