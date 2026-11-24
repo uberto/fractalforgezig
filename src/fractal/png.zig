@@ -207,3 +207,56 @@ test "partial writes deliver the complete PNG" {
     }
     try testing.expectEqualSlices(u8, normal.buffered(), short.sink.buffered());
 }
+
+const BufferedWriter = struct {
+    writer: std.Io.Writer,
+    sink: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *BufferedWriter = @fieldParentPtr("writer", writer);
+        try self.sink.writeAll(writer.buffered());
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |part| {
+            try self.sink.writeAll(part);
+            written += part.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.sink.writeAll(last);
+        _ = writer.consumeAll();
+        return written + last.len * splat;
+    }
+};
+
+test "finish drains the complete PNG to the sink" {
+    var buffer: [256]u8 = undefined;
+    var output: [256]u8 = undefined;
+    var buffered = BufferedWriter{
+        .writer = .{ .buffer = &buffer, .vtable = &BufferedWriter.vtable },
+        .sink = .fixed(&output),
+    };
+    var expected: [256]u8 = undefined;
+    var normal = std.Io.Writer.fixed(&expected);
+    for ([_]*std.Io.Writer{ &buffered.writer, &normal }) |writer| {
+        var encoder = try Encoder.init(writer, .{ .width = 1, .height = 1 });
+        try encoder.writeRow(&.{ 10, 20, 30, 255 });
+        try encoder.finish();
+    }
+    try testing.expectEqualSlices(u8, normal.buffered(), buffered.sink.buffered());
+}
+
+test "finish drain failure propagates and poisons the encoder" {
+    var buffer: [256]u8 = undefined;
+    var buffered = BufferedWriter{
+        .writer = .{ .buffer = &buffer, .vtable = &BufferedWriter.vtable },
+        .sink = .failing,
+    };
+    var encoder = try Encoder.init(&buffered.writer, .{ .width = 1, .height = 1 });
+    try encoder.writeRow(&.{ 10, 20, 30, 255 });
+    try testing.expectError(error.WriteFailed, encoder.finish());
+
+    var recovered: [256]u8 = undefined;
+    buffered.sink = .fixed(&recovered);
+    try testing.expectError(error.EncoderFailed, encoder.finish());
+}
