@@ -24,8 +24,8 @@ const progressive = @import("../fractal/progressive.zig");
 
 const ui_log = std.log.scoped(.ui);
 
-const window_name = "fractalforge";
-const about_popup = "About fractalforge";
+const window_name = "Fractal Forge Z";
+const about_popup = "About Fractal Forge Z";
 
 /// Width (px) of one character of the bundled default ImGui font (ProggyClean is a 7×13
 /// bitmap font, so every glyph advances 7 px). Only used to SIZE the coordinate fields; nothing
@@ -991,8 +991,8 @@ fn floatsToColor(col: [4]f32) [4]u8 {
 /// `igOpenPopup_Str`. Closes on the Close button.
 fn drawAboutModal() void {
     if (ig.igBeginPopupModal(about_popup, null, ig.window_flags_no_resize)) {
-        ig.igTextUnformatted("fractalforge - M0 skeleton", null);
-        ig.igTextUnformatted("CPU Mandelbrot -> SDL_GPU texture -> Dear ImGui.", null);
+        ig.igTextUnformatted("Fractal Forge Z", null);
+        ig.igTextUnformatted("Uberto Barbini wrote the original Fractal Forge around 2000.", null);
         ig.igSeparator();
         if (ig.igSmallButton("Close")) ig.igCloseCurrentPopup();
         ig.igEndPopup();

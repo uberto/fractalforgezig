@@ -92,7 +92,7 @@ pub fn gpuBlaIterFn(
     try compute_mod.gpuIterateDeepBlaRows(pl, view, orbit, table, w, h, max_iter, y0, rows, iter_band);
 }
 
-const window_title = "fractalforge";
+const window_title = "Fractal Forge Z";
 const initial_window_w = 1280;
 const initial_window_h = 720;
 

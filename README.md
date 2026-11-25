@@ -1,8 +1,10 @@
-# Fractal Forge
+# Fractal Forge Z
 
-Fractal Forge is a native Mandelbrot explorer for Apple Silicon Macs, written in Zig. Follow a spiral down to a view width of `1e-30`, inspect the Julia set for a point on its boundary, or turn a favorite view into a poster-sized PNG.
+Fractal Forge Z is a native Mandelbrot explorer for Apple Silicon Macs, written in Zig. Follow a spiral down to a view width of `1e-30`, inspect the Julia set for a point on its boundary, or turn a favorite view into a poster-sized PNG.
 
-![Fractal Forge displaying the Mandelbrot set beside its coordinate and render controls](docs/images/mandelbrot-explorer.png)
+![Fractal Forge Z displaying the Mandelbrot set beside its coordinate and render controls](docs/images/mandelbrot-explorer.png)
+
+Uberto Barbini wrote the original Fractal Forge around 2000. [Visit the original project on SourceForge](https://sourceforge.net/projects/fractalforge/).
 
 ## Explore a view
 
@@ -35,7 +37,7 @@ Each axis accepts 1–16,384 pixels, with at most 100,000,000 pixels total. The 
 
 ## Deep-zoom rendering
 
-Fractal Forge uses perturbation to explore beyond double precision. At a view width of `1e-6` or smaller, enable **BLA** in the Data panel to skip groups of iterations. Metal can accelerate eligible views, and the CPU handles depths beyond the GPU precision limit.
+Fractal Forge Z uses perturbation to explore beyond double precision. At a view width of `1e-6` or smaller, enable **BLA** in the Data panel to skip groups of iterations. Metal can accelerate eligible views, and the CPU handles depths beyond the GPU precision limit.
 
 [Deep-zoom benchmarks and manual verification](docs/rendering-notes.md)
 
