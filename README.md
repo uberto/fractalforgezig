@@ -41,6 +41,3 @@ Fractal Forge Z uses perturbation to explore beyond double precision. At a view 
 
 [Deep-zoom benchmarks and manual verification](docs/rendering-notes.md)
 
-## Manual PNG export checks
-
-The headless suite and poster-sized worker export passed. Native GUI verification is pending. [PNG export checklist](docs/rendering-notes.md#manual-png-export-checks)
